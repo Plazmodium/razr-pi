@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "work_root": ".razr/work",
+  "retention": "commit",
+  "adapter": {
+    "mode": "process-local",
+    "max_active_work_items": 5,
+    "queue_order": ["priority", "approved_at", "id"]
+  }
+}
