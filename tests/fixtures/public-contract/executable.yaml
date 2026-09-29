@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "id": "public-probe",
+  "status": "compiled",
+  "source_spec": {
+    "revision": 1,
+    "digest": "sha256:7a549065e59f5d85fb1da79f429885640cc8ae37bdbb2c18dd77b68b247587dd"
+  },
+  "objective": "Provide a harmless synthetic local assertion for public inspection tests.",
+  "contract": [
+    {"id": "REQ-001", "type": "requirement", "statement": "The local Python assertion evaluates two plus two as four."},
+    {"id": "CON-001", "type": "constraint", "statement": "Never hand-edit state.yaml. The primary appends observed proof to core-created evidence.md."},
+    {"id": "NG-001", "type": "non_goal", "statement": "This fixture grants no live execution, review or publication authority."},
+    {"id": "VER-001", "type": "verification", "statement": "An owned synthetic test executes the local assertion, preserves the original draft pair, and labels its results as test observations rather than human approval.", "satisfies": ["REQ-001", "CON-001", "NG-001"]}
+  ],
+  "nodes": [
+    {"id": "assert-arithmetic", "role": "guide", "depends_on": [], "contract_ids": ["REQ-001", "CON-001", "NG-001", "VER-001"], "validation": ["python3 -c 'assert 2 + 2 == 4'"]}
+  ],
+  "trajectory": {"first_task": "assert-arithmetic", "todo_limit": 12},
+  "critique": {"technical": "required", "contract": "required"},
+  "human_gates": ["exact specification approval", "first verified-task human checkpoint", "final PR review and merge"]
+}

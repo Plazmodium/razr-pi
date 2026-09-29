@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "id": "stable-kebab-id",
+  "status": "compiled",
+  "source_spec": {
+    "revision": 1,
+    "digest": "sha256:<64-hex>"
+  },
+  "objective": "One sentence describing the approved outcome.",
+  "contract": [
+    {
+      "id": "REQ-001",
+      "type": "requirement",
+      "statement": "Approved observable requirement."
+    },
+    {
+      "id": "VER-001",
+      "type": "verification",
+      "statement": "How the requirement is proved.",
+      "satisfies": ["REQ-001"]
+    }
+  ],
+  "nodes": [
+    {
+      "id": "foundational-task",
+      "role": "guide",
+      "depends_on": [],
+      "contract_ids": ["REQ-001", "VER-001"],
+      "validation": ["exact focused verification command"]
+    }
+  ],
+  "trajectory": {
+    "first_task": "foundational-task",
+    "todo_limit": 12
+  },
+  "critique": {
+    "technical": "required",
+    "contract": "required"
+  },
+  "human_gates": ["exact specification approval", "final PR review and merge"]
+}

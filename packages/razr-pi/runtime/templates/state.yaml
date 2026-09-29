@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "id": "stable-kebab-id",
+  "stage": "build",
+  "status": "active",
+  "generation": 1,
+  "created_at": "ISO-8601-with-timezone",
+  "depth": "standard",
+  "priority": 100,
+  "approved_at": "ISO-8601-with-timezone",
+  "spec": {
+    "approved_revision": 1,
+    "digest": "sha256:<64-hex>"
+  },
+  "executable": {
+    "source_spec_revision": 1,
+    "digest": "sha256:<64-hex>"
+  },
+  "nodes": {
+    "foundational-task": {
+      "status": "pending",
+      "attempt": 0,
+      "result_ref": null
+    }
+  },
+  "trajectory": {
+    "first_verified_task": {
+      "node": null,
+      "evidence_ref": null,
+      "verified_at": null
+    }
+  },
+  "candidate": {
+    "repository": null,
+    "branch": null,
+    "commit": null,
+    "source_digest": null
+  },
+  "critics": {
+    "technical": {
+      "outcome": "not_due",
+      "candidate": null,
+      "reviewed_commit": null,
+      "evidence_ref": null,
+      "reviewer": null,
+      "context_id": null,
+      "recorded_at": null
+    },
+    "contract": {
+      "outcome": "not_due",
+      "candidate": null,
+      "reviewed_commit": null,
+      "evidence_ref": null,
+      "reviewer": null,
+      "context_id": null,
+      "recorded_at": null
+    }
+  },
+  "delivery": {
+    "pull_request": null,
+    "head_commit": null,
+    "source_digest": null,
+    "outcome": "not_due",
+    "review_iteration": 0
+  },
+  "last_transition": {
+    "from": "spec",
+    "to": "build",
+    "decision": "approved_contract",
+    "reason": null,
+    "at": "ISO-8601-with-timezone"
+  }
+}

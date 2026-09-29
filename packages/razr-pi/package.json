@@ -1,0 +1,9 @@
+{
+  "name": "razr-pi",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Public source bootstrap for explicit safe adoption and discovery; not delivery automation",
+  "keywords": ["pi-package"],
+  "pi": { "skills": ["./skills"] },
+  "files": ["skills", "runtime", "scripts", "README.md"]
+}
