@@ -6,7 +6,10 @@ SOURCE_BASELINE.md
 .pi/prompts/razr-learn.md
 .pi/skills/razr-pi-learning/SKILL.md
 docs/05-vertical-slices.md
+docs/CURRENT.md
 docs/architecture.md
+docs/audits/evidence-storage.md
+docs/audits/task-attempt-lifecycle.md
 docs/capabilities.md
 docs/testing.md
 packages/razr-pi/README.md
