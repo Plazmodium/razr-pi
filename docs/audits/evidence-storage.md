@@ -72,7 +72,7 @@ No ignore file was changed in this mission. For the local wrapper, the following
 - the root `erl_crash.dump` (or a dedicated private crash-output directory);
 - OS/editor metadata such as `.DS_Store` (already ignored locally).
 
-Do **not** blanket-ignore `.labs/`, `.bootstrap/`, `ephemeral/`, `*.log`, `*.jsonl`, `sessions/`, or `.test-output/` while canonical records and documentation point into them. Ignoring does not create retention, privacy, or deletion safety; it can instead hide unprotected evidence in an unborn repository.
+Do **not** blanket-ignore `.labs`, `.bootstrap`, `ephemeral`, `*.log`, `*.jsonl`, `sessions`, or `.test-output` while canonical records and documentation point into them. Ignoring does not create retention, privacy, or deletion safety; it can instead hide unprotected evidence in an unborn repository.
 
 A safer future layout is to make generated runs land in an explicitly private evidence root by default, then export only reviewed minimal fixtures to source. Ignore rules should follow that boundary, not attempt to create it.
 
