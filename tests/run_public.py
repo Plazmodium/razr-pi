@@ -240,7 +240,7 @@ def main():
         require(source_after == source_before, 'public source drift during tracer')
         suite_summary = None
         if args.phase == 'full':
-            # Export only the 42 declared files, never .git, private output or workshop data.
+            # Export only the 45 declared files, never .git, private output or workshop data.
             # This is a stripped materialized tree, not a commit or actual clone.
             stripped = run / 'public source tree'
             stripped.mkdir()
