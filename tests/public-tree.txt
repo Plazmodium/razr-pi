@@ -11,6 +11,7 @@ docs/architecture.md
 docs/audits/evidence-storage.md
 docs/audits/task-attempt-lifecycle.md
 docs/capabilities.md
+docs/design/execution-provider.md
 docs/testing.md
 packages/razr-pi/README.md
 packages/razr-pi/package.json

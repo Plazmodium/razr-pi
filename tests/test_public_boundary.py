@@ -84,7 +84,7 @@ class BoundaryTests(FixtureTest):
         pointer.unlink(); pointer.symlink_to(administrative / 'gitdir')
         self.unchanged_refusal(tree)
         pointer.unlink(); pointer.write_bytes(original)
-        self.assertEqual(check(tree)['files'], 45)
+        self.assertEqual(check(tree)['files'], 46)
 
     def test_missing_linked_metadata_and_ambiguous_identity_refuse(self):
         primary, tree, administrative = self.linked_tree()
@@ -121,12 +121,12 @@ class BoundaryTests(FixtureTest):
         config = normal / '.git/config'; original = config.read_bytes()
         config.write_bytes(original + ('\n[core]\n\tworktree = ' + str(primary) + '\n').encode())
         self.unchanged_refusal(normal); config.write_bytes(original)
-        self.assertEqual(check(tree)['files'], 45)
+        self.assertEqual(check(tree)['files'], 46)
 
     def test_non_git_administration_and_query_failures_refuse(self):
         tree = self.public_tree()
         # A source-only export remains supported, but is never a Git repository.
-        self.assertEqual(check(tree)['files'], 45)
+        self.assertEqual(check(tree)['files'], 46)
         with self.assertRaisesRegex(ValueError, 'not a Git repository'):
             git_administration(tree)
         (tree / '.git').mkdir()
@@ -147,7 +147,7 @@ class BoundaryTests(FixtureTest):
 
     def test_exact_tree_and_ignored_private_extra_are_not_interchangeable(self):
         tree = self.public_tree()
-        self.assertEqual(check(tree)['files'], 45)
+        self.assertEqual(check(tree)['files'], 46)
         for name in ('.' + 'labs', 'sessions', '.env'):
             with self.subTest(name=name):
                 path = tree / name
@@ -191,7 +191,7 @@ class BoundaryTests(FixtureTest):
                 with self.assertRaises(ValueError):
                     check(tree)
         doc.write_bytes(original)
-        self.assertEqual(check(tree)['files'], 45)
+        self.assertEqual(check(tree)['files'], 46)
 
     def test_linked_source_ancestor_and_git_surface_refuse(self):
         tree = self.public_tree()
@@ -215,7 +215,7 @@ class BoundaryTests(FixtureTest):
         with self.assertRaisesRegex(ValueError, 'unowned private output'):
             check(tree)
         (output / '.owner').write_text(OUTPUT_MARKER)
-        self.assertEqual(check(tree)['files'], 45)
+        self.assertEqual(check(tree)['files'], 46)
         with self.assertRaisesRegex(ValueError, 'traversal'):
             check(tree / 'not-needed' / '..')
         path = tree / 'tests/public-tree.txt'; path.write_text(path.read_text() + '../outside\n')
