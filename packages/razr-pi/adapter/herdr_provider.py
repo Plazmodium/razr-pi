@@ -167,8 +167,8 @@ def _marker(root: Path, root_id: str, digest: str, *, create: bool) -> None:
     marker = root / ".razr-herdr-root.json"
     if marker.exists():
         try:
-            value = json.loads(marker.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            value = _strict_json(marker.read_bytes())
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
             raise _fail("RESOURCE_REUSED", "root ownership marker is malformed") from exc
         if value != {"schema_version": 1, "root_id": root_id, "manifest_digest": digest}:
             raise _fail("RESOURCE_REUSED", "root ownership identity differs")
@@ -180,7 +180,7 @@ def _marker(root: Path, root_id: str, digest: str, *, create: bool) -> None:
         fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump({"schema_version": 1, "root_id": root_id, "manifest_digest": digest}, stream, sort_keys=True, separators=(",", ":"))
-            stream.write("\n"); stream.flush(); os.fsync(stream.fileno())
+            stream.flush(); os.fsync(stream.fileno())
     except FileExistsError as exc:
         raise _fail("RESOURCE_REUSED", "root ownership raced with another attempt") from exc
 
@@ -384,7 +384,7 @@ class AttemptLedger:
                 stream.seek(0, 2); original_length = stream.tell(); stream.seek(0); records: list[dict[str, object]] = []
                 for line in stream:
                     if not line.endswith("\n"): raise _fail("LEDGER_CORRUPT", "partial ledger line")
-                    try: row = json.loads(line)
+                    try: row = _strict_json(line.rstrip("\n").encode("utf-8"))
                     except json.JSONDecodeError as exc: raise _fail("LEDGER_CORRUPT", "malformed ledger JSON") from exc
                     records.append(self._replay_validate(row))
             except OSError as exc: raise _fail("LOCK_UNAVAILABLE", "attempt ledger cannot be read") from exc
@@ -458,9 +458,9 @@ class ProviderRequest:
         caps = self.value["required_capabilities"]
         if not isinstance(caps, list) or any(cap not in _CAPABILITIES for cap in caps): raise _fail("UNSUPPORTED_CAPABILITY", "unsupported capability")
         runtime = _closed(self.value["runtime"], {"provider", "model", "thinking"}, "runtime")
-        if runtime["model"] != _MODEL or runtime["thinking"] != "medium": raise _fail("UNSUPPORTED_CAPABILITY", "exact Pi runtime required")
+        if runtime["provider"] != "openai-codex" or runtime["model"] != _MODEL or runtime["thinking"] != "medium": raise _fail("UNSUPPORTED_CAPABILITY", "exact Pi runtime required")
         limits = _closed(self.value["limits"], {"deadline_ms", "max_output_bytes"}, "limits")
-        if not isinstance(limits["deadline_ms"], int) or isinstance(limits["deadline_ms"], bool) or limits["deadline_ms"] <= 0 or not isinstance(limits["max_output_bytes"], int) or isinstance(limits["max_output_bytes"], bool) or limits["max_output_bytes"] <= 0: raise _fail("INVALID_REQUEST", "limits must be positive integers")
+        if not isinstance(limits["deadline_ms"], int) or isinstance(limits["deadline_ms"], bool) or limits["deadline_ms"] <= 0 or limits["deadline_ms"] > 600_000 or not isinstance(limits["max_output_bytes"], int) or isinstance(limits["max_output_bytes"], bool) or limits["max_output_bytes"] <= 0 or limits["max_output_bytes"] > 1_048_576: raise _fail("INVALID_REQUEST", "limits exceed contract bounds")
 
     @property
     def digest(self) -> str:
@@ -548,7 +548,7 @@ class HerdrProvider:
         caps = request["required_capabilities"]
         if not isinstance(caps, list): raise _fail("INVALID_REQUEST", "required_capabilities must be an array")
         runtime = _closed(request["runtime"], {"provider", "model", "thinking"}, "probe runtime")
-        if runtime["model"] != _MODEL or runtime["thinking"] != "medium": raise _fail("UNSUPPORTED_CAPABILITY", "exact Pi runtime required")
+        if runtime["provider"] != "openai-codex" or runtime["model"] != _MODEL or runtime["thinking"] != "medium": raise _fail("UNSUPPORTED_CAPABILITY", "exact Pi runtime required")
         _host()
         if any(cap not in _CAPABILITIES for cap in caps): raise _fail("UNSUPPORTED_CAPABILITY", "unknown capability")
         herdr_help = self._exec([self.herdr, "--help"], timeout_ms=10_000, max_output=262_144).decode("utf-8", "replace")
@@ -604,17 +604,17 @@ class HerdrProvider:
 
     def worktree_create(self, *, cwd: str, branch: str, base: str, label: str) -> dict[str, object]:
         root = _canonical_dir(cwd, "cwd"); _branch(branch, "branch"); _branch(base, "base"); _id(label, "label")
-        response = _envelope(self._exec([self.herdr, "worktree", "create", "--cwd", str(root), "--branch", branch, "--base", base, "--label", label, "--no-focus"], timeout_ms=120_000), "worktree")
+        response = _envelope(self._exec([self.herdr, "worktree", "create", "--cwd", str(root), "--branch", branch, "--base", base, "--label", label, "--no-focus"], timeout_ms=120_000), "worktree", {"cli:worktree:create"})
         normalized = self._parse_worktree_response(response, None)
         return {**response, "result": normalized}
 
     def worktree_open(self, *, path: str) -> dict[str, object]:
         root = _canonical_dir(path, "worktree")
-        response = _envelope(self._exec([self.herdr, "worktree", "open", "--path", str(root), "--no-focus"], timeout_ms=120_000), "worktree")
+        response = _envelope(self._exec([self.herdr, "worktree", "open", "--path", str(root), "--no-focus"], timeout_ms=120_000), "worktree", {"cli:worktree:open"})
         return {**response, "result": self._parse_worktree_response(response, root)}
 
     def _resolve_existing_worktree(self, path: Path, expected_host: Mapping[str, object] | None = None) -> dict[str, str] | None:
-        response = _envelope(self._exec([self.herdr, "worktree", "list", "--cwd", str(path)], timeout_ms=_CLI_TIMEOUT_MS), "worktree list")
+        response = _envelope(self._exec([self.herdr, "worktree", "list", "--cwd", str(path)], timeout_ms=_CLI_TIMEOUT_MS), "worktree list", {"cli:worktree:list"})
         result = _closed(response["result"], {"source", "type", "worktrees"}, "worktree list result")
         _closed(result["source"], {"repo_key", "repo_name", "repo_root", "source_checkout_path", "source_workspace_id"}, "worktree list source")
         if result["type"] != "worktree_list" or not isinstance(result["worktrees"], list): raise _fail("HERDR_IDENTITY_INCOMPLETE", "worktree list is malformed")
@@ -631,7 +631,7 @@ class HerdrProvider:
         if len(matches) > 1: raise _fail("IDENTITY_MISMATCH", "duplicate worktree paths are listed")
         if not matches or "open_workspace_id" not in matches[0]: return None
         workspace_id = matches[0]["open_workspace_id"]; _id(workspace_id, "workspace_id")
-        panes_response = _envelope(self._exec([self.herdr, "pane", "list", "--workspace", workspace_id], timeout_ms=_CLI_TIMEOUT_MS), "pane list")
+        panes_response = _envelope(self._exec([self.herdr, "pane", "list", "--workspace", workspace_id], timeout_ms=_CLI_TIMEOUT_MS), "pane list", {"cli:pane:list"})
         panes_result = _closed(panes_response["result"], {"panes", "type"}, "pane list result")
         if panes_result["type"] != "pane_list" or not isinstance(panes_result["panes"], list): raise _fail("HERDR_IDENTITY_INCOMPLETE", "pane list is malformed")
         roots = []
@@ -674,7 +674,7 @@ class HerdrProvider:
                     fcntl.flock(stream.fileno(), fcntl.LOCK_EX); stream.seek(0); rows = []; previous = "sha256:" + "0" * 64
                     for line in stream:
                         if not line.endswith("\n"): raise _fail("LEDGER_CORRUPT", "partial root claims record")
-                        try: row = json.loads(line)
+                        try: row = _strict_json(line.rstrip("\n").encode("utf-8"))
                         except json.JSONDecodeError as exc: raise _fail("LEDGER_CORRUPT", "malformed root claims record") from exc
                         expected = {"schema_version", "root_id", "root_digest", "path", "attempt_id", "request_digest", "claimed_at", "prev_digest", "record_digest"}
                         if not isinstance(row, dict) or set(row) != expected or row["prev_digest"] != previous or row["record_digest"] != raw_file_digest(canonical_json({key: row[key] for key in row if key != "record_digest"})):
@@ -714,7 +714,7 @@ class HerdrProvider:
         prior: list[dict[str, object]] = []
         if self.ledger is not None and self.ledger.path.exists():
             for line in self.ledger.path.read_text(encoding="utf-8").splitlines():
-                try: prior.append(AttemptLedger._replay_validate(json.loads(line)))
+                try: prior.append(AttemptLedger._replay_validate(_strict_json(line.rstrip("\n").encode("utf-8"))))
                 except (json.JSONDecodeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "cannot claim roots from corrupt ledger") from exc
         for root_key, id_key in (("output_root", "output_root_id"), ("session_root", "session_root_id")):
             root = _canonical_dir(values[root_key], root_key)
@@ -748,7 +748,7 @@ class HerdrProvider:
         for root_key, id_key in (("output_root", "output_root_id"), ("session_root", "session_root_id")):
             try:
                 root = _canonical_dir(value[root_key], root_key); marker = root / ".razr-herdr-root.json"
-                if marker.is_file() and json.loads(marker.read_text(encoding="utf-8")).get("root_id") == value[id_key]: marker.unlink()
+                if marker.is_file() and _strict_json(marker.read_bytes()).get("root_id") == value[id_key]: marker.unlink()
             except (OSError, UnicodeDecodeError, json.JSONDecodeError, ProtocolError):
                 continue
 
@@ -777,7 +777,7 @@ class HerdrProvider:
         self._attempt_sessions[value["attempt_id"]] = _canonical_dir(value["session_root"], "session_root")
         self._attempt_roots[value["attempt_id"]] = (_canonical_dir(value["output_root"], "output_root"), _canonical_dir(value["session_root"], "session_root"))
         try:
-            response = self._exec([self.herdr, "agent", "start", value["worker_id"], "--kind", "pi", "--pane", value["host"]["pane_id"], "--timeout", str(min(deadline, 300_000)), "--", "--model", _MODEL, "--thinking", "medium", "--session-dir", value["session_root"], "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve"], timeout_ms=min(deadline, 300_000), cwd=_canonical_dir(value["cwd"], "cwd"), max_output=value["limits"]["max_output_bytes"])
+            response = self._exec([self.herdr, "agent", "start", value["worker_id"], "--kind", "pi", "--pane", value["host"]["pane_id"], "--timeout", str(deadline), "--", "--model", _MODEL, "--thinking", "medium", "--session-dir", value["session_root"], "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve"], timeout_ms=deadline, cwd=_canonical_dir(value["cwd"], "cwd"), max_output=value["limits"]["max_output_bytes"])
         except ProtocolError as exc:
             failure = _canonical_dir(value["worktree"], "worktree") / ".razr" / "evidence" / ("launch-failure-" + value["attempt_id"] + ".json")
             launch_code = exc.code if exc.code in {"LAUNCH_FAILED", "TIMEOUT", "OUTPUT_LIMIT", "PROVIDER_UNAVAILABLE"} else "LAUNCH_FAILED"
@@ -794,7 +794,7 @@ class HerdrProvider:
             settled["record_digest"] = raw_file_digest(canonical_json(settled)); self.ledger.append(settled)
             raise
         try:
-            envelope = _envelope(response, "agent start"); result = envelope["result"]
+            envelope = _envelope(response, "agent start", {"cli:agent:start"}); result = envelope["result"]
             if not isinstance(result, dict) or not isinstance(result.get("agent"), dict): raise _fail("HERDR_IDENTITY_INCOMPLETE", "agent response lacks nested agent identity")
             agent = result["agent"]
             if "name" in agent:
@@ -821,7 +821,7 @@ class HerdrProvider:
             canonical_session_path = path_session(agent) or path_session(result)
             if canonical_session_path is None:
                 for _ in range(3):
-                    observed = _envelope(self._exec([self.herdr, "agent", "get", value["worker_id"]], timeout_ms=_CLI_TIMEOUT_MS), "agent get")["result"]
+                    observed = _envelope(self._exec([self.herdr, "agent", "get", value["worker_id"]], timeout_ms=_CLI_TIMEOUT_MS), "agent get", {"cli:agent:get"})["result"]
                     observed_agent = observed.get("agent") if isinstance(observed, dict) and isinstance(observed.get("agent"), dict) else observed
                     canonical_session_path = path_session(observed_agent) or path_session(observed)
                     if canonical_session_path is not None: break
@@ -829,7 +829,7 @@ class HerdrProvider:
             if canonical_session_path is not None: opaque_session = "pi-session-" + hashlib.sha256(str(canonical_session_path).encode("utf-8")).hexdigest()
             result = {"agent_id": agent_id, "workspace_id": agent["workspace_id"], "tab_id": agent["tab_id"], "pane_id": agent["pane_id"], "pi_session_id": opaque_session}
             if any(result[key] != value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")): raise _fail("IDENTITY_MISMATCH", "agent host identity differs")
-            pane = _envelope(self._exec([self.herdr, "pane", "get", value["host"]["pane_id"]], timeout_ms=10_000), "pane")
+            pane = _envelope(self._exec([self.herdr, "pane", "get", value["host"]["pane_id"]], timeout_ms=10_000), "pane", {"cli:pane:get"})
             pane_result = pane["result"]
             if not isinstance(pane_result, dict) or not isinstance(pane_result.get("pane"), dict): raise _fail("IDENTITY_MISMATCH", "pane response lacks nested pane")
             pane_result = pane_result["pane"]
@@ -895,7 +895,7 @@ class HerdrProvider:
         if synthetic and not artifact.exists():
             fd = os.open(artifact, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as stream: stream.write(data); stream.flush(); os.fsync(stream.fileno())
-        try: records = AttemptLedger._replay_chain([AttemptLedger._replay_validate(json.loads(line)) for line in self.ledger.path.read_text(encoding="utf-8").splitlines()])
+        try: records = AttemptLedger._replay_chain([AttemptLedger._replay_validate(_strict_json(line.rstrip("\n").encode("utf-8"))) for line in self.ledger.path.read_text(encoding="utf-8").splitlines()])
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "settlement ledger cannot be replayed") from exc
         started = next((row for row in records if row["attempt_id"] == handle["attempt_id"] and row["event"] == "STARTED"), None)
         if started is None: raise _fail("INVALID_ORDER", "settlement has no STARTED event")
@@ -916,7 +916,7 @@ class HerdrProvider:
         session_root = _canonical_dir(private["paths"]["session_root"], "session_root")
         candidate_path = None
         for attempt in range(3):
-            observed = _envelope(self._exec([self.herdr, "agent", "get", value["handle_id"]], timeout_ms=_CLI_TIMEOUT_MS), "agent get")["result"]
+            observed = _envelope(self._exec([self.herdr, "agent", "get", value["handle_id"]], timeout_ms=_CLI_TIMEOUT_MS), "agent get", {"cli:agent:get"})["result"]
             agent = observed.get("agent") if isinstance(observed, dict) and isinstance(observed.get("agent"), dict) else observed
             session = agent.get("agent_session") if isinstance(agent, dict) else None
             if isinstance(session, dict) and session.get("kind") == "path" and session.get("agent") == "pi" and isinstance(session.get("value"), str) and Path(session["value"]).is_absolute():
@@ -978,8 +978,8 @@ class HerdrProvider:
                 except UnicodeDecodeError as exc: raise _fail("IDENTITY_MISMATCH", "root claim is not UTF-8") from exc
                 previous = "sha256:" + "0" * 64; found = False
                 for line in lines:
-                    try: row = json.loads(line)
-                    except json.JSONDecodeError as exc: raise _fail("IDENTITY_MISMATCH", "root claim is malformed") from exc
+                    try: row = _strict_json(line.rstrip("\n").encode("utf-8"))
+                    except (json.JSONDecodeError, UnicodeDecodeError, ValueError, TypeError) as exc: raise _fail("IDENTITY_MISMATCH", "root claim is malformed") from exc
                     expected = {"schema_version", "root_id", "root_digest", "path", "attempt_id", "request_digest", "claimed_at", "prev_digest", "record_digest"}
                     if not isinstance(row, dict) or set(row) != expected or row["prev_digest"] != previous or row["record_digest"] != raw_file_digest(canonical_json({key: row[key] for key in row if key != "record_digest"})):
                         raise _fail("IDENTITY_MISMATCH", "root claim chain is corrupt")
@@ -1000,8 +1000,8 @@ class HerdrProvider:
         if value["host"] != _host(): raise _fail("IDENTITY_MISMATCH", "foreign Herdr host")
         if self.private_root is None: raise _fail("IDENTITY_MISMATCH", "provider private root is unavailable")
         private_path = _canonical_dir(str(self.private_root), "private_root") / "handles" / ("handle-" + value["handle_id"] + ".json")
-        try: private = json.loads(_read_private_bytes(private_path, _canonical_dir(str(self.private_root), "private_root")).decode("utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "durable private handle evidence is unavailable") from exc
+        try: private = _strict_json(_read_private_bytes(private_path, _canonical_dir(str(self.private_root), "private_root")))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc: raise _fail("IDENTITY_MISMATCH", "durable private handle evidence is unavailable") from exc
         private = _closed(private, {"schema_version", "handle", "agent_id", "pi_session_id", "session_status", "capability_report_digest", "session_record_ref", "session_record_digest", "session_binding_ref", "session_binding_digest", "handle_digest", "paths", "attempt_path", "attempt_ref", "record_digest"}, "private handle")
         if not isinstance(private["schema_version"], int) or isinstance(private["schema_version"], bool): raise _fail("IDENTITY_MISMATCH", "private handle schema is invalid")
         paths = _closed(private["paths"], {"worktree", "output_root", "session_root"}, "private handle paths")
@@ -1019,7 +1019,7 @@ class HerdrProvider:
         if private["session_status"] == "pending":
             if private["session_record_digest"] is not None: raise _fail("IDENTITY_MISMATCH", "pending session digest is unexpected")
             if session_record_path.exists():
-                try: pending_record = json.loads(_read_private_bytes(session_record_path, private_base).decode("utf-8"))
+                try: pending_record = _strict_json(_read_private_bytes(session_record_path, private_base))
                 except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "pending session binding is malformed") from exc
                 pending_record = _closed(pending_record, {"schema_version", "kind", "handle_id", "attempt_id", "request_digest", "host", "pi_session_path", "pi_session_id", "record_digest"}, "private session record")
                 if not isinstance(pending_record["schema_version"], int) or isinstance(pending_record["schema_version"], bool): raise _fail("IDENTITY_MISMATCH", "private session schema is invalid")
@@ -1030,7 +1030,7 @@ class HerdrProvider:
                     raise _fail("IDENTITY_MISMATCH", "pending session binding differs")
         else:
             _digest(private["session_record_digest"], "session_record_digest")
-            try: session_record = json.loads(_read_private_bytes(session_record_path, private_base).decode("utf-8"))
+            try: session_record = _strict_json(_read_private_bytes(session_record_path, private_base))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "private session record is unavailable") from exc
             session_record = _closed(session_record, {"schema_version", "kind", "handle_id", "attempt_id", "request_digest", "host", "pi_session_path", "pi_session_id", "record_digest"}, "private session record")
             if not isinstance(session_record["schema_version"], int) or isinstance(session_record["schema_version"], bool): raise _fail("IDENTITY_MISMATCH", "private session schema is invalid")
@@ -1054,11 +1054,11 @@ class HerdrProvider:
         session_exists = session_record_path.exists(); binding_exists = binding_path.exists()
         if session_exists != binding_exists: raise _fail("IDENTITY_MISMATCH", "incomplete session binding chain")
         if session_exists:
-            try: binding = json.loads(_read_private_bytes(binding_path, private_base).decode("utf-8"))
+            try: binding = _strict_json(_read_private_bytes(binding_path, private_base))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "session binding event is unavailable") from exc
             binding = _closed(binding, {"schema_version", "kind", "handle_record_digest", "session_record_digest", "attempt_id", "request_digest", "host", "bound_at", "record_digest"}, "session binding")
             if not isinstance(binding["schema_version"], int) or isinstance(binding["schema_version"], bool): raise _fail("IDENTITY_MISMATCH", "session binding schema is invalid")
-            if binding["kind"] != "pi_session_binding" or binding["handle_record_digest"] != private["record_digest"] or binding["session_record_digest"] != (private["session_record_digest"] or (json.loads(_read_private_bytes(session_record_path, private_base).decode("utf-8"))["record_digest"])) or binding["attempt_id"] != value["attempt_id"] or binding["request_digest"] != value["request_digest"] or binding["host"] != value["host"] or binding["record_digest"] != raw_file_digest(canonical_json({key: binding[key] for key in binding if key != "record_digest"})):
+            if binding["kind"] != "pi_session_binding" or binding["handle_record_digest"] != private["record_digest"] or binding["session_record_digest"] != (private["session_record_digest"] or (_strict_json(_read_private_bytes(session_record_path, private_base))["record_digest"])) or binding["attempt_id"] != value["attempt_id"] or binding["request_digest"] != value["request_digest"] or binding["host"] != value["host"] or binding["record_digest"] != raw_file_digest(canonical_json({key: binding[key] for key in binding if key != "record_digest"})):
                 raise _fail("IDENTITY_MISMATCH", "session binding event differs")
         record_body = {key: private[key] for key in private if key != "record_digest"}
         if not isinstance(private["schema_version"], int) or isinstance(private["schema_version"], bool) or private["schema_version"] != 1 or private["handle"] != value or private["handle_digest"] != raw_file_digest(canonical_json(value)) or private["record_digest"] != raw_file_digest(canonical_json(record_body)) or private["attempt_path"] != paths["worktree"] or private["attempt_ref"] != ".": raise _fail("IDENTITY_MISMATCH", "handle evidence differs")
@@ -1069,7 +1069,7 @@ class HerdrProvider:
         self._attempt_sessions.setdefault(value["attempt_id"], Path(paths["session_root"]))
         self._attempt_roots.setdefault(value["attempt_id"], (Path(paths["output_root"]), Path(paths["session_root"])))
         if self.ledger is None or not self.ledger.path.exists(): raise _fail("IDENTITY_MISMATCH", "handle ledger is unavailable")
-        try: records = AttemptLedger._replay_chain([AttemptLedger._replay_validate(json.loads(line)) for line in self.ledger.path.read_text(encoding="utf-8").splitlines()])
+        try: records = AttemptLedger._replay_chain([AttemptLedger._replay_validate(_strict_json(line.rstrip("\n").encode("utf-8"))) for line in self.ledger.path.read_text(encoding="utf-8").splitlines()])
         except (OSError, json.JSONDecodeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "handle ledger cannot be replayed") from exc
         started = next((row for row in records if row["event"] == "STARTED" and row["attempt_id"] == value["attempt_id"]), None)
         settled = next((row for row in records if row["event"] == "SETTLED" and row["attempt_id"] == value["attempt_id"]), None)
@@ -1077,7 +1077,7 @@ class HerdrProvider:
         packet_path = Path(paths["worktree"]) / started["request_packet"]["ref"] if started is not None else Path("/")
         try:
             packet_bytes = packet_path.read_bytes()
-            packet = json.loads(packet_bytes.decode("utf-8"))
+            packet = _strict_json(packet_bytes)
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise _fail("IDENTITY_MISMATCH", "request packet is unavailable") from exc
         if started is not None and raw_file_digest(packet_bytes) != started["request_packet"]["digest"]:
@@ -1130,7 +1130,7 @@ class HerdrProvider:
             checked_evidence.append(dict(ref))
         evidence = checked_evidence
         if self.ledger is None or not self.ledger.path.exists(): raise _fail("LEDGER_CORRUPT", "recovery ledger is unavailable")
-        try: records = AttemptLedger._replay_chain([AttemptLedger._replay_validate(json.loads(line)) for line in self.ledger.path.read_text(encoding="utf-8").splitlines()])
+        try: records = AttemptLedger._replay_chain([AttemptLedger._replay_validate(_strict_json(line.rstrip("\n").encode("utf-8"))) for line in self.ledger.path.read_text(encoding="utf-8").splitlines()])
         except (OSError, json.JSONDecodeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "recovery ledger cannot be replayed") from exc
         started = next((row for row in records if row["event"] == "STARTED" and row["attempt_id"] == request["attempt_id"]), None)
         if started is None: raise _fail("INVALID_ORDER", "no unmatched STARTED event")
@@ -1146,17 +1146,17 @@ class HerdrProvider:
         if self.private_root is None: raise _fail("IDENTITY_MISMATCH", "provider private root is unavailable")
         private_root = _canonical_dir(str(self.private_root), "private_root")
         record_path = private_root / "handles" / ("handle-" + target + ".json")
-        try: record = json.loads(_read_private_bytes(record_path, private_root).decode("utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "durable prompt handle is unavailable") from exc
+        try: record = _strict_json(_read_private_bytes(record_path, private_root))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc: raise _fail("IDENTITY_MISMATCH", "durable prompt handle is unavailable") from exc
         if not isinstance(record, dict) or not isinstance(record.get("handle"), dict) or record["handle"].get("handle_id") != target: raise _fail("IDENTITY_MISMATCH", "prompt target is not a durable handle")
         value = self._handle(record["handle"])
         if value["handle_id"] != target: raise _fail("IDENTITY_MISMATCH", "prompt handle identity differs")
-        response = _envelope(self._exec([self.herdr, "agent", "prompt", target, text, "--wait", "--timeout", str(timeout_ms)], timeout_ms=timeout_ms), "prompt")
+        response = _envelope(self._exec([self.herdr, "agent", "prompt", target, text, "--wait", "--timeout", str(timeout_ms)], timeout_ms=timeout_ms), "prompt", {"cli:agent:prompt"})
         self._bind_session_if_available(value)
         return response
 
     def _inspect_handle(self, handle: Mapping[str, object]) -> object:
-        value = self._handle(handle); raw = _envelope(self._exec([self.herdr, "agent", "get", value["handle_id"]], timeout_ms=10_000), "inspect"); result = raw["result"]
+        value = self._handle(handle); raw = _envelope(self._exec([self.herdr, "agent", "get", value["handle_id"]], timeout_ms=10_000), "inspect", {"cli:agent:get"}); result = raw["result"]
         if not isinstance(result, dict) or not isinstance(result.get("agent"), dict): raise _fail("ARTIFACT_UNAVAILABLE", "agent status lacks nested agent")
         agent = result["agent"]
         if not isinstance(agent.get("name"), str) or agent["name"] != value["handle_id"]: raise _fail("IDENTITY_MISMATCH", "agent status name differs")
@@ -1178,7 +1178,7 @@ class HerdrProvider:
     def wait(self, handle: Mapping[str, object], *, timeout_ms: int) -> object:
         value = self._handle(handle)
         if timeout_ms <= 0: raise _fail("INVALID_REQUEST", "invalid wait bound")
-        return _envelope(self._exec([self.herdr, "agent", "wait", value["handle_id"], "--timeout", str(timeout_ms)], timeout_ms=timeout_ms), "wait")
+        return _envelope(self._exec([self.herdr, "agent", "wait", value["handle_id"], "--timeout", str(timeout_ms)], timeout_ms=timeout_ms), "wait", {"cli:agent:wait"})
 
     def _private_observation(self, handle: Mapping[str, object], kind: str, value: Mapping[str, object]) -> bytes:
         root = self._attempt_roots[handle["attempt_id"]][1]
@@ -1197,7 +1197,7 @@ class HerdrProvider:
         if self._attempt_sessions.get(value["attempt_id"]) is None: raise _fail("ARTIFACT_UNAVAILABLE", "interrupt session root is unavailable")
         interrupt_path = self._attempt_sessions[value["attempt_id"]] / ("interrupt-" + value["attempt_id"] + ".json")
         if interrupt_path.exists():
-            try: stored = json.loads(interrupt_path.read_text(encoding="utf-8"))
+            try: stored = _strict_json(interrupt_path.read_bytes())
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "interrupt record is malformed") from exc
             try: stored = _closed(stored, {"schema_version", "kind", "request_id", "handle_id", "request_digest", "reason", "reason_digest", "outcome"}, "interrupt record")
             except ProtocolError as exc: raise _fail("IDENTITY_MISMATCH", "legacy or malformed interrupt record") from exc
@@ -1250,7 +1250,7 @@ class HerdrProvider:
             status_response = self._inspect_handle(value); status = status_response["result"]["status"]
             raw_status = None
             if status not in {"SETTLED", "TERMINATED"} and value["attempt_id"] not in self._settled:
-                raw_get = _envelope(self._exec([self.herdr, "agent", "get", value["handle_id"]], timeout_ms=_CLI_TIMEOUT_MS), "collect status")["result"]
+                raw_get = _envelope(self._exec([self.herdr, "agent", "get", value["handle_id"]], timeout_ms=_CLI_TIMEOUT_MS), "collect status", {"cli:agent:get"})["result"]
                 raw_agent = raw_get.get("agent") if isinstance(raw_get, dict) else None
                 raw_status = raw_agent.get("agent_status") if isinstance(raw_agent, dict) else None
             if status not in {"SETTLED", "TERMINATED"} and raw_status != "done" and value["attempt_id"] not in self._settled: raise _fail("ARTIFACT_UNAVAILABLE", "collect requires an observed completed turn or settled attempt")
@@ -1336,13 +1336,13 @@ class HerdrProvider:
         try:
             worktree_root = _canonical_dir(str(self._attempt_paths[value["attempt_id"]]), "worktree")
             self._exec([self.herdr, "worktree", "remove", "--workspace", value["host"]["workspace_id"], "--force"], timeout_ms=120_000)
-            workspace_response = _envelope(self._exec([self.herdr, "workspace", "list"], timeout_ms=10_000), "workspace list")
+            workspace_response = _envelope(self._exec([self.herdr, "workspace", "list"], timeout_ms=10_000), "workspace list", {"cli:workspace:list"})
             workspace_result = workspace_response["result"]
             if not isinstance(workspace_result, dict) or workspace_result.get("type") != "workspace_list" or not isinstance(workspace_result.get("workspaces"), list): raise _fail("CLEANUP_UNKNOWN", "workspace list is malformed")
             for workspace in workspace_result["workspaces"]:
                 if not isinstance(workspace, dict) or not isinstance(workspace.get("workspace_id"), str): raise _fail("CLEANUP_UNKNOWN", "workspace identity is malformed")
                 if workspace["workspace_id"] == value["host"]["workspace_id"]: raise _fail("CLEANUP_UNKNOWN", "workspace remains after cleanup")
-            worktree_response = _envelope(self._exec([self.herdr, "worktree", "list"], timeout_ms=10_000), "worktree list")
+            worktree_response = _envelope(self._exec([self.herdr, "worktree", "list"], timeout_ms=10_000), "worktree list", {"cli:worktree:list"})
             worktree_result = worktree_response["result"]
             if not isinstance(worktree_result, dict) or worktree_result.get("type") != "worktree_list" or not isinstance(worktree_result.get("worktrees"), list): raise _fail("CLEANUP_UNKNOWN", "worktree list is malformed")
             root_text = str(worktree_root)
