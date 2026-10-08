@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import shutil
+import time
 from typing import Callable, Mapping, Sequence
 
 from .protocol import ERROR_CODES, ProtocolError, canonical_json, raw_file_digest
@@ -617,6 +618,9 @@ class HerdrProvider:
                 try: canonical_session_path = session_path.resolve(strict=False)
                 except OSError: return None
                 if session_path != canonical_session_path or not canonical_session_path.is_relative_to(session_root): return None
+                try: stat = canonical_session_path.stat()
+                except OSError: return None
+                if not canonical_session_path.is_file() or canonical_session_path.is_symlink() or stat.st_nlink != 1: return None
                 return canonical_session_path
             canonical_session_path = path_session(agent) or path_session(result)
             if canonical_session_path is None:
@@ -625,8 +629,8 @@ class HerdrProvider:
                     observed_agent = observed.get("agent") if isinstance(observed, dict) and isinstance(observed.get("agent"), dict) else observed
                     canonical_session_path = path_session(observed_agent) or path_session(observed)
                     if canonical_session_path is not None: break
-            if canonical_session_path is None: raise _fail("FRESH_CONTEXT_FAILED", "Pi session path identity was not verified")
-            opaque_session = "pi-session-" + hashlib.sha256(str(canonical_session_path).encode("utf-8")).hexdigest()
+            opaque_session = "pending"
+            if canonical_session_path is not None: opaque_session = "pi-session-" + hashlib.sha256(str(canonical_session_path).encode("utf-8")).hexdigest()
             result = {"agent_id": agent_id, "workspace_id": agent["workspace_id"], "tab_id": agent["tab_id"], "pane_id": agent["pane_id"], "pi_session_id": opaque_session}
             if any(result[key] != value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")): raise _fail("IDENTITY_MISMATCH", "agent host identity differs")
             pane = _envelope(self._exec([self.herdr, "pane", "get", value["host"]["pane_id"]], timeout_ms=10_000), "pane")
@@ -638,12 +642,16 @@ class HerdrProvider:
             if self.private_root is None: raise _fail("INVALID_REQUEST", "provider private root is unavailable")
             private_dir = _canonical_dir(str(self.private_root), "private_root") / "handles"
             private_dir.mkdir(mode=0o700, exist_ok=True)
-            session_record = {"schema_version": 1, "kind": "pi_session", "handle_id": result["agent_id"], "attempt_id": value["attempt_id"], "request_digest": evidence["request_digest"], "host": value["host"], "pi_session_path": str(canonical_session_path), "pi_session_id": opaque_session}
-            session_record["record_digest"] = raw_file_digest(canonical_json(session_record))
             session_path_file = private_dir / ("pi-session-" + result["agent_id"] + ".json")
-            session_path_file.write_bytes(canonical_json(session_record))
             session_record_ref = "handles/" + session_path_file.name
-            private = {"schema_version": 1, "handle": handle, "agent_id": result["agent_id"], "pi_session_id": result["pi_session_id"], "capability_report_digest": evidence["capability_report_digest"], "session_record_ref": session_record_ref, "session_record_digest": session_record["record_digest"], "handle_digest": raw_file_digest(canonical_json(handle)), "paths": {"worktree": value["worktree"], "output_root": value["output_root"], "session_root": value["session_root"]}, "attempt_path": value["worktree"], "attempt_ref": "."}
+            session_record_digest = None; session_status = "pending"
+            if canonical_session_path is not None:
+                session_record = {"schema_version": 1, "kind": "pi_session", "handle_id": result["agent_id"], "attempt_id": value["attempt_id"], "request_digest": evidence["request_digest"], "host": value["host"], "pi_session_path": str(canonical_session_path), "pi_session_id": opaque_session}
+                session_record["record_digest"] = raw_file_digest(canonical_json(session_record))
+                fd = os.open(session_path_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "wb") as stream: stream.write(canonical_json(session_record)); stream.flush(); os.fsync(stream.fileno())
+                session_record_digest = session_record["record_digest"]; session_status = "bound"
+            private = {"schema_version": 1, "handle": handle, "agent_id": result["agent_id"], "pi_session_id": result["pi_session_id"], "session_status": session_status, "capability_report_digest": evidence["capability_report_digest"], "session_record_ref": session_record_ref, "session_record_digest": session_record_digest, "handle_digest": raw_file_digest(canonical_json(handle)), "paths": {"worktree": value["worktree"], "output_root": value["output_root"], "session_root": value["session_root"]}, "attempt_path": value["worktree"], "attempt_ref": "."}
             private["record_digest"] = raw_file_digest(canonical_json(private))
             private_path = private_dir / ("handle-" + result["agent_id"] + ".json")
             private_bytes = canonical_json(private)
@@ -689,6 +697,32 @@ class HerdrProvider:
         settled.update({"event": "SETTLED", "settled_at": _now(), "outcome": outcome, "evidence_refs": collected + supplemental, "prev_digest": started["record_digest"], "cleanup": cleanup})
         settled["record_digest"] = raw_file_digest(canonical_json(settled)); self.ledger.append(settled); self._settled.add(handle["attempt_id"])
 
+    def _bind_session_if_available(self, value: Mapping[str, object]) -> bool:
+        private = self._private_handles.get(value["handle_id"])
+        if private is None or private["session_status"] == "bound": return True
+        session_root = _canonical_dir(private["paths"]["session_root"], "session_root")
+        candidate_path = None
+        for attempt in range(3):
+            observed = _envelope(self._exec([self.herdr, "agent", "get", value["handle_id"]], timeout_ms=_CLI_TIMEOUT_MS), "agent get")["result"]
+            agent = observed.get("agent") if isinstance(observed, dict) and isinstance(observed.get("agent"), dict) else observed
+            session = agent.get("agent_session") if isinstance(agent, dict) else None
+            if isinstance(session, dict) and session.get("kind") == "path" and session.get("agent") == "pi" and isinstance(session.get("value"), str) and Path(session["value"]).is_absolute():
+                path = Path(session["value"])
+                try: canonical = path.resolve(strict=False); stat = canonical.stat()
+                except OSError: canonical = None
+                if canonical is not None and path == canonical and canonical.is_relative_to(session_root) and canonical.is_file() and not canonical.is_symlink() and stat.st_nlink == 1: candidate_path = canonical; break
+            if attempt < 2: time.sleep(0.05)
+        if candidate_path is None: return False
+        opaque = "pi-session-" + hashlib.sha256(str(candidate_path).encode("utf-8")).hexdigest()
+        record = {"schema_version": 1, "kind": "pi_session", "handle_id": value["handle_id"], "attempt_id": value["attempt_id"], "request_digest": value["request_digest"], "host": value["host"], "pi_session_path": str(candidate_path), "pi_session_id": opaque}
+        record["record_digest"] = raw_file_digest(canonical_json(record))
+        private_base = _canonical_dir(str(self.private_root), "private_root"); path = private_base / private["session_record_ref"]
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as stream: stream.write(canonical_json(record)); stream.flush(); os.fsync(stream.fileno())
+        except FileExistsError as exc: raise _fail("RESOURCE_REUSED", "session binding already exists") from exc
+        return True
+
     def _handle(self, handle: Mapping[str, object]) -> dict[str, object]:
         fields = {"provider_id", "handle_id", "request_digest", "attempt_id", "host", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest"}
         value = _closed(handle, fields, "handle")
@@ -699,26 +733,42 @@ class HerdrProvider:
         private_path = _canonical_dir(str(self.private_root), "private_root") / "handles" / ("handle-" + value["handle_id"] + ".json")
         try: private = json.loads(private_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "durable private handle evidence is unavailable") from exc
-        private = _closed(private, {"schema_version", "handle", "agent_id", "pi_session_id", "capability_report_digest", "session_record_ref", "session_record_digest", "handle_digest", "paths", "attempt_path", "attempt_ref", "record_digest"}, "private handle")
+        private = _closed(private, {"schema_version", "handle", "agent_id", "pi_session_id", "session_status", "capability_report_digest", "session_record_ref", "session_record_digest", "handle_digest", "paths", "attempt_path", "attempt_ref", "record_digest"}, "private handle")
         paths = _closed(private["paths"], {"worktree", "output_root", "session_root"}, "private handle paths")
         private_base = _canonical_dir(str(self.private_root), "private_root")
         for name in paths:
             path = _canonical_dir(paths[name], name)
             if name != "worktree" and not path.is_relative_to(private_base): raise _fail("PATH_ESCAPE", "private handle path escapes provider root")
-        _digest(private["capability_report_digest"], "capability_report_digest"); _digest(private["session_record_digest"], "session_record_digest")
+        _digest(private["capability_report_digest"], "capability_report_digest")
+        if private["session_status"] not in {"pending", "bound"}: raise _fail("IDENTITY_MISMATCH", "invalid private session status")
         if not isinstance(private["session_record_ref"], str) or PurePosixPath(private["session_record_ref"]).is_absolute() or ".." in PurePosixPath(private["session_record_ref"]).parts:
             raise _fail("PATH_ESCAPE", "private session record reference escapes root")
         session_record_path = private_base / private["session_record_ref"]
-        try: session_record = json.loads(session_record_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "private session record is unavailable") from exc
-        session_record = _closed(session_record, {"schema_version", "kind", "handle_id", "attempt_id", "request_digest", "host", "pi_session_path", "pi_session_id", "record_digest"}, "private session record")
-        session_body = {key: session_record[key] for key in session_record if key != "record_digest"}
-        if session_record["record_digest"] != raw_file_digest(canonical_json(session_body)) or private["session_record_digest"] != session_record["record_digest"] or session_record["handle_id"] != private["agent_id"] or session_record["attempt_id"] != value["attempt_id"] or session_record["request_digest"] != value["request_digest"] or session_record["host"] != value["host"] or session_record["kind"] != "pi_session":
-            raise _fail("IDENTITY_MISMATCH", "private session binding differs")
-        session_root = _canonical_dir(paths["session_root"], "session_root")
-        session_path = Path(session_record["pi_session_path"])
-        if not session_path.is_absolute() or session_path != session_path.resolve(strict=False) or not session_path.is_relative_to(session_root) or session_record["pi_session_id"] != "pi-session-" + hashlib.sha256(str(session_path).encode("utf-8")).hexdigest():
-            raise _fail("IDENTITY_MISMATCH", "private session path identity differs")
+        if private["session_status"] == "pending":
+            if private["session_record_digest"] is not None: raise _fail("IDENTITY_MISMATCH", "pending session digest is unexpected")
+            if session_record_path.exists():
+                try: pending_record = json.loads(session_record_path.read_text(encoding="utf-8"))
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "pending session binding is malformed") from exc
+                pending_record = _closed(pending_record, {"schema_version", "kind", "handle_id", "attempt_id", "request_digest", "host", "pi_session_path", "pi_session_id", "record_digest"}, "private session record")
+                session_root = _canonical_dir(paths["session_root"], "session_root"); pending_path = Path(pending_record["pi_session_path"])
+                try: pending_stat = pending_path.stat()
+                except OSError as exc: raise _fail("IDENTITY_MISMATCH", "pending session path is unavailable") from exc
+                if pending_record["kind"] != "pi_session" or pending_record["handle_id"] != private["agent_id"] or pending_record["attempt_id"] != value["attempt_id"] or pending_record["request_digest"] != value["request_digest"] or pending_record["host"] != value["host"] or pending_record["record_digest"] != raw_file_digest(canonical_json({key: pending_record[key] for key in pending_record if key != "record_digest"})) or not pending_path.is_absolute() or pending_path != pending_path.resolve(strict=False) or not pending_path.is_relative_to(session_root) or not pending_path.is_file() or pending_path.is_symlink() or pending_stat.st_nlink != 1 or pending_record["pi_session_id"] != "pi-session-" + hashlib.sha256(str(pending_path).encode("utf-8")).hexdigest():
+                    raise _fail("IDENTITY_MISMATCH", "pending session binding differs")
+            
+        else:
+            _digest(private["session_record_digest"], "session_record_digest")
+            try: session_record = json.loads(session_record_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "private session record is unavailable") from exc
+            session_record = _closed(session_record, {"schema_version", "kind", "handle_id", "attempt_id", "request_digest", "host", "pi_session_path", "pi_session_id", "record_digest"}, "private session record")
+            session_body = {key: session_record[key] for key in session_record if key != "record_digest"}
+            if session_record["record_digest"] != raw_file_digest(canonical_json(session_body)) or private["session_record_digest"] != session_record["record_digest"] or session_record["handle_id"] != private["agent_id"] or session_record["attempt_id"] != value["attempt_id"] or session_record["request_digest"] != value["request_digest"] or session_record["host"] != value["host"] or session_record["kind"] != "pi_session":
+                raise _fail("IDENTITY_MISMATCH", "private session binding differs")
+            session_root = _canonical_dir(paths["session_root"], "session_root"); session_path = Path(session_record["pi_session_path"])
+            try: stat = session_path.stat()
+            except OSError as exc: raise _fail("IDENTITY_MISMATCH", "bound session path is unavailable") from exc
+            if not session_path.is_absolute() or session_path != session_path.resolve(strict=False) or not session_path.is_relative_to(session_root) or not session_path.is_file() or session_path.is_symlink() or stat.st_nlink != 1 or session_record["pi_session_id"] != "pi-session-" + hashlib.sha256(str(session_path).encode("utf-8")).hexdigest():
+                raise _fail("IDENTITY_MISMATCH", "private session path identity differs")
         record_body = {key: private[key] for key in private if key != "record_digest"}
         if private["schema_version"] != 1 or private["handle"] != value or private["handle_digest"] != raw_file_digest(canonical_json(value)) or private["record_digest"] != raw_file_digest(canonical_json(record_body)) or private["attempt_path"] != paths["worktree"] or private["attempt_ref"] != ".": raise _fail("IDENTITY_MISMATCH", "handle evidence differs")
         cached = self._private_handles.get(value["handle_id"])
@@ -804,6 +854,7 @@ class HerdrProvider:
 
     def _inspect_handle(self, handle: Mapping[str, object]) -> object:
         value = self._handle(handle); response = _envelope(self._exec([self.herdr, "agent", "get", value["handle_id"]], timeout_ms=10_000), "inspect"); result = response["result"]
+        self._bind_session_if_available(value)
         if not isinstance(result, dict) or not all(key in result for key in ("status", "workspace_id", "tab_id", "pane_id", "observed_at", "source")):  raise _fail("ARTIFACT_UNAVAILABLE", "invalid Herdr status")
         for key in ("workspace_id", "tab_id", "pane_id", "source", "status"):
             if not isinstance(result[key], str): raise _fail("ARTIFACT_UNAVAILABLE", "invalid Herdr status")
@@ -815,7 +866,9 @@ class HerdrProvider:
     def read(self, handle: Mapping[str, object], *, lines: int = 160) -> bytes:
         value = self._handle(handle)
         if not isinstance(lines, int) or lines <= 0: raise _fail("INVALID_REQUEST", "invalid line bound")
-        return self._exec([self.herdr, "agent", "read", value["handle_id"], "--source", "recent-unwrapped", "--lines", str(min(lines, 10_000))], timeout_ms=10_000, max_output=1_048_576)
+        data = self._exec([self.herdr, "agent", "read", value["handle_id"], "--source", "recent-unwrapped", "--lines", str(min(lines, 10_000))], timeout_ms=10_000, max_output=1_048_576)
+        self._bind_session_if_available(value)
+        return data
 
     def wait(self, handle: Mapping[str, object], *, timeout_ms: int) -> object:
         value = self._handle(handle)
@@ -856,6 +909,7 @@ class HerdrProvider:
         try:
             self._exec([self.herdr, "agent", "send-keys", value["handle_id"], "ctrl-c"], timeout_ms=10_000)
             observed = self._inspect_handle(value)["result"]["status"]
+            self._bind_session_if_available(value)
             cleanup = "confirmed" if observed in {"SETTLED", "TERMINATED"} else "uncertain"
             response = {"schema_version": 1, "ok": True, "request_id": request_id, "result": {"attempt_id": value["attempt_id"], "host": value["host"], "requested": True, "observed": observed, "cleanup": cleanup}}
             interrupt_record = {"schema_version": 1, "kind": "interrupt_result", "request_id": request_id, "handle_id": value["handle_id"], "request_digest": value["request_digest"], "reason": reason, "reason_digest": raw_file_digest(canonical_json({"reason": reason})), "outcome": {"ok": True, "response": response, "error": None}}
@@ -888,6 +942,7 @@ class HerdrProvider:
             status_response = self._inspect_handle(value); status = status_response["result"]["status"]
             if status not in {"SETTLED", "TERMINATED"}: raise _fail("ARTIFACT_UNAVAILABLE", "collect requires an observed terminal status")
             data = self.read(value)
+            session_available = self._bind_session_if_available(value)
             output_root, session_root = self._attempt_roots[value["attempt_id"]]
             output_artifact = output_root / ("agent-read-" + value["attempt_id"] + ".bin")
             status_bytes = canonical_json(status_response["result"])
