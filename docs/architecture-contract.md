@@ -1,7 +1,7 @@
 # ADR: Razr-Pi architecture contract
 
-- **Status:** accepted for M01 implementation planning; revision 2 approved in M01b PR #4
-- **Revision 2 migration note:** `CoreRequest.expected_commit` is now required and binds source identity to an explicitly verified full commit; `ReadbackResult` retains private raw bytes for immutable workflow projection, whose state path is derived from committed `work_root`. No foundation consumers exist yet, so no consumer migration is required; serialized review is performed in this PR. Revision 1 remains preserved in Git history.
+- **Status:** accepted for M01 implementation planning; revision 3 approved in M01b PR #4
+- **Revision 3 migration note:** the pre-consumer revision 2 `expected_commit` change is retained; revision 3 clarifies that config parsing is transport-only, core remains semantic authority, and workflow projection is minimal after core PASS. No foundation consumers exist yet, so no consumer migration is required; serialized review is performed in this PR. Revisions 1 and 2 remain preserved in Git history.
 - **Scope:** M02–M05 only; this document does not implement those missions
 
 ## 1. Authority and boundaries
@@ -167,6 +167,8 @@ class CoreResponse:
     provenance: tuple[ProvenancePin, ...]
     source_digest: str  # core source-tree sha256
     readback: tuple[ReadbackResult, ...]
+
+`CoreResponse.request_id` is the adapter correlation copied from the closed request after the local invocation; the core subprocess does not claim or echo a protocol request ID. Adapter calls verify the closed request identity before constructing the response.
 
 ErrorCode = Literal[
     "INVALID_REQUEST", "OUTPUT_LIMIT", "TIMEOUT", "INTERRUPTED", "CORE_EXIT",

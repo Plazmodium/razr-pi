@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "packages/razr-pi"))
 
 from adapter.core_subprocess import (_environment, _git_head, _readback, _reject_dirty_checkout,
-                                      _source_digest, _validate_core_config, _workflow_projection, invoke_core)
+                                      _source_digest, _extract_work_root, _workflow_projection, invoke_core)
 from adapter.protocol import (CoreRequest, CoreResponse, ProtocolError, ProvenancePin, ReadbackResult,
                               ReadbackSpec, canonical_json, raw_file_digest, validate_git_object_id,
                               validate_source_digest)
@@ -110,12 +110,11 @@ class AdapterFoundationTests(unittest.TestCase):
         valid = {"schema_version": 1, "work_root": ".razr/work", "retention": "commit",
                  "adapter": {"mode": "process-local", "max_active_work_items": 5,
                  "queue_order": ["priority", "approved_at", "id"]}}
-        self.assertEqual(_validate_core_config(valid), ".razr/work")
-        for bad in ({**valid, "extra": 1}, {**valid, "schema_version": True},
-                    {**valid, "work_root": "../escape"},
-                    {**valid, "adapter": {"mode": "process-local"}}):
+        self.assertEqual(_extract_work_root(valid), ".razr/work")
+        for bad in ({"schema_version": 1}, {**valid, "work_root": "../escape"},
+                    {**valid, "work_root": 7}, {**valid, "work_root": ""}):
             with self.assertRaises(ValueError):
-                _validate_core_config(bad)
+                _extract_work_root(bad)
 
     def test_raw_readback_preserves_bytes_and_rejects_malformed_json(self):
         with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:

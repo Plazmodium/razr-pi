@@ -193,20 +193,28 @@ def _git_head(root: Path) -> str:
 
 
 def _reject_dirty_checkout(root: Path, work_root: str) -> None:
+    env = _environment()
     try:
-        result = subprocess.run(["git", "-C", str(root), "status", "--porcelain=v1", "-z", "--untracked-files=all"],
-                                env=_environment(), cwd=root, capture_output=True, check=False, timeout=10)
+        status = subprocess.run(["git", "-C", str(root), "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+                                env=env, cwd=root, capture_output=True, check=False, timeout=10)
+        untracked = subprocess.run(["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z"],
+                                   env=env, cwd=root, capture_output=True, check=False, timeout=10)
+        ignored = subprocess.run(["git", "-C", str(root), "ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+                                 env=env, cwd=root, capture_output=True, check=False, timeout=10)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise _fail("IDENTITY_MISMATCH", "Git dirtiness query unavailable") from exc
-    if result.returncode or result.stderr:
+    if any(result.returncode or result.stderr for result in (status, untracked, ignored)):
         raise _fail("IDENTITY_MISMATCH", "Git dirtiness query failed")
-    # The only owned untracked/private output-cache area is the committed work_root.
-    # No other output/cache directory is permitted; source and config remain tracked.
+    # The only owned private output/cache policy is the configured work_root.
+    # No other ignored, untracked, source, or configuration path is owned.
     prefix = work_root.rstrip("/") + "/"
-    for entry in result.stdout.split(b"\0"):
-        if not entry:
-            continue
-        raw_path = entry[3:] if len(entry) >= 3 else b""
+    paths: list[bytes] = []
+    for entry in status.stdout.split(b"\0"):
+        if entry and entry[:2] != b"??":
+            paths.append(entry[3:])
+    paths.extend(path for path in untracked.stdout.split(b"\0") if path)
+    paths.extend(path for path in ignored.stdout.split(b"\0") if path)
+    for raw_path in paths:
         try:
             path = raw_path.decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -251,21 +259,11 @@ def _source_digest(root: Path, commit: str) -> str:
     return "sha256:" + hashlib.sha256(b"".join(entries)).hexdigest()
 
 
-def _validate_core_config(value: object) -> str:
-    if not isinstance(value, dict) or set(value) != {"schema_version", "work_root", "retention", "adapter"}:
-        raise ValueError("config fields differ")
-    if not isinstance(value["schema_version"], int) or isinstance(value["schema_version"], bool) or value["schema_version"] != 1 or value["retention"] != "commit":
-        raise ValueError("config scalar differs")
+def _extract_work_root(value: object) -> str:
+    """Transport-only config parsing; core remains the semantic config authority."""
+    if not isinstance(value, dict) or "work_root" not in value or not isinstance(value["work_root"], str) or not value["work_root"]:
+        raise ValueError("work_root is unavailable")
     work = value["work_root"]
-    adapter = value["adapter"]
-    if not isinstance(work, str) or not work or not isinstance(adapter, dict):
-        raise ValueError("config types differ")
-    if set(adapter) != {"mode", "max_active_work_items", "queue_order"}:
-        raise ValueError("adapter fields differ")
-    if adapter["mode"] != "process-local" or not isinstance(adapter["max_active_work_items"], int) or isinstance(adapter["max_active_work_items"], bool) or adapter["max_active_work_items"] != 5:
-        raise ValueError("adapter scalar differs")
-    if adapter["queue_order"] != ["priority", "approved_at", "id"]:
-        raise ValueError("adapter queue differs")
     path = PurePosixPath(work)
     if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
         raise ValueError("unsafe work root")
@@ -290,8 +288,8 @@ def _core_work_root(root: Path, commit: str) -> str:
             raise _fail("SOURCE_CHANGED", "live razr.yaml differs from commit")
         committed_value = json.loads(committed.decode("utf-8"), object_pairs_hook=_json_object)
         live_value = json.loads(live_bytes.decode("utf-8"), object_pairs_hook=_json_object)
-        committed_work = _validate_core_config(committed_value)
-        live_work = _validate_core_config(live_value)
+        committed_work = _extract_work_root(committed_value)
+        live_work = _extract_work_root(live_value)
         if committed_value != live_value or committed_work != live_work:
             raise _fail("SOURCE_CHANGED", "live razr.yaml semantics differ from commit")
         return committed_work
@@ -377,15 +375,15 @@ def _workflow_projection(status_row: object, state: object, work_id: str, node_i
     _nullable_string(status_row["pull_request"])
     if not isinstance(state, dict):
         raise _fail("READBACK_FAILED", "state is not an object")
-    required = {"schema_version", "id", "stage", "status", "generation", "created_at", "depth", "priority", "approved_at", "spec", "executable", "nodes", "trajectory", "candidate", "critics", "delivery", "last_transition"}
-    if not required <= set(state) or state["schema_version"] != 1 or state["id"] != work_id:
-        raise _fail("READBACK_FAILED", "state required fields differ")
+    required = {"id", "stage", "status", "generation", "depth", "priority", "approved_at", "nodes", "candidate", "delivery"}
+    if not required <= set(state) or state["id"] != work_id:
+        raise _fail("READBACK_FAILED", "state projection fields differ")
     if state["stage"] != status_row["stage"] or state["status"] != status_row["status"] or state["depth"] != status_row["depth"] or state["priority"] != status_row["priority"]:
         raise _fail("READBACK_FAILED", "state and status row differ")
     if state["approved_at"] != status_row["approved_at"]:
         raise _fail("READBACK_FAILED", "approval fields differ")
-    if not isinstance(state["generation"], int) or isinstance(state["generation"], bool) or state["generation"] < 1 or not isinstance(state["created_at"], str):
-        raise _fail("READBACK_FAILED", "state scalar domain differs")
+    if not isinstance(state["generation"], int) or isinstance(state["generation"], bool) or state["generation"] < 1:
+        raise _fail("READBACK_FAILED", "state generation domain differs")
     _nullable_string(state["approved_at"])
     candidate = state["candidate"]
     if not isinstance(candidate, dict) or set(candidate) != {"repository", "branch", "commit", "source_digest"}:
