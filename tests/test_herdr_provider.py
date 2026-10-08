@@ -51,13 +51,14 @@ class HerdrProviderTests(unittest.TestCase):
         calls = []
         def run(argv, **kwargs):
             calls.append((argv, kwargs))
-            help_text = b"--no-session --session --continue --resume --cwd --path --pane --timeout --lines pane"
+            help_text = b"Provider Model --no-session --session --continue --resume --cwd --path --pane --timeout --lines --workspace cwd pane"
             if argv[:2] == ["pi", "--list-models"]: return subprocess.CompletedProcess(argv, 0, b"Provider    Model             Context\nopenai-codex gpt-5.6-luna      200000\n", b"")
             return subprocess.CompletedProcess(argv, 0, help_text, b"")
         result = HerdrProvider(runner=run).probe({"schema_version": 1, "request_id": "probe-1", "required_capabilities": list(("fresh_context", "working_directory", "bounded_time", "bounded_output", "runtime_identity")), "runtime": {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "thinking": "medium"}})
         self.assertEqual(result["request_id"], "probe-1")
         self.assertEqual(result["result"]["runtime_identity"], "openai-codex/gpt-5.6-luna:medium")
-        self.assertEqual([call[0][:2] for call in calls], [["herdr", "--help"], ["herdr", "agent"], ["herdr", "agent"], ["herdr", "worktree"], ["herdr", "pane"], ["pi", "--help"], ["pi", "--list-models"]])
+        self.assertTrue({"working_directory", "bounded_time", "bounded_output"} <= set(result["result"]["capabilities"]))
+        self.assertEqual([call[0][:2] for call in calls], [["herdr", "--help"], ["herdr", "agent"], ["herdr", "agent"], ["herdr", "worktree"], ["herdr", "worktree"], ["herdr", "pane"], ["herdr", "pane"], ["pi", "--help"], ["pi", "--list-models"]])
         self.assertTrue(all(call[1]["shell"] is False and call[1]["stdin"] is subprocess.DEVNULL for call in calls))
 
     def test_malformed_and_timeout_are_mechanical_errors(self):

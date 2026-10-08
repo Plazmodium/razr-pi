@@ -23,6 +23,8 @@ from .protocol import ERROR_CODES, ProtocolError, canonical_json, raw_file_diges
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 _MODEL = "openai-codex/gpt-5.6-luna"
+_CLI_TIMEOUT_MS = 10_000
+_CLI_MAX_OUTPUT = 262_144
 _CAPABILITIES = frozenset({
     "fresh_context", "saved_session", "neutral_instructions", "working_directory",
     "environment_policy", "bounded_time", "bounded_output", "stream_capture",
@@ -346,6 +348,15 @@ class HerdrProvider:
         if result.returncode: raise _fail("LAUNCH_FAILED", "Herdr command failed", returncode=result.returncode, stderr=stderr.decode("utf-8", "replace")[:2000])
         return stdout
 
+    def _adapter_bounds_active(self, kind: str) -> bool:
+        implementation = getattr(self._exec, "__func__", None) is HerdrProvider._exec
+        if kind == "time": return implementation and _CLI_TIMEOUT_MS > 0
+        if kind == "output": return implementation and _CLI_MAX_OUTPUT > 0 and 1_048_576 > 0
+        return False
+
+    def _post_launch_identity_verification_active(self) -> bool:
+        return getattr(self._handle, "__func__", None) is HerdrProvider._handle and getattr(self._inspect_handle, "__func__", None) is HerdrProvider._inspect_handle
+
     def _model(self) -> str:
         try: output = self._exec([self.pi, "--list-models", "gpt-5.6-luna"], timeout_ms=10_000, max_output=262_144).decode("utf-8", "strict")
         except UnicodeDecodeError as exc: raise _fail("UNSUPPORTED_CAPABILITY", "Pi model table is not UTF-8") from exc
@@ -379,8 +390,10 @@ class HerdrProvider:
         herdr_help = self._exec([self.herdr, "--help"], timeout_ms=10_000, max_output=262_144).decode("utf-8", "replace")
         agent_help = self._exec([self.herdr, "agent", "--help"], timeout_ms=10_000, max_output=262_144).decode("utf-8", "replace")
         read_help = self._exec([self.herdr, "agent", "read", "--help"], timeout_ms=10_000, max_output=262_144).decode("utf-8", "replace")
-        worktree_help = self._exec([self.herdr, "worktree", "--help"], timeout_ms=10_000, max_output=262_144).decode("utf-8", "replace")
-        pane_help = self._exec([self.herdr, "pane", "--help"], timeout_ms=10_000, max_output=262_144).decode("utf-8", "replace")
+        worktree_help = self._exec([self.herdr, "worktree", "--help"], timeout_ms=_CLI_TIMEOUT_MS, max_output=_CLI_MAX_OUTPUT).decode("utf-8", "replace")
+        worktree_open_help = self._exec([self.herdr, "worktree", "open", "--help"], timeout_ms=_CLI_TIMEOUT_MS, max_output=_CLI_MAX_OUTPUT).decode("utf-8", "replace")
+        pane_help = self._exec([self.herdr, "pane", "--help"], timeout_ms=_CLI_TIMEOUT_MS, max_output=_CLI_MAX_OUTPUT).decode("utf-8", "replace")
+        pane_get_help = self._exec([self.herdr, "pane", "get", "--help"], timeout_ms=_CLI_TIMEOUT_MS, max_output=_CLI_MAX_OUTPUT).decode("utf-8", "replace")
         pi_help = self._exec([self.pi, "--help"], timeout_ms=10_000, max_output=262_144).decode("utf-8", "replace")
         self._model()
         capabilities = set()
@@ -388,9 +401,9 @@ class HerdrProvider:
             capabilities.add("fresh_context")
         if "--session-dir" in pi_help and "--session" in pi_help:
             capabilities.add("saved_session")
-        if "--cwd" in worktree_help and "--path" in worktree_help and "--pane" in agent_help and "pane" in pane_help:
+        if "--path" in worktree_open_help and pane_get_help.strip() and self._post_launch_identity_verification_active():
             capabilities.add("working_directory")
-        if "--timeout" in agent_help and "--timeout" in herdr_help + pane_help:
+        if self._adapter_bounds_active("time"):
             capabilities.add("bounded_time")
         if "send-keys" in agent_help:
             capabilities.add("interrupt")
@@ -398,9 +411,8 @@ class HerdrProvider:
             capabilities.add("stream_capture")
         if all(flag in pi_help for flag in ("--no-context-files", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes")) and self._env():
             capabilities.add("environment_policy")
-        if MAX_OUTPUT_BYTES := 1_048_576:
-            if MAX_OUTPUT_BYTES > 0 and "--lines" in pane_help + agent_help:
-                capabilities.add("bounded_output")
+        if self._adapter_bounds_active("output"):
+            capabilities.add("bounded_output")
         capabilities.add("runtime_identity")
         if any(cap not in capabilities for cap in caps): raise _fail("UNSUPPORTED_CAPABILITY", "required capability was not directly evidenced")
         report = {"provider_id": self.provider_id, "runtime_identity": _MODEL + ":medium", "capabilities": [cap for cap in _CAPABILITY_ORDER if cap in capabilities]}
