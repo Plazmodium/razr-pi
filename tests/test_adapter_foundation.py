@@ -245,6 +245,15 @@ class AdapterFoundationTests(unittest.TestCase):
         finally:
             os.environ.update(forbidden)
         self.assertEqual(caught.exception.code, "PROVENANCE_MISMATCH")
+        substitute = dataclasses.replace(request, runtime_script=(package / "runtime/AGENTS.project-razr.md").resolve())
+        forbidden = {name: os.environ.pop(name) for name in list(os.environ)
+                     if name.startswith("GIT_") and name not in {"GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_OPTIONAL_LOCKS", "GIT_TERMINAL_PROMPT"}}
+        try:
+            with self.assertRaises(ProtocolError) as substituted:
+                invoke_core(substitute)
+        finally:
+            os.environ.update(forbidden)
+        self.assertEqual(substituted.exception.code, "INVALID_REQUEST")
 
 
 if __name__ == "__main__":

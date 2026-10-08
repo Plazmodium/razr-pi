@@ -62,8 +62,11 @@ def _validate_request(request: CoreRequest) -> tuple[Path, Path, Path]:
     package = _canonical(request.package_root, directory=True)
     python = _canonical(request.python_executable, directory=False)
     runtime = _canonical(request.runtime_script, directory=False)
-    if not runtime.is_relative_to(package):
-        raise _fail("INVALID_REQUEST", "runtime script is outside package")
+    expected_runtime = package / "runtime/scripts/razr.py"
+    if not expected_runtime.is_file() or expected_runtime.is_symlink():
+        raise _fail("PROVENANCE_MISMATCH", "pinned core entrypoint is unavailable")
+    if runtime != expected_runtime:
+        raise _fail("INVALID_REQUEST", "runtime script is not the pinned core entrypoint")
     if not isinstance(request.argv, tuple) or not all(isinstance(v, str) and v for v in request.argv):
         raise _fail("INVALID_REQUEST", "invalid core arguments")
     for value, maximum, name in ((request.timeout_ms, DEFAULT_TIMEOUT_MS, "timeout_ms"),
@@ -100,6 +103,8 @@ def _validate_request(request: CoreRequest) -> tuple[Path, Path, Path]:
             path = package / "runtime" / relative
             if not path.is_file() or path.is_symlink() or raw_file_digest(path.read_bytes()) != "sha256:" + pin.sha256:
                 raise _fail("PROVENANCE_MISMATCH", "pinned runtime file differs", path=relative)
+        if raw_file_digest(runtime.read_bytes()) != "sha256:" + pins["scripts/razr.py"].sha256:
+            raise _fail("PROVENANCE_MISMATCH", "runtime entrypoint bytes differ")
             if rows.get(relative) != pin.sha256:
                 raise _fail("PROVENANCE_MISMATCH", "provenance declaration differs", path=relative)
     except ProtocolError:
