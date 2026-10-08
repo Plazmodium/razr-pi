@@ -8,6 +8,7 @@ SOURCE_BASELINE.md
 docs/05-vertical-slices.md
 docs/CURRENT.md
 docs/architecture.md
+docs/architecture-contract.md
 docs/audits/evidence-storage.md
 docs/audits/task-attempt-lifecycle.md
 docs/campaigns/razr-pi-next.md
