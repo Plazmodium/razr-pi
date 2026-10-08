@@ -4,6 +4,10 @@ Review [the skill](skills/razr/SKILL.md) and [managed routing](runtime/AGENTS.pr
 
 The package resolves helpers and runtime internally. The core and five canonical templates are unchanged snapshots identified by [provenance](runtime/provenance.json). Provenance is not execution proof or licensing clearance.
 
+Stable adapter surfaces:
+
+- `adapter/memory.py`: deterministic repository-local append-only Memory for M03/M05; it stores experience only and never owns workflow state.
+
 Supported helper surfaces:
 
 - `scripts/adopt.py`: explicit exact-root preflight, then unchanged core initialization.
