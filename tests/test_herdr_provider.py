@@ -124,6 +124,8 @@ class HerdrProviderTests(unittest.TestCase):
             provider = HerdrProvider(runner=run, ledger=ledger, private_root=private)
             response = provider.launch(request); handle = response["result"]["handle"]
             self.assertEqual(set(handle), {"provider_id", "handle_id", "request_digest", "attempt_id", "host", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest"})
+            self.assertEqual(response["result"]["capability_report_digest"], provider.probe({"schema_version": 1, "request_id": "probe-after-launch", "required_capabilities": ["runtime_identity"], "runtime": request["runtime"]})["result"]["report_digest"])
+            self.assertEqual(provider.inspect({"schema_version": 1, "request_id": "inspect-unique", "handle": handle})["request_id"], "inspect-unique")
             recovery = {"schema_version": 1, "request_id": "recover-1", "attempt_id": "att-1", "recovery_authority": {"kind": "explicit", "authority_id": "human-1", "asserted": True, "reason": "retained crash evidence"}, "retained_evidence": [{"ref": ".razr/evidence/crash.json", "digest_domain": "canonical_json", "digest": "sha256:" + "e" * 64, "kind": "recovery"}]}
             self.assertEqual(provider.recover_unmatched(recovery)["result"]["outcome"], "UNKNOWN")
             collected = HerdrProvider(runner=run, ledger=ledger, private_root=private)
@@ -132,6 +134,13 @@ class HerdrProviderTests(unittest.TestCase):
             self.assertEqual(collected.cleanup(handle)["cleanup"], "confirmed")
             with self.assertRaises(ProtocolError): collected._handle({**handle, "request_digest": "sha256:" + "d" * 64})
             self.assertEqual(len(ledger.path.read_text().splitlines()), 2)
+
+    def test_interrupt_request_id_is_echoed_and_closed(self):
+        provider = HerdrProvider(runner=lambda *args, **kwargs: subprocess.CompletedProcess([], 0, b"", b""))
+        with patch.object(provider, "_interrupt_handle", return_value={"result": {"attempt_id": "att-1", "host": {"mode": "herdr", "workspace_id": "w", "tab_id": "t", "pane_id": "p"}, "requested": True, "observed": "TERMINATED", "cleanup": "confirmed"}}):
+            result = provider.interrupt({"schema_version": 1, "request_id": "interrupt-unique", "handle": {}, "reason": "cancel"})
+        self.assertEqual(result["request_id"], "interrupt-unique")
+        with self.assertRaises(ProtocolError): provider.interrupt({"schema_version": 1, "request_id": "interrupt-unique", "handle": {}, "reason": "cancel", "extra": True})
 
     def test_request_rejects_runtime_fallback_and_root_reuse(self):
         with tempfile.TemporaryDirectory() as tmp:

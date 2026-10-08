@@ -409,7 +409,7 @@ class HerdrProvider:
         if "sha256:" + hashlib.sha256(digest_input).hexdigest() != value["candidate"]["source_digest"]:
             raise _fail("CANDIDATE_CHANGED", "worktree source digest differs from candidate")
 
-    def _claim_roots(self, request: ProviderRequest) -> None:
+    def _claim_roots(self, request: ProviderRequest, capability_report_digest: str) -> None:
         values = request.value
         prior: list[dict[str, object]] = []
         if self.ledger is not None and self.ledger.path.exists():
@@ -424,7 +424,9 @@ class HerdrProvider:
             if digest != values[root_key + "_digest"] or entries: raise _fail("RESOURCE_REUSED", f"{root_key} manifest differs or is non-empty")
             _marker(root, _id(values[id_key], id_key), digest, create=True)
         packet = {key: values[key] for key in ("schema_version", "request_id", "attempt_id", "role", "work", "worker_id", "branch", "candidate", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "fresh_context", "neutral_input_digest", "environment_policy_digest", "tool_policy_digest", "required_capabilities", "runtime", "limits", "allowance_id")}
-        packet["request_digest"] = request.digest
+        _digest(capability_report_digest, "capability_report_digest")
+        packet["capability_report_digest"] = capability_report_digest
+        packet["request_digest"] = raw_file_digest(canonical_json(packet))
         evidence = _canonical_dir(values["worktree"], "worktree") / ".razr" / "evidence"
         try:
             evidence.mkdir(parents=True, exist_ok=True)
@@ -437,7 +439,7 @@ class HerdrProvider:
                 with os.fdopen(fd, "wb") as stream: stream.write(data); stream.flush(); os.fsync(stream.fileno())
         except FileExistsError as exc: raise _fail("RESOURCE_REUSED", "attempt evidence already exists") from exc
         return {"candidate": {"ref": str(candidate_path.relative_to(_canonical_dir(values["worktree"], "worktree"))), "digest_domain": "canonical_json", "digest": raw_file_digest(candidate_bytes)},
-                "packet": {"ref": str(packet_path.relative_to(_canonical_dir(values["worktree"], "worktree"))), "digest_domain": "canonical_json", "digest": raw_file_digest(packet_bytes)}}
+                "packet": {"ref": str(packet_path.relative_to(_canonical_dir(values["worktree"], "worktree"))), "digest_domain": "canonical_json", "digest": raw_file_digest(packet_bytes)}, "request_digest": packet["request_digest"], "capability_report_digest": capability_report_digest}
 
     def launch(self, request: Mapping[str, object]) -> dict[str, object]:
         parsed = ProviderRequest(request)
@@ -448,10 +450,10 @@ class HerdrProvider:
         for key in ("output_root", "session_root"):
             root = _canonical_dir(parsed.value[key], key)
             if root == private_root or not root.is_relative_to(private_root): raise _fail("PATH_ESCAPE", f"{key} is outside provider private root")
-        evidence = self._claim_roots(parsed)
+        evidence = self._claim_roots(parsed, probe_report["result"]["report_digest"])
         self._verify_candidate(parsed)
         value = parsed.value; deadline = value["limits"]["deadline_ms"]
-        started = {"schema_version": 1, "event": "STARTED", "attempt_id": value["attempt_id"], "work_id": value["work"]["work_id"], "node_id": value["work"]["node_id"], "observed_generation": value["work"]["generation"], "observed_ordinal": value["work"]["ordinal"], "worker_id": value["worker_id"], "branch": value["branch"], "worktree_ref": ".", "allowance_id": value["allowance_id"], "provider_id": self.provider_id, "started_at": _now(), "started_at_source": "adapter_observed", "candidate": value["candidate"], "candidate_evidence": evidence["candidate"], "request_packet": evidence["packet"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"], "request_digest": parsed.digest, "herdr": {key: value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")}, "prev_digest": "sha256:" + "0" * 64}
+        started = {"schema_version": 1, "event": "STARTED", "attempt_id": value["attempt_id"], "work_id": value["work"]["work_id"], "node_id": value["work"]["node_id"], "observed_generation": value["work"]["generation"], "observed_ordinal": value["work"]["ordinal"], "worker_id": value["worker_id"], "branch": value["branch"], "worktree_ref": ".", "allowance_id": value["allowance_id"], "provider_id": self.provider_id, "started_at": _now(), "started_at_source": "adapter_observed", "candidate": value["candidate"], "candidate_evidence": evidence["candidate"], "request_packet": evidence["packet"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"], "request_digest": evidence["request_digest"], "herdr": {key: value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")}, "prev_digest": "sha256:" + "0" * 64}
         # The ledger computes no authority: this is a durable observation only.
         # Its predecessor is supplied by the ledger caller/chain; STARTED must
         # be appended before the provider launch below.
@@ -483,11 +485,11 @@ class HerdrProvider:
             if not isinstance(pane_result, dict) or "cwd" not in pane_result or "agent_id" not in pane_result: raise _fail("IDENTITY_MISMATCH", "pane response lacks actual agent cwd")
             if _canonical_dir(pane_result["cwd"], "agent cwd") != _canonical_dir(value["worktree"], "worktree") or pane_result["agent_id"] != result["agent_id"]:
                 raise _fail("IDENTITY_MISMATCH", "agent cwd/worktree differs")
-            handle = {"provider_id": "herdr", "handle_id": result["agent_id"], "request_digest": parsed.digest, "attempt_id": value["attempt_id"], "host": value["host"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"]}
+            handle = {"provider_id": "herdr", "handle_id": result["agent_id"], "request_digest": evidence["request_digest"], "attempt_id": value["attempt_id"], "host": value["host"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"]}
             if self.private_root is None: raise _fail("INVALID_REQUEST", "provider private root is unavailable")
             private_dir = _canonical_dir(str(self.private_root), "private_root") / "handles"
             private_dir.mkdir(mode=0o700, exist_ok=True)
-            private = {"schema_version": 1, "handle": handle, "agent_id": result["agent_id"], "pi_session_id": result["pi_session_id"], "handle_digest": raw_file_digest(canonical_json(handle)), "paths": {"worktree": value["worktree"], "output_root": value["output_root"], "session_root": value["session_root"]}, "attempt_path": value["worktree"], "attempt_ref": "."}
+            private = {"schema_version": 1, "handle": handle, "agent_id": result["agent_id"], "pi_session_id": result["pi_session_id"], "capability_report_digest": evidence["capability_report_digest"], "handle_digest": raw_file_digest(canonical_json(handle)), "paths": {"worktree": value["worktree"], "output_root": value["output_root"], "session_root": value["session_root"]}, "attempt_path": value["worktree"], "attempt_ref": "."}
             private["record_digest"] = raw_file_digest(canonical_json(private))
             private_path = private_dir / ("handle-" + result["agent_id"] + ".json")
             private_bytes = canonical_json(private)
@@ -530,12 +532,13 @@ class HerdrProvider:
         private_path = _canonical_dir(str(self.private_root), "private_root") / "handles" / ("handle-" + value["handle_id"] + ".json")
         try: private = json.loads(private_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "durable private handle evidence is unavailable") from exc
-        private = _closed(private, {"schema_version", "handle", "agent_id", "pi_session_id", "handle_digest", "paths", "attempt_path", "attempt_ref", "record_digest"}, "private handle")
+        private = _closed(private, {"schema_version", "handle", "agent_id", "pi_session_id", "capability_report_digest", "handle_digest", "paths", "attempt_path", "attempt_ref", "record_digest"}, "private handle")
         paths = _closed(private["paths"], {"worktree", "output_root", "session_root"}, "private handle paths")
         private_base = _canonical_dir(str(self.private_root), "private_root")
         for name in paths:
             path = _canonical_dir(paths[name], name)
             if name != "worktree" and not path.is_relative_to(private_base): raise _fail("PATH_ESCAPE", "private handle path escapes provider root")
+        _digest(private["capability_report_digest"], "capability_report_digest")
         record_body = {key: private[key] for key in private if key != "record_digest"}
         if private["schema_version"] != 1 or private["handle"] != value or private["handle_digest"] != raw_file_digest(canonical_json(value)) or private["record_digest"] != raw_file_digest(canonical_json(record_body)) or private["attempt_path"] != paths["worktree"] or private["attempt_ref"] != ".": raise _fail("IDENTITY_MISMATCH", "handle evidence differs")
         cached = self._private_handles.get(value["handle_id"])
@@ -550,6 +553,16 @@ class HerdrProvider:
         started = next((row for row in records if row["event"] == "STARTED" and row["attempt_id"] == value["attempt_id"]), None)
         settled = next((row for row in records if row["event"] == "SETTLED" and row["attempt_id"] == value["attempt_id"]), None)
         if settled is not None: self._settled.add(value["attempt_id"])
+        packet_path = Path(paths["worktree"]) / started["request_packet"]["ref"] if started is not None else Path("/")
+        try:
+            packet_bytes = packet_path.read_bytes()
+            packet = json.loads(packet_bytes.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise _fail("IDENTITY_MISMATCH", "request packet is unavailable") from exc
+        if started is not None and raw_file_digest(packet_bytes) != started["request_packet"]["digest"]:
+            raise _fail("DIGEST_MISMATCH", "request packet digest differs")
+        if not isinstance(packet, dict) or packet.get("capability_report_digest") != private["capability_report_digest"] or packet.get("request_digest") != started.get("request_digest"):
+            raise _fail("IDENTITY_MISMATCH", "capability report/request packet identity differs")
         if started is None or any(started.get(key) != value.get(key) for key in ("attempt_id", "provider_id", "request_digest", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest")) or started.get("herdr") != {key: value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")}:
             raise _fail("IDENTITY_MISMATCH", "handle does not match STARTED identity")
         return value
