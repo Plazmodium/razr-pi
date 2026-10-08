@@ -146,7 +146,8 @@ class HerdrProviderTests(unittest.TestCase):
                     result = {"agent": {"name": "worker-1", "agent": "pi", "agent_session": {"kind": "provisional", "agent": "pi", "value": "herdr:pi"}, "workspace_id": "w", "tab_id": "t", "pane_id": "p", "telemetry": {"status": "ready"}}, "type": "agent_started"}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "start", "result": result}).encode(), b"")
                 if argv[:3] == ["herdr", "agent", "get"]:
-                    result = {"agent": {"name": "worker-1", "agent_status": "done", "workspace_id": "w", "tab_id": "t", "pane_id": "p", "agent_session": {"kind": "path", "agent": "pi", "value": str(session / "pi-session.json")}, "telemetry": {"live": True}}, "telemetry": {"observed": True}}
+                    (session / "session-live.jsonl").write_bytes(b'{"type":"session"}\n')
+                    result = {"agent": {"name": "worker-1", "agent_status": "done", "workspace_id": "w", "tab_id": "t", "pane_id": "p", "telemetry": {"live": True}}, "telemetry": {"observed": True}}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "get", "result": result}).encode(), b"")
                 if argv[:3] == ["herdr", "workspace", "list"]:
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "workspaces", "result": {"type": "workspace_list", "workspaces": []}}).encode(), b"")

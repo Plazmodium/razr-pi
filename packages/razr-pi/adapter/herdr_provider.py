@@ -678,9 +678,9 @@ class HerdrProvider:
                 try: canonical_session_path = session_path.resolve(strict=False)
                 except OSError: return None
                 if session_path != canonical_session_path or not canonical_session_path.is_relative_to(session_root): return None
-                try: stat = canonical_session_path.stat()
+                try: stat_result = canonical_session_path.stat()
                 except OSError: return None
-                if not canonical_session_path.is_file() or canonical_session_path.is_symlink() or stat.st_nlink != 1: return None
+                if not canonical_session_path.is_file() or canonical_session_path.is_symlink() or stat_result.st_nlink != 1: return None
                 return canonical_session_path
             canonical_session_path = path_session(agent) or path_session(result)
             if canonical_session_path is None:
@@ -784,9 +784,9 @@ class HerdrProvider:
             session = agent.get("agent_session") if isinstance(agent, dict) else None
             if isinstance(session, dict) and session.get("kind") == "path" and session.get("agent") == "pi" and isinstance(session.get("value"), str) and Path(session["value"]).is_absolute():
                 path = Path(session["value"])
-                try: canonical = path.resolve(strict=False); stat = canonical.stat()
+                try: canonical = path.resolve(strict=False); stat_result = canonical.stat()
                 except OSError: canonical = None
-                if canonical is not None and path == canonical and canonical.is_relative_to(session_root) and canonical.is_file() and not canonical.is_symlink() and stat.st_nlink == 1: candidate_path = canonical; break
+                if canonical is not None and path == canonical and canonical.is_relative_to(session_root) and canonical.is_file() and not canonical.is_symlink() and stat_result.st_nlink == 1: candidate_path = canonical; break
             if attempt < 2: time.sleep(0.05)
         if candidate_path is None:
             dirfd = os.open(session_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
@@ -800,7 +800,7 @@ class HerdrProvider:
                         file_stat = os.fstat(fd)
                         if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.jsonl", name): os.close(fd); return False
                         with os.fdopen(fd, "rb") as stream: content = stream.read(1_048_577)
-                        if not content or len(content) > 1_048_576 or not content.endswith(b"\\n"): return False
+                        if not content or len(content) > 1_048_576 or not content.endswith(b"\n"): return False
                         for line in content.splitlines():
                             if not line.strip() or not isinstance(json.loads(line), dict): return False
                         candidates.append(session_root / name)
@@ -898,9 +898,9 @@ class HerdrProvider:
             if session_record["record_digest"] != raw_file_digest(canonical_json(session_body)) or private["session_record_digest"] != session_record["record_digest"] or session_record["handle_id"] != private["agent_id"] or session_record["attempt_id"] != value["attempt_id"] or session_record["request_digest"] != value["request_digest"] or session_record["host"] != value["host"] or session_record["kind"] != "pi_session":
                 raise _fail("IDENTITY_MISMATCH", "private session binding differs")
             session_root = _canonical_dir(paths["session_root"], "session_root"); session_path = Path(session_record["pi_session_path"])
-            try: stat = session_path.stat()
+            try: stat_result = session_path.stat()
             except OSError as exc: raise _fail("IDENTITY_MISMATCH", "bound session path is unavailable") from exc
-            if not session_path.is_absolute() or session_path != session_path.resolve(strict=False) or not session_path.is_relative_to(session_root) or not session_path.is_file() or session_path.is_symlink() or stat.st_nlink != 1 or session_record["pi_session_id"] != "pi-session-" + hashlib.sha256(str(session_path).encode("utf-8")).hexdigest():
+            if not session_path.is_absolute() or session_path != session_path.resolve(strict=False) or not session_path.is_relative_to(session_root) or not session_path.is_file() or session_path.is_symlink() or stat_result.st_nlink != 1 or session_record["pi_session_id"] != "pi-session-" + hashlib.sha256(str(session_path).encode("utf-8")).hexdigest():
                 raise _fail("IDENTITY_MISMATCH", "private session path identity differs")
         session_identity = session_record if private["session_status"] == "bound" else (pending_record if "pending_record" in locals() else None)
         if session_identity is not None:
