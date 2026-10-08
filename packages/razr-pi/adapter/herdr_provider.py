@@ -110,11 +110,24 @@ def _closed(value: object, fields: set[str], name: str) -> dict[str, object]:
     return value
 
 
-def _envelope(raw: bytes, name: str) -> dict[str, object]:
-    try:
-        value = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise _fail("ARTIFACT_UNAVAILABLE", f"malformed {name} response") from exc
+def _strict_json(data: bytes) -> object:
+    def reject_duplicate(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result: raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+    value = json.loads(data.decode("utf-8"), object_pairs_hook=reject_duplicate, parse_constant=lambda token: (_ for _ in ()).throw(ValueError("nonfinite JSON")))
+    if canonical_json(value) != data: raise ValueError("noncanonical JSON")
+    return value
+
+
+def _envelope(raw: bytes, name: str, expected_ids: set[str] | None = None) -> dict[str, object]:
+    try: value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("ARTIFACT_UNAVAILABLE", f"malformed {name} response") from exc
+    if not isinstance(value, dict) or not isinstance(value.get("id"), str) or not value["id"].startswith("cli:") or not value["id"][4:] or not re.fullmatch(r"cli:[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", value["id"]):
+        raise _fail("ARTIFACT_UNAVAILABLE", f"invalid {name} event identity")
+    if expected_ids is not None and value["id"] not in expected_ids: raise _fail("IDENTITY_MISMATCH", f"unexpected {name} event identity")
     return _closed(value, {"id", "result"}, name)
 
 
@@ -208,8 +221,9 @@ class AttemptLedger:
             raise _fail("PATH_ESCAPE", f"invalid {name} reference")
         if domain and value["digest_domain"] != domain:
             raise _fail("LEDGER_CORRUPT", f"invalid {name} digest domain")
-        if name == "evidence_ref" and value["kind"] in _EVIDENCE_KIND_DOMAINS and value["digest_domain"] != _EVIDENCE_KIND_DOMAINS[value["kind"]]:
-            raise _fail("LEDGER_CORRUPT", "evidence kind and digest domain differ")
+        if name == "evidence_ref":
+            if value["kind"] not in _EVIDENCE_KIND_DOMAINS: raise _fail("LEDGER_CORRUPT", "unknown evidence kind")
+            if value["digest_domain"] != _EVIDENCE_KIND_DOMAINS[value["kind"]]: raise _fail("LEDGER_CORRUPT", "evidence kind and digest domain differ")
         _digest(value["digest"], f"{name} digest")
 
     @classmethod
@@ -1109,8 +1123,9 @@ class HerdrProvider:
             if len(data) > 1_048_576: raise _fail("OUTPUT_LIMIT", "retained evidence exceeds bound")
             actual = raw_file_digest(data) if ref["digest_domain"] == "raw_file" else None
             if ref["digest_domain"] == "canonical_json":
-                try: actual = raw_file_digest(canonical_json(json.loads(data.decode("utf-8"))))
-                except (UnicodeDecodeError, json.JSONDecodeError, ProtocolError) as exc: raise _fail("DIGEST_MISMATCH", "retained canonical evidence is malformed") from exc
+                try:
+                    parsed = _strict_json(data); actual = raw_file_digest(canonical_json(parsed))
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc: raise _fail("DIGEST_MISMATCH", "retained canonical evidence is malformed") from exc
             if actual != ref["digest"]: raise _fail("DIGEST_MISMATCH", "retained evidence digest differs")
             checked_evidence.append(dict(ref))
         evidence = checked_evidence

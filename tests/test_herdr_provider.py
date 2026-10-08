@@ -33,14 +33,14 @@ class HerdrProviderTests(unittest.TestCase):
     def test_scoped_worktree_resolution_ignores_closed_historical_entries(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve(); target = root / "target"; target.mkdir(); old = root / "old"; old.mkdir()
-            listed = {"id": "list", "result": {"source": {"repo_key": str(root / ".git"), "repo_name": "repo", "repo_root": str(root), "source_checkout_path": str(root), "source_workspace_id": "w"}, "type": "worktree_list", "worktrees": [{"is_bare": False, "is_detached": True, "is_linked_worktree": True, "is_prunable": True, "label": "old", "path": str(old), "historical_extra": "ignored"}, {"branch": "main", "is_bare": False, "is_detached": False, "is_linked_worktree": True, "is_prunable": False, "label": "target", "open_workspace_id": "w", "path": str(target)}]}}
+            listed = {"id": "cli:worktree:list", "result": {"source": {"repo_key": str(root / ".git"), "repo_name": "repo", "repo_root": str(root), "source_checkout_path": str(root), "source_workspace_id": "w"}, "type": "worktree_list", "worktrees": [{"is_bare": False, "is_detached": True, "is_linked_worktree": True, "is_prunable": True, "label": "old", "path": str(old), "historical_extra": "ignored"}, {"branch": "main", "is_bare": False, "is_detached": False, "is_linked_worktree": True, "is_prunable": False, "label": "target", "open_workspace_id": "w", "path": str(target)}]}}
             pane = {"agent_status": "unknown", "cwd": str(target), "focused": False, "foreground_cwd": str(target), "pane_id": "p", "revision": 0, "scroll": {"max_offset_from_bottom": 0, "offset_from_bottom": 0, "viewport_rows": 29}, "tab_id": "t", "terminal_id": "term", "workspace_id": "w"}
             def run(argv, **kwargs):
                 if argv[:3] == ["herdr", "worktree", "list"]:
                     self.assertEqual(argv[3:], ["--cwd", str(target)])
                     return subprocess.CompletedProcess(argv, 0, json.dumps(listed).encode(), b"")
                 if argv[:3] == ["herdr", "pane", "list"]:
-                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "panes", "result": {"panes": [pane], "type": "pane_list"}}).encode(), b"")
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "cli:pane:list", "result": {"panes": [pane], "type": "pane_list"}}).encode(), b"")
                 raise AssertionError(argv)
             result = HerdrProvider(runner=run)._resolve_existing_worktree(target)
             self.assertEqual(result, {"workspace_id": "w", "tab_id": "t", "pane_id": "p"})
@@ -166,28 +166,28 @@ class HerdrProviderTests(unittest.TestCase):
             def run(argv, **kwargs):
                 if argv[:3] == ["herdr", "agent", "start"]:
                     result = {"agent": {"name": "worker-1", "agent": "pi", "agent_session": {"kind": "provisional", "agent": "pi", "value": "herdr:pi"}, "workspace_id": "w", "tab_id": "t", "pane_id": "p", "telemetry": {"status": "ready"}}, "type": "agent_started"}
-                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "start", "result": result}).encode(), b"")
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "cli:agent:start", "result": result}).encode(), b"")
                 if argv[:3] == ["herdr", "agent", "get"]:
                     (session / "session-live.jsonl").write_bytes(b'{"type":"session"}\n')
                     result = {"agent": {"name": "worker-1", "agent_status": "done", "workspace_id": "w", "tab_id": "t", "pane_id": "p", "telemetry": {"live": True}}, "telemetry": {"observed": True}}
-                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "get", "result": result}).encode(), b"")
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "cli:agent:get", "result": result}).encode(), b"")
                 if argv[:3] == ["herdr", "workspace", "list"]:
-                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "workspaces", "result": {"type": "workspace_list", "workspaces": []}}).encode(), b"")
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "cli:workspace:list", "result": {"type": "workspace_list", "workspaces": []}}).encode(), b"")
                 if argv[:3] == ["herdr", "worktree", "list"]:
                     list_calls[0] += 1
-                    if list_calls[0] > 1: return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "list", "result": {"source": {"repo_key": str(worktree / ".git"), "repo_name": "repo", "repo_root": str(worktree), "source_checkout_path": str(worktree), "source_workspace_id": "other"}, "type": "worktree_list", "worktrees": []}}).encode(), b"")
+                    if list_calls[0] > 1: return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "cli:worktree:list", "result": {"source": {"repo_key": str(worktree / ".git"), "repo_name": "repo", "repo_root": str(worktree), "source_checkout_path": str(worktree), "source_workspace_id": "other"}, "type": "worktree_list", "worktrees": []}}).encode(), b"")
                     result = {"source": {"repo_key": str(worktree / ".git"), "repo_name": "repo", "repo_root": str(worktree), "source_checkout_path": str(worktree), "source_workspace_id": "w"}, "type": "worktree_list", "worktrees": [{"branch": "feature/x", "is_bare": False, "is_detached": False, "is_linked_worktree": False, "is_prunable": False, "label": "worktree", "open_workspace_id": "w", "path": str(worktree)}]}
-                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "list", "result": result}).encode(), b"")
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "cli:worktree:list", "result": result}).encode(), b"")
                 if argv[:3] == ["herdr", "pane", "list"]:
                     pane = {"agent_status": "unknown", "cwd": str(worktree), "focused": False, "foreground_cwd": str(worktree), "pane_id": "p", "revision": 0, "scroll": {"max_offset_from_bottom": 0, "offset_from_bottom": 0, "viewport_rows": 29}, "tab_id": "t", "terminal_id": "term", "workspace_id": "w", "workspace_telemetry": {"layout": "grid"}}
-                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "panes", "result": {"panes": [pane], "type": "pane_list"}}).encode(), b"")
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "cli:pane:list", "result": {"panes": [pane], "type": "pane_list"}}).encode(), b"")
                 if argv[:3] == ["herdr", "worktree", "open"]:
                     if "--help" not in argv: open_calls.append(argv)
                     result = {"root_pane": {"agent_status": "unknown", "cwd": str(worktree), "focused": False, "foreground_cwd": str(worktree), "pane_id": "p", "revision": 0, "scroll": {"max_offset_from_bottom": 0, "offset_from_bottom": 0, "viewport_rows": 29}, "tab_id": "t", "terminal_id": "term", "workspace_id": "w"}, "tab": {"agent_status": "unknown", "focused": False, "label": "1", "number": 1, "pane_count": 1, "tab_id": "t", "workspace_id": "w"}, "type": "worktree_opened", "workspace": {"active_tab_id": "t", "agent_status": "unknown", "focused": False, "label": "worktree", "number": 1, "pane_count": 1, "tab_count": 1, "workspace_id": "w", "worktree": {"checkout_path": str(worktree), "is_linked_worktree": False, "repo_key": str(worktree / ".git"), "repo_name": "repo", "repo_root": str(worktree)}}, "worktree": {"branch": "feature/x", "is_bare": False, "is_detached": False, "is_linked_worktree": False, "is_prunable": False, "label": "worktree", "open_workspace_id": "w", "path": str(worktree)}}
-                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "open", "result": result}).encode(), b"")
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "cli:worktree:open", "result": result}).encode(), b"")
                 if argv[:3] == ["herdr", "pane", "get"]:
                     result = {"pane": {"foreground_cwd": str(worktree), "cwd": str(worktree), "agent_id": "worker-1", "telemetry": {"source": "herdr"}}, "telemetry": {"request": "captured"}}
-                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "pane", "result": result}).encode(), b"")
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "cli:pane:get", "result": result}).encode(), b"")
                 if argv[:2] == ["herdr", "--help"] or argv[:2] == ["herdr", "agent"] or argv[:2] == ["herdr", "worktree"] or argv[:2] == ["herdr", "pane"]:
                     return subprocess.CompletedProcess(argv, 0, b"help", b"")
                 if argv[:2] == ["pi", "--list-models"]:
@@ -197,7 +197,7 @@ class HerdrProviderTests(unittest.TestCase):
                 if argv[:3] == ["herdr", "agent", "read"]:
                     return subprocess.CompletedProcess(argv, 0, b"observed output", b"")
                 if argv[:3] == ["herdr", "pane", "close"] or argv[:3] == ["herdr", "worktree", "remove"]:
-                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "worktree:remove", "result": {"type": "worktree_removed", "workspace_id": "w", "removed": True}}).encode(), b"")
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "cli:worktree:remove", "result": {"type": "worktree_removed", "workspace_id": "w", "removed": True}}).encode(), b"")
                 if argv[:3] == ["herdr", "worktree", "list"]:
                     return subprocess.CompletedProcess(argv, 0, b"[]", b"")
                 if argv[:3] == ["git", "-C", str(worktree)] and argv[3] == "symbolic-ref":
@@ -297,7 +297,7 @@ class HerdrProviderTests(unittest.TestCase):
         value = {"attempt_id": "att-status", "handle_id": "worker-status", "request_digest": "sha256:" + "a" * 64, "host": {"mode": "herdr", "workspace_id": "w", "tab_id": "t", "pane_id": "p"}, "output_root_id": "out", "output_root_digest": "sha256:" + "b" * 64, "session_root_id": "sess", "session_root_digest": "sha256:" + "c" * 64}
         provider = HerdrProvider(); provider._private_handles[value["handle_id"]] = {"session_status": "pending"}
         for telemetry, expected in (("starting", "STARTING"), ("working", "ACTIVE"), ("idle", "ACTIVE"), ("done", "ACTIVE"), ("blocked", "ACTIVE"), ("unknown", "UNKNOWN")):
-            raw = {"id": "get", "result": {"agent": {"name": "worker-status", "agent_status": telemetry, "workspace_id": "w", "tab_id": "t", "pane_id": "p", "extra": True}}}
+            raw = {"id": "cli:agent:get", "result": {"agent": {"name": "worker-status", "agent_status": telemetry, "workspace_id": "w", "tab_id": "t", "pane_id": "p", "extra": True}}}
             with patch.object(provider, "_handle", return_value=value), patch.object(provider, "_bind_session_if_available", return_value=False), patch.object(provider, "_exec", return_value=json.dumps(raw).encode()):
                 self.assertEqual(provider._inspect_handle(value)["result"]["status"], expected)
 
@@ -313,14 +313,14 @@ class HerdrProviderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve(); evidence = root / ".razr" / "evidence"; evidence.mkdir(parents=True)
             base = {"schema_version": 1, "request_id": "recover-unique", "attempt_id": "att-missing", "worktree": str(root), "recovery_authority": {"kind": "explicit", "authority_id": "human-1", "asserted": True, "reason": "crash"}}
-            missing = {**base, "retained_evidence": [{"ref": ".razr/evidence/missing.json", "digest_domain": "raw_file", "digest": "sha256:" + "a" * 64, "kind": "recovery"}]}
+            missing = {**base, "retained_evidence": [{"ref": ".razr/evidence/missing.json", "digest_domain": "raw_file", "digest": "sha256:" + "a" * 64, "kind": "event"}]}
             with self.assertRaises(ProtocolError) as caught: HerdrProvider().recover_unmatched(missing)
             self.assertEqual(caught.exception.code, "ARTIFACT_UNAVAILABLE")
-            escaping = {**base, "retained_evidence": [{"ref": ".razr/evidence/../../secret", "digest_domain": "raw_file", "digest": "sha256:" + "a" * 64, "kind": "recovery"}]}
+            escaping = {**base, "retained_evidence": [{"ref": ".razr/evidence/../../secret", "digest_domain": "raw_file", "digest": "sha256:" + "a" * 64, "kind": "event"}]}
             with self.assertRaises(ProtocolError) as caught: HerdrProvider().recover_unmatched(escaping)
             self.assertEqual(caught.exception.code, "PATH_ESCAPE")
             actual = evidence / "actual.json"; actual.write_bytes(b"actual")
-            mismatch = {**base, "retained_evidence": [{"ref": ".razr/evidence/actual.json", "digest_domain": "raw_file", "digest": "sha256:" + "b" * 64, "kind": "recovery"}]}
+            mismatch = {**base, "retained_evidence": [{"ref": ".razr/evidence/actual.json", "digest_domain": "raw_file", "digest": "sha256:" + "b" * 64, "kind": "event"}]}
             with self.assertRaises(ProtocolError) as caught: HerdrProvider().recover_unmatched(mismatch)
             self.assertEqual(caught.exception.code, "DIGEST_MISMATCH")
 
