@@ -808,10 +808,11 @@ class HerdrProvider:
         try: st = claim_path.stat()
         except OSError as exc: raise _fail("IDENTITY_MISMATCH", "root claim is unavailable") from exc
         if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or claim_path.is_symlink(): raise _fail("IDENTITY_MISMATCH", "root claim identity is unsafe")
-        try: lines = claim_path.read_text(encoding="utf-8").splitlines()
+        try: claim_bytes = claim_path.read_bytes()
         except (OSError, UnicodeDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "root claim cannot be read") from exc
+        if not claim_bytes.endswith(b"\n"): raise _fail("IDENTITY_MISMATCH", "root claim is partial")
         previous = "sha256:" + "0" * 64; found = False
-        for line in lines:
+        for line in claim_bytes.decode("utf-8").splitlines():
             try: row = json.loads(line)
             except json.JSONDecodeError as exc: raise _fail("IDENTITY_MISMATCH", "root claim is malformed") from exc
             expected = {"schema_version", "root_id", "root_digest", "path", "attempt_id", "request_digest", "claimed_at", "prev_digest", "record_digest"}
