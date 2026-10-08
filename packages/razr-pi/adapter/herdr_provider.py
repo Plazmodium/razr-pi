@@ -211,7 +211,7 @@ class AttemptLedger:
 
     @classmethod
     def _validate_event(cls, event: object) -> dict[str, object]:
-        if not isinstance(event, dict) or event.get("schema_version") != 1 or event.get("event") not in {"STARTED", "SETTLED"}:
+        if not isinstance(event, dict) or not isinstance(event.get("schema_version"), int) or isinstance(event.get("schema_version"), bool) or event.get("schema_version") != 1 or event.get("event") not in {"STARTED", "SETTLED"}:
             raise _fail("LEDGER_CORRUPT", "invalid attempt event")
         required = cls.STARTED if event["event"] == "STARTED" else cls.SETTLED
         optional = cls.OPTIONAL_STARTED if event["event"] == "STARTED" else cls.OPTIONAL_SETTLED
@@ -267,9 +267,22 @@ class AttemptLedger:
 
     @classmethod
     def _replay_chain(cls, records: list[dict[str, object]]) -> list[dict[str, object]]:
-        previous = "sha256:" + "0" * 64
+        previous = "sha256:" + "0" * 64; attempts = {}; allowances = {}; roots = {}
         for row in records:
             if row["prev_digest"] != previous: raise _fail("LEDGER_CORRUPT", "attempt ledger hash chain is out of order")
+            attempt = row["attempt_id"]
+            if attempt not in attempts:
+                if row["event"] != "STARTED": raise _fail("LEDGER_CORRUPT", "attempt does not start with STARTED")
+                attempts[attempt] = "STARTED"
+                allowance = row.get("allowance_id")
+                if allowance in allowances and allowances[allowance] != attempt: raise _fail("ALLOWANCE_REUSED", "allowance is already bound to another attempt")
+                allowances[allowance] = attempt
+                for root_id, digest in ((row["output_root_id"], row["output_root_digest"]), (row["session_root_id"], row["session_root_digest"])):
+                    if root_id in roots and roots[root_id] != attempt: raise _fail("RESOURCE_REUSED", "root identity was reused")
+                    roots[root_id] = attempt
+            elif attempts[attempt] == "STARTED" and row["event"] == "SETTLED":
+                attempts[attempt] = "SETTLED"
+            else: raise _fail("LEDGER_CORRUPT", "invalid per-attempt event order")
             previous = row["record_digest"]
         return records
 
@@ -281,27 +294,42 @@ class AttemptLedger:
             relative = PurePosixPath(ref["ref"])
             if len(relative.parts) < 3 or relative.parts[:2] != (".razr", "evidence"):
                 raise _fail("LEDGER_CORRUPT", "settlement evidence escapes attempt boundary")
-            path = root.joinpath(*relative.parts)
-            cursor = root
+            fds = []
             try:
-                for part in relative.parts:
-                    cursor = cursor / part
-                    if cursor.is_symlink(): raise _fail("LEDGER_CORRUPT", "settlement evidence contains a symlink")
-                info = path.stat()
+                current = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW); fds.append(current)
+                for part in relative.parts[:-1]:
+                    current = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current); fds.append(current)
+                fd = os.open(relative.parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current); fds.append(fd)
+                info = os.fstat(fd)
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1: raise _fail("LEDGER_CORRUPT", "settlement evidence is not a private regular file")
-                data = path.read_bytes()
+                data = os.read(fd, 1_048_577)
+                if len(data) > 1_048_576: raise _fail("OUTPUT_LIMIT", "settlement evidence exceeds bound")
             except ProtocolError: raise
             except OSError as exc: raise _fail("LEDGER_CORRUPT", "settlement evidence is unavailable") from exc
+            finally:
+                for fd in reversed(fds):
+                    try: os.close(fd)
+                    except OSError: pass
             actual = raw_file_digest(data)
             if ref["digest_domain"] == "canonical_json":
-                try: actual = raw_file_digest(canonical_json(json.loads(data.decode("utf-8"))))
-                except (UnicodeDecodeError, json.JSONDecodeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "settlement canonical evidence is malformed") from exc
+                try:
+                    def reject_duplicate(pairs):
+                        result = {}
+                        for key, value in pairs:
+                            if key in result: raise ValueError("duplicate JSON key")
+                            result[key] = value
+                        return result
+                    parsed = json.loads(data.decode("utf-8"), object_pairs_hook=reject_duplicate, parse_constant=lambda value: (_ for _ in ()).throw(ValueError("nonfinite JSON")))
+                    canonical = canonical_json(parsed)
+                    if canonical != data: raise ValueError("noncanonical JSON")
+                    actual = raw_file_digest(canonical)
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "settlement canonical evidence is malformed") from exc
             if actual != ref["digest"]: raise _fail("LEDGER_CORRUPT", "settlement evidence digest differs")
 
     def append(self, event: Mapping[str, object]) -> dict[str, object]:
         import copy
         event = copy.deepcopy(dict(event))
-        if not isinstance(event, dict) or event.get("schema_version") != 1 or event.get("event") not in {"STARTED", "SETTLED"}:
+        if not isinstance(event, dict) or not isinstance(event.get("schema_version"), int) or isinstance(event.get("schema_version"), bool) or event.get("schema_version") != 1 or event.get("event") not in {"STARTED", "SETTLED"}:
             raise _fail("LEDGER_CORRUPT", "invalid attempt event")
         event.pop("prev_digest", None); event.pop("record_digest", None)
         try: self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -391,7 +419,7 @@ class ProviderRequest:
                     "session_root_digest", "fresh_context", "neutral_input_digest", "environment_policy_digest", "tool_policy_digest",
                     "required_capabilities", "runtime", "limits", "allowance_id"}
         if set(self.value) != required: raise _fail("INVALID_REQUEST", "provider request is not closed")
-        if self.value["schema_version"] != 1 or self.value["fresh_context"] is not True: raise _fail("INVALID_REQUEST", "invalid request version/context")
+        if not isinstance(self.value["schema_version"], int) or isinstance(self.value["schema_version"], bool) or self.value["schema_version"] != 1 or self.value["fresh_context"] is not True: raise _fail("INVALID_REQUEST", "invalid request version/context")
         _id(self.value["request_id"], "request_id"); _id(self.value["attempt_id"], "attempt_id"); _id(self.value["worker_id"], "worker_id"); _branch(self.value["branch"], "branch"); _id(self.value["allowance_id"], "allowance_id")
         if self.value["role"] not in {"technical", "contract", "worker"}: raise _fail("INVALID_REQUEST", "invalid role")
         if self.value["host"] != _host(): raise _fail("IDENTITY_MISMATCH", "Herdr host identity differs")
@@ -495,7 +523,7 @@ class HerdrProvider:
 
     def probe(self, request: Mapping[str, object]) -> dict[str, object]:
         request = _closed(request, {"schema_version", "request_id", "required_capabilities", "runtime"}, "probe request")
-        if request["schema_version"] != 1: raise _fail("INVALID_REQUEST", "invalid probe schema")
+        if not isinstance(request["schema_version"], int) or isinstance(request["schema_version"], bool) or request["schema_version"] != 1: raise _fail("INVALID_REQUEST", "invalid probe schema")
         request_id = _id(request["request_id"], "request_id")
         caps = request["required_capabilities"]
         if not isinstance(caps, list): raise _fail("INVALID_REQUEST", "required_capabilities must be an array")
@@ -729,11 +757,12 @@ class HerdrProvider:
             response = self._exec([self.herdr, "agent", "start", value["worker_id"], "--kind", "pi", "--pane", value["host"]["pane_id"], "--timeout", str(min(deadline, 300_000)), "--", "--model", _MODEL, "--thinking", "medium", "--session-dir", value["session_root"], "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve"], timeout_ms=min(deadline, 300_000), cwd=_canonical_dir(value["cwd"], "cwd"), max_output=value["limits"]["max_output_bytes"])
         except ProtocolError as exc:
             failure = _canonical_dir(value["worktree"], "worktree") / ".razr" / "evidence" / ("launch-failure-" + value["attempt_id"] + ".json")
-            data = canonical_json({"error_code": exc.code, "message": str(exc)[:500]}) + b"\n"
+            launch_code = exc.code if exc.code in {"LAUNCH_FAILED", "TIMEOUT", "OUTPUT_LIMIT", "PROVIDER_UNAVAILABLE"} else "LAUNCH_FAILED"
+            data = canonical_json({"error_code": launch_code, "cause": exc.code, "message": str(exc)[:500]}) + b"\n"
             try:
                 fd = os.open(failure, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 with os.fdopen(fd, "wb") as stream: stream.write(data); stream.flush(); os.fsync(stream.fileno())
-                failure_ref = {"ref": str(failure.relative_to(_canonical_dir(value["worktree"], "worktree"))), "digest_domain": "raw_file", "digest": raw_file_digest(data), "kind": "launch_failure", "error_code": exc.code}
+                failure_ref = {"ref": str(failure.relative_to(_canonical_dir(value["worktree"], "worktree"))), "digest_domain": "raw_file", "digest": raw_file_digest(data), "kind": "launch_failure", "error_code": launch_code}
             except OSError:
                 failure_ref = dict(evidence["launch_boundary"]); failure_ref.update({"kind": "launch_failure", "error_code": "LAUNCH_FAILED"})
             settled = {key: started[key] for key in ("schema_version", "attempt_id", "work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "worktree_ref", "branch", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest", "herdr")}
@@ -951,6 +980,7 @@ class HerdrProvider:
         try: private = json.loads(_read_private_bytes(private_path, _canonical_dir(str(self.private_root), "private_root")).decode("utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "durable private handle evidence is unavailable") from exc
         private = _closed(private, {"schema_version", "handle", "agent_id", "pi_session_id", "session_status", "capability_report_digest", "session_record_ref", "session_record_digest", "session_binding_ref", "session_binding_digest", "handle_digest", "paths", "attempt_path", "attempt_ref", "record_digest"}, "private handle")
+        if not isinstance(private["schema_version"], int) or isinstance(private["schema_version"], bool): raise _fail("IDENTITY_MISMATCH", "private handle schema is invalid")
         paths = _closed(private["paths"], {"worktree", "output_root", "session_root"}, "private handle paths")
         private_base = _canonical_dir(str(self.private_root), "private_root")
         for name in paths:
@@ -969,6 +999,7 @@ class HerdrProvider:
                 try: pending_record = json.loads(_read_private_bytes(session_record_path, private_base).decode("utf-8"))
                 except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "pending session binding is malformed") from exc
                 pending_record = _closed(pending_record, {"schema_version", "kind", "handle_id", "attempt_id", "request_digest", "host", "pi_session_path", "pi_session_id", "record_digest"}, "private session record")
+                if not isinstance(pending_record["schema_version"], int) or isinstance(pending_record["schema_version"], bool): raise _fail("IDENTITY_MISMATCH", "private session schema is invalid")
                 session_root = _canonical_dir(paths["session_root"], "session_root"); pending_path = Path(pending_record["pi_session_path"])
                 try: pending_stat = pending_path.stat()
                 except OSError as exc: raise _fail("IDENTITY_MISMATCH", "pending session path is unavailable") from exc
@@ -979,6 +1010,7 @@ class HerdrProvider:
             try: session_record = json.loads(_read_private_bytes(session_record_path, private_base).decode("utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "private session record is unavailable") from exc
             session_record = _closed(session_record, {"schema_version", "kind", "handle_id", "attempt_id", "request_digest", "host", "pi_session_path", "pi_session_id", "record_digest"}, "private session record")
+            if not isinstance(session_record["schema_version"], int) or isinstance(session_record["schema_version"], bool): raise _fail("IDENTITY_MISMATCH", "private session schema is invalid")
             session_body = {key: session_record[key] for key in session_record if key != "record_digest"}
             if session_record["record_digest"] != raw_file_digest(canonical_json(session_body)) or private["session_record_digest"] != session_record["record_digest"] or session_record["handle_id"] != private["agent_id"] or session_record["attempt_id"] != value["attempt_id"] or session_record["request_digest"] != value["request_digest"] or session_record["host"] != value["host"] or session_record["kind"] != "pi_session":
                 raise _fail("IDENTITY_MISMATCH", "private session binding differs")
@@ -1002,10 +1034,11 @@ class HerdrProvider:
             try: binding = json.loads(_read_private_bytes(binding_path, private_base).decode("utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "session binding event is unavailable") from exc
             binding = _closed(binding, {"schema_version", "kind", "handle_record_digest", "session_record_digest", "attempt_id", "request_digest", "host", "bound_at", "record_digest"}, "session binding")
+            if not isinstance(binding["schema_version"], int) or isinstance(binding["schema_version"], bool): raise _fail("IDENTITY_MISMATCH", "session binding schema is invalid")
             if binding["kind"] != "pi_session_binding" or binding["handle_record_digest"] != private["record_digest"] or binding["session_record_digest"] != (private["session_record_digest"] or (json.loads(_read_private_bytes(session_record_path, private_base).decode("utf-8"))["record_digest"])) or binding["attempt_id"] != value["attempt_id"] or binding["request_digest"] != value["request_digest"] or binding["host"] != value["host"] or binding["record_digest"] != raw_file_digest(canonical_json({key: binding[key] for key in binding if key != "record_digest"})):
                 raise _fail("IDENTITY_MISMATCH", "session binding event differs")
         record_body = {key: private[key] for key in private if key != "record_digest"}
-        if private["schema_version"] != 1 or private["handle"] != value or private["handle_digest"] != raw_file_digest(canonical_json(value)) or private["record_digest"] != raw_file_digest(canonical_json(record_body)) or private["attempt_path"] != paths["worktree"] or private["attempt_ref"] != ".": raise _fail("IDENTITY_MISMATCH", "handle evidence differs")
+        if not isinstance(private["schema_version"], int) or isinstance(private["schema_version"], bool) or private["schema_version"] != 1 or private["handle"] != value or private["handle_digest"] != raw_file_digest(canonical_json(value)) or private["record_digest"] != raw_file_digest(canonical_json(record_body)) or private["attempt_path"] != paths["worktree"] or private["attempt_ref"] != ".": raise _fail("IDENTITY_MISMATCH", "handle evidence differs")
         cached = self._private_handles.get(value["handle_id"])
         if cached is not None and cached != private: raise _fail("IDENTITY_MISMATCH", "in-memory handle evidence differs")
         self._private_handles[value["handle_id"]] = private
@@ -1034,7 +1067,7 @@ class HerdrProvider:
 
     def recover_unmatched(self, request: Mapping[str, object]) -> dict[str, object]:
         request = _closed(request, {"schema_version", "request_id", "attempt_id", "worktree", "recovery_authority", "retained_evidence"}, "recovery request")
-        if request["schema_version"] != 1: raise _fail("INVALID_REQUEST", "invalid recovery schema")
+        if not isinstance(request["schema_version"], int) or isinstance(request["schema_version"], bool) or request["schema_version"] != 1: raise _fail("INVALID_REQUEST", "invalid recovery schema")
         request_id = _id(request["request_id"], "request_id"); _id(request["attempt_id"], "attempt_id")
         worktree = _canonical_dir(request["worktree"], "recovery worktree")
         authority = _closed(request["recovery_authority"], {"kind", "authority_id", "asserted", "reason"}, "recovery authority")
@@ -1144,8 +1177,9 @@ class HerdrProvider:
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "interrupt record is malformed") from exc
             try: stored = _closed(stored, {"schema_version", "kind", "request_id", "handle_id", "request_digest", "reason", "reason_digest", "outcome"}, "interrupt record")
             except ProtocolError as exc: raise _fail("IDENTITY_MISMATCH", "legacy or malformed interrupt record") from exc
+            if not isinstance(stored["schema_version"], int) or isinstance(stored["schema_version"], bool): raise _fail("IDENTITY_MISMATCH", "interrupt record schema is invalid")
             expected_reason_digest = raw_file_digest(canonical_json({"reason": reason}))
-            if stored["schema_version"] != 1 or stored["kind"] != "interrupt_result" or stored["request_id"] != request_id or stored["handle_id"] != value["handle_id"] or stored["request_digest"] != value["request_digest"] or stored["reason"] != reason or stored["reason_digest"] != expected_reason_digest:
+            if not isinstance(stored["schema_version"], int) or isinstance(stored["schema_version"], bool) or stored["schema_version"] != 1 or stored["kind"] != "interrupt_result" or stored["request_id"] != request_id or stored["handle_id"] != value["handle_id"] or stored["request_digest"] != value["request_digest"] or stored["reason"] != reason or stored["reason_digest"] != expected_reason_digest:
                 raise _fail("IDENTITY_MISMATCH", "interrupt reuse identity differs")
             outcome = _closed(stored["outcome"], {"ok", "response", "error"}, "interrupt outcome")
             if outcome["ok"] is True:
@@ -1236,21 +1270,21 @@ class HerdrProvider:
 
     def inspect(self, request: Mapping[str, object]) -> dict[str, object]:
         request = _closed(request, {"schema_version", "request_id", "handle"}, "inspect request")
-        if request["schema_version"] != 1: raise _fail("INVALID_REQUEST", "invalid inspect schema")
+        if not isinstance(request["schema_version"], int) or isinstance(request["schema_version"], bool) or request["schema_version"] != 1: raise _fail("INVALID_REQUEST", "invalid inspect schema")
         request_id = _id(request["request_id"], "request_id")
         internal = self._inspect_handle(request["handle"])
         return {"schema_version": 1, "ok": True, "request_id": request_id, "result": internal["result"]}
 
     def collect(self, request: Mapping[str, object]) -> dict[str, object]:
         request = _closed(request, {"schema_version", "request_id", "handle"}, "collect request")
-        if request["schema_version"] != 1: raise _fail("INVALID_REQUEST", "invalid collect schema")
+        if not isinstance(request["schema_version"], int) or isinstance(request["schema_version"], bool) or request["schema_version"] != 1: raise _fail("INVALID_REQUEST", "invalid collect schema")
         request_id = _id(request["request_id"], "request_id")
         internal = self._collect_handle(request["handle"])
         return {"schema_version": 1, "ok": True, "request_id": request_id, "result": internal["result"]}
 
     def interrupt(self, request: Mapping[str, object]) -> dict[str, object]:
         request = _closed(request, {"schema_version", "request_id", "handle", "reason"}, "interrupt request")
-        if request["schema_version"] != 1: raise _fail("INVALID_REQUEST", "invalid interrupt schema")
+        if not isinstance(request["schema_version"], int) or isinstance(request["schema_version"], bool) or request["schema_version"] != 1: raise _fail("INVALID_REQUEST", "invalid interrupt schema")
         request_id = _id(request["request_id"], "request_id")
         internal = self._interrupt_handle(request["handle"], request["reason"], request_id)
         return {"schema_version": 1, "ok": True, "request_id": request_id, "result": internal["result"]}
