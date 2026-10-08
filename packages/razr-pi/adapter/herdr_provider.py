@@ -526,7 +526,7 @@ class HerdrProvider:
             self._settle({"attempt_id": value["attempt_id"]}, "UNKNOWN", cleanup="uncertain", reason=str(exc))
             raise
 
-    def _settle(self, handle: Mapping[str, object], outcome: str, *, cleanup: str = "not_applicable", reason: str = "") -> None:
+    def _settle(self, handle: Mapping[str, object], outcome: str, *, cleanup: str = "not_applicable", reason: str = "", evidence_refs: Sequence[Mapping[str, object]] = ()) -> None:
         if handle["attempt_id"] in self._settled: return
         if self.ledger is None: raise _fail("LEDGER_CORRUPT", "settlement ledger is unavailable")
         root = self._attempt_paths.get(handle["attempt_id"])
@@ -534,6 +534,8 @@ class HerdrProvider:
         evidence_dir = root / ".razr" / "evidence"; evidence_dir.mkdir(parents=True, exist_ok=True)
         artifact = evidence_dir / ("settled-" + handle["attempt_id"] + ".json")
         data = canonical_json({"attempt_id": handle["attempt_id"], "outcome": outcome, "reason": reason[:500]})
+        collected = [dict(ref) for ref in evidence_refs]
+        for ref in collected: AttemptLedger._ref(ref, "evidence_ref")
         if not artifact.exists():
             fd = os.open(artifact, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as stream: stream.write(data); stream.flush(); os.fsync(stream.fileno())
@@ -541,7 +543,8 @@ class HerdrProvider:
         started = next((json.loads(line) for line in lines if json.loads(line).get("attempt_id") == handle["attempt_id"] and json.loads(line).get("event") == "STARTED"), None)
         if started is None: raise _fail("INVALID_ORDER", "settlement has no STARTED event")
         settled = {key: started[key] for key in ("schema_version", "attempt_id", "work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "worktree_ref", "branch", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest", "herdr")}
-        settled.update({"event": "SETTLED", "settled_at": _now(), "outcome": outcome, "evidence_refs": [{"ref": str(artifact.relative_to(root)), "digest_domain": "canonical_json", "digest": raw_file_digest(data), "kind": "result"}], "prev_digest": started["record_digest"], "cleanup": cleanup})
+        synthetic = {"ref": str(artifact.relative_to(root)), "digest_domain": "raw_file", "digest": raw_file_digest(data), "kind": "result"}
+        settled.update({"event": "SETTLED", "settled_at": _now(), "outcome": outcome, "evidence_refs": collected + [synthetic], "prev_digest": started["record_digest"], "cleanup": cleanup})
         settled["record_digest"] = raw_file_digest(canonical_json(settled)); self.ledger.append(settled); self._settled.add(handle["attempt_id"])
 
     def _handle(self, handle: Mapping[str, object]) -> dict[str, object]:
@@ -590,25 +593,53 @@ class HerdrProvider:
         return value
 
     def recover_unmatched(self, request: Mapping[str, object]) -> dict[str, object]:
-        request = _closed(request, {"schema_version", "request_id", "attempt_id", "recovery_authority", "retained_evidence"}, "recovery request")
+        request = _closed(request, {"schema_version", "request_id", "attempt_id", "worktree", "recovery_authority", "retained_evidence"}, "recovery request")
         if request["schema_version"] != 1: raise _fail("INVALID_REQUEST", "invalid recovery schema")
         request_id = _id(request["request_id"], "request_id"); _id(request["attempt_id"], "attempt_id")
+        worktree = _canonical_dir(request["worktree"], "recovery worktree")
         authority = _closed(request["recovery_authority"], {"kind", "authority_id", "asserted", "reason"}, "recovery authority")
         if authority["kind"] != "explicit" or authority["asserted"] is not True: raise _fail("INVALID_REQUEST", "explicit recovery authority is required")
         _id(authority["authority_id"], "authority_id")
         if not isinstance(authority["reason"], str) or not authority["reason"]: raise _fail("INVALID_REQUEST", "recovery reason is required")
         evidence = request["retained_evidence"]
         if not isinstance(evidence, list) or not evidence: raise _fail("ARTIFACT_UNAVAILABLE", "retained recovery evidence is required")
-        for ref in evidence: AttemptLedger._ref(ref, "evidence_ref")
+        checked_evidence = []
+        evidence_root = worktree / ".razr" / "evidence"
+        for ref in evidence:
+            try: AttemptLedger._ref(ref, "evidence_ref")
+            except ProtocolError as exc:
+                if exc.code == "PATH_ESCAPE": raise
+                raise _fail("ARTIFACT_UNAVAILABLE", "invalid retained evidence reference") from exc
+            relative = PurePosixPath(ref["ref"])
+            if len(relative.parts) < 3 or relative.parts[:2] != (".razr", "evidence"):
+                raise _fail("PATH_ESCAPE", "retained evidence is outside the evidence boundary")
+            path = worktree.joinpath(*relative.parts)
+            cursor = worktree
+            for part in relative.parts:
+                cursor = cursor / part
+                if cursor.is_symlink(): raise _fail("PATH_ESCAPE", "retained evidence contains a symlink")
+            try: resolved = path.resolve(strict=True)
+            except OSError as exc: raise _fail("ARTIFACT_UNAVAILABLE", "retained evidence is missing") from exc
+            if not resolved.is_relative_to(evidence_root) or resolved.is_symlink() or not resolved.is_file(): raise _fail("PATH_ESCAPE", "retained evidence escapes boundary")
+            try:
+                data = resolved.read_bytes()
+            except OSError as exc: raise _fail("ARTIFACT_UNAVAILABLE", "retained evidence cannot be read") from exc
+            if len(data) > 1_048_576: raise _fail("OUTPUT_LIMIT", "retained evidence exceeds bound")
+            actual = raw_file_digest(data) if ref["digest_domain"] == "raw_file" else None
+            if ref["digest_domain"] == "canonical_json":
+                try: actual = raw_file_digest(canonical_json(json.loads(data.decode("utf-8"))))
+                except (UnicodeDecodeError, json.JSONDecodeError, ProtocolError) as exc: raise _fail("DIGEST_MISMATCH", "retained canonical evidence is malformed") from exc
+            if actual != ref["digest"]: raise _fail("DIGEST_MISMATCH", "retained evidence digest differs")
+            checked_evidence.append(dict(ref))
+        evidence = checked_evidence
         if self.ledger is None or not self.ledger.path.exists(): raise _fail("LEDGER_CORRUPT", "recovery ledger is unavailable")
         try: records = [AttemptLedger._replay_validate(json.loads(line)) for line in self.ledger.path.read_text(encoding="utf-8").splitlines()]
         except (OSError, json.JSONDecodeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "recovery ledger cannot be replayed") from exc
         started = next((row for row in records if row["event"] == "STARTED" and row["attempt_id"] == request["attempt_id"]), None)
         if started is None: raise _fail("INVALID_ORDER", "no unmatched STARTED event")
         if any(row["attempt_id"] == request["attempt_id"] and row["event"] == "SETTLED" for row in records): raise _fail("INVALID_ORDER", "attempt is already settled")
-        settled = {key: started[key] for key in ("schema_version", "attempt_id", "work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "worktree_ref", "branch", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest", "herdr")}
-        settled.update({"event": "SETTLED", "settled_at": _now(), "outcome": "UNKNOWN", "evidence_refs": evidence, "prev_digest": records[-1]["record_digest"], "cleanup": "uncertain"})
-        settled["record_digest"] = raw_file_digest(canonical_json(settled)); self.ledger.append(settled)
+        self._attempt_paths[request["attempt_id"]] = worktree
+        self._settle({"attempt_id": request["attempt_id"]}, "UNKNOWN", cleanup="uncertain", reason="explicit recovery", evidence_refs=evidence)
         return {"schema_version": 1, "ok": True, "request_id": request_id, "result": {"attempt_id": request["attempt_id"], "outcome": "UNKNOWN", "recovered": True}}
 
     def prompt(self, target: str, text: str, *, timeout_ms: int) -> object:
@@ -651,14 +682,23 @@ class HerdrProvider:
             self._exec([self.herdr, "agent", "send-keys", value["handle_id"], "ctrl-c"], timeout_ms=10_000)
             observed = self._inspect_handle(value)["result"]["status"]
             cleanup = "confirmed" if observed in {"SETTLED", "TERMINATED"} else "uncertain"
-            self._private_observation(value, "interrupt", {"reason": reason, "observed": observed, "cleanup": cleanup})
-            self._settle(value, "INTERRUPTED" if cleanup == "confirmed" else "UNKNOWN", cleanup=cleanup, reason=reason)
+            interruption_bytes = self._private_observation(value, "interrupt", {"reason": reason, "observed": observed, "cleanup": cleanup})
+            interruption_ref = {"ref": "private/attempt-" + value["attempt_id"] + "/session/interrupt-" + value["attempt_id"] + ".json", "kind": "event", "digest_domain": "raw_file", "digest": raw_file_digest(interruption_bytes), "bytes": len(interruption_bytes)}
+            self._settle(value, "INTERRUPTED" if cleanup == "confirmed" else "UNKNOWN", cleanup=cleanup, reason=reason, evidence_refs=[interruption_ref])
             return {"schema_version": 1, "ok": True, "request_id": "interrupt", "result": {"attempt_id": value["attempt_id"], "host": value["host"], "requested": True, "observed": observed, "cleanup": cleanup}}
         except ProtocolError as exc:
-            try: self._private_observation(value, "interrupt", {"reason": reason, "observed": "UNKNOWN", "error": str(exc)[:500]})
+            try:
+                interruption_bytes = self._private_observation(value, "interrupt", {"reason": reason, "observed": "UNKNOWN", "error": str(exc)[:500]})
+                interruption_ref = {"ref": "private/attempt-" + value["attempt_id"] + "/session/interrupt-" + value["attempt_id"] + ".json", "kind": "event", "digest_domain": "raw_file", "digest": raw_file_digest(interruption_bytes), "bytes": len(interruption_bytes)}
+            except ProtocolError:
+                interruption_ref = []
+            try: self._settle(value, "UNKNOWN", cleanup="uncertain", reason=str(exc), evidence_refs=interruption_ref)
             except ProtocolError: pass
-            self._settle(value, "UNKNOWN", cleanup="uncertain", reason=str(exc))
             raise
+        except OSError as exc:
+            try: self._settle(value, "UNKNOWN", cleanup="uncertain", reason=str(exc), evidence_refs=[])
+            except ProtocolError: pass
+            raise _fail("INTERRUPT_FAILED", "interruption observation failed") from exc
 
     def _collect_handle(self, handle: Mapping[str, object]) -> dict[str, object]:
         value = self._handle(handle)
@@ -677,8 +717,9 @@ class HerdrProvider:
             # The frozen status response has no exit code and no semantic
             # termination. Preserve that uncertainty; never consume worker
             # metadata or invent an exit code.
-            self._settle(value, "UNKNOWN", reason="Herdr status/read observed; termination UNKNOWN")
-            return {"schema_version": 1, "ok": True, "request_id": "collect", "result": {"attempt_id": value["attempt_id"], "termination": "UNKNOWN", "runtime_identity": _MODEL + ":medium", "host": value["host"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"], "artifact_refs": [{"kind": "stdout", "digest_domain": "raw_file", "digest": raw_file_digest(data), "bytes": len(data)}, {"kind": "session", "digest_domain": "raw_file", "digest": raw_file_digest(status_bytes), "bytes": len(status_bytes)}], "cleanup": "not_applicable"}}
+            refs = [{"ref": "private/attempt-" + value["attempt_id"] + "/output/" + output_artifact.name, "kind": "stdout", "digest_domain": "raw_file", "digest": raw_file_digest(data), "bytes": len(data)}, {"ref": "private/attempt-" + value["attempt_id"] + "/session/" + status_artifact.name, "kind": "session", "digest_domain": "raw_file", "digest": raw_file_digest(status_bytes), "bytes": len(status_bytes)}]
+            self._settle(value, "UNKNOWN", reason="Herdr status/read observed; termination UNKNOWN", evidence_refs=refs)
+            return {"schema_version": 1, "ok": True, "request_id": "collect", "result": {"attempt_id": value["attempt_id"], "termination": "UNKNOWN", "runtime_identity": _MODEL + ":medium", "host": value["host"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"], "artifact_refs": refs, "cleanup": "not_applicable"}}
         except ProtocolError as exc:
             self._settle(value, "UNKNOWN", cleanup="uncertain", reason=str(exc)); raise
 

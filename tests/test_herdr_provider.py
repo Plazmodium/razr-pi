@@ -126,7 +126,8 @@ class HerdrProviderTests(unittest.TestCase):
             self.assertEqual(set(handle), {"provider_id", "handle_id", "request_digest", "attempt_id", "host", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest"})
             self.assertEqual(response["result"]["capability_report_digest"], provider.probe({"schema_version": 1, "request_id": "probe-after-launch", "required_capabilities": ["runtime_identity"], "runtime": request["runtime"]})["result"]["report_digest"])
             self.assertEqual(provider.inspect({"schema_version": 1, "request_id": "inspect-unique", "handle": handle})["request_id"], "inspect-unique")
-            recovery = {"schema_version": 1, "request_id": "recover-1", "attempt_id": "att-1", "recovery_authority": {"kind": "explicit", "authority_id": "human-1", "asserted": True, "reason": "retained crash evidence"}, "retained_evidence": [{"ref": ".razr/evidence/crash.json", "digest_domain": "canonical_json", "digest": "sha256:" + "e" * 64, "kind": "recovery"}]}
+            crash = worktree / ".razr" / "evidence" / "crash.json"; crash.parent.mkdir(parents=True, exist_ok=True); crash.write_bytes(b"crash")
+            recovery = {"schema_version": 1, "request_id": "recover-1", "attempt_id": "att-1", "worktree": str(worktree), "recovery_authority": {"kind": "explicit", "authority_id": "human-1", "asserted": True, "reason": "retained crash evidence"}, "retained_evidence": [{"ref": ".razr/evidence/crash.json", "digest_domain": "raw_file", "digest": raw_file_digest(b"crash"), "kind": "recovery"}]}
             self.assertEqual(provider.recover_unmatched(recovery)["result"]["outcome"], "UNKNOWN")
             collected = HerdrProvider(runner=run, ledger=ledger, private_root=private)
             result = collected.collect({"schema_version": 1, "request_id": "collect-1", "handle": handle})
@@ -149,6 +150,21 @@ class HerdrProviderTests(unittest.TestCase):
                 with self.assertRaises(ProtocolError) as caught:
                     AttemptLedger._replay_validate({"schema_version": 1, "event": "STARTED", "candidate": candidate, "candidate_evidence": [], "request_packet": None, "herdr": []})
                 self.assertEqual(caught.exception.code, "LEDGER_CORRUPT")
+
+    def test_recovery_retained_evidence_requires_existing_matching_boundary_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve(); evidence = root / ".razr" / "evidence"; evidence.mkdir(parents=True)
+            base = {"schema_version": 1, "request_id": "recover-unique", "attempt_id": "att-missing", "worktree": str(root), "recovery_authority": {"kind": "explicit", "authority_id": "human-1", "asserted": True, "reason": "crash"}}
+            missing = {**base, "retained_evidence": [{"ref": ".razr/evidence/missing.json", "digest_domain": "raw_file", "digest": "sha256:" + "a" * 64, "kind": "recovery"}]}
+            with self.assertRaises(ProtocolError) as caught: HerdrProvider().recover_unmatched(missing)
+            self.assertEqual(caught.exception.code, "ARTIFACT_UNAVAILABLE")
+            escaping = {**base, "retained_evidence": [{"ref": ".razr/evidence/../../secret", "digest_domain": "raw_file", "digest": "sha256:" + "a" * 64, "kind": "recovery"}]}
+            with self.assertRaises(ProtocolError) as caught: HerdrProvider().recover_unmatched(escaping)
+            self.assertEqual(caught.exception.code, "PATH_ESCAPE")
+            actual = evidence / "actual.json"; actual.write_bytes(b"actual")
+            mismatch = {**base, "retained_evidence": [{"ref": ".razr/evidence/actual.json", "digest_domain": "raw_file", "digest": "sha256:" + "b" * 64, "kind": "recovery"}]}
+            with self.assertRaises(ProtocolError) as caught: HerdrProvider().recover_unmatched(mismatch)
+            self.assertEqual(caught.exception.code, "DIGEST_MISMATCH")
 
     def test_request_rejects_runtime_fallback_and_root_reuse(self):
         with tempfile.TemporaryDirectory() as tmp:
