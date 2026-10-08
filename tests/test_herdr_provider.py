@@ -158,6 +158,29 @@ class HerdrProviderTests(unittest.TestCase):
                 with self.assertRaises(ProtocolError) as caught: provider._interrupt_handle(value, "timeout", "interrupt-repeat")
                 self.assertEqual(caught.exception.code, "IDENTITY_MISMATCH")
 
+    def test_failing_interrupt_replays_same_protocol_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); session = root / "session"; session.mkdir()
+            value = {"attempt_id": "att-fail", "handle_id": "agent-fail", "request_digest": "sha256:" + "a" * 64, "host": {"mode": "herdr", "workspace_id": "w", "tab_id": "t", "pane_id": "p"}}
+            calls = []
+            def fail(argv, **kwargs): calls.append(argv); raise ProtocolError("INTERRUPT_FAILED", "signal failed", retryable=True, details={"source": "fake"})
+            provider = HerdrProvider(runner=fail); provider._attempt_sessions[value["attempt_id"]] = session; provider._attempt_paths[value["attempt_id"]] = root
+            with patch.object(provider, "_handle", return_value=value), patch.object(provider, "_settle"):
+                with self.assertRaises(ProtocolError) as first: provider._interrupt_handle(value, "cancel", "interrupt-fail")
+                with self.assertRaises(ProtocolError) as second: provider._interrupt_handle(value, "cancel", "interrupt-fail")
+            self.assertEqual(first.exception.code, second.exception.code); self.assertEqual(str(first.exception), str(second.exception)); self.assertEqual(len(calls), 1)
+
+    def test_collection_failure_with_malformed_ledger_maps_and_retains_private_record(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); output = root / "output"; session = root / "session"; output.mkdir(); session.mkdir(); ledger_path = root / "attempts.jsonl"; ledger_path.write_text("not-json\\n")
+            ledger = AttemptLedger(ledger_path); provider = HerdrProvider(ledger=ledger); value = {"attempt_id": "att-corrupt", "handle_id": "agent-corrupt"}
+            provider._attempt_roots[value["attempt_id"]] = (output, session); provider._attempt_sessions[value["attempt_id"]] = session; provider._attempt_paths[value["attempt_id"]] = root
+            (output / "agent-read-att-corrupt.bin").write_bytes(b"already")
+            with patch.object(provider, "_handle", return_value=value), patch.object(provider, "_inspect_handle", return_value={"result": {"status": "TERMINATED"}}), patch.object(provider, "read", return_value=b"new"):
+                with self.assertRaises(ProtocolError) as caught: provider._collect_handle(value)
+            self.assertEqual(caught.exception.code, "LEDGER_CORRUPT")
+            self.assertTrue((session / "collect-failure-att-corrupt.json").exists())
+
     def test_nested_malformed_records_fail_as_ledger_corrupt(self):
         malformed = [None, [], {}, {"commit": "0" * 40}, {"source_digest": "sha256:" + "a" * 64}]
         for candidate in malformed:

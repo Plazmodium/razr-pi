@@ -539,8 +539,9 @@ class HerdrProvider:
         if synthetic and not artifact.exists():
             fd = os.open(artifact, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as stream: stream.write(data); stream.flush(); os.fsync(stream.fileno())
-        lines = self.ledger.path.read_text(encoding="utf-8").splitlines()
-        started = next((json.loads(line) for line in lines if json.loads(line).get("attempt_id") == handle["attempt_id"] and json.loads(line).get("event") == "STARTED"), None)
+        try: records = [AttemptLedger._replay_validate(json.loads(line)) for line in self.ledger.path.read_text(encoding="utf-8").splitlines()]
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "settlement ledger cannot be replayed") from exc
+        started = next((row for row in records if row["attempt_id"] == handle["attempt_id"] and row["event"] == "STARTED"), None)
         if started is None: raise _fail("INVALID_ORDER", "settlement has no STARTED event")
         settled = {key: started[key] for key in ("schema_version", "attempt_id", "work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "worktree_ref", "branch", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest", "herdr")}
         supplemental = [{"ref": str(artifact.relative_to(root)), "digest_domain": "raw_file", "digest": raw_file_digest(data), "kind": "result"}] if synthetic else []
@@ -683,16 +684,24 @@ class HerdrProvider:
         if interrupt_path.exists():
             try: stored = json.loads(interrupt_path.read_text(encoding="utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "interrupt record is malformed") from exc
+            try: stored = _closed(stored, {"schema_version", "kind", "request_id", "handle_id", "request_digest", "reason", "reason_digest", "outcome"}, "interrupt record")
+            except ProtocolError as exc: raise _fail("IDENTITY_MISMATCH", "legacy or malformed interrupt record") from exc
             expected_reason_digest = raw_file_digest(canonical_json({"reason": reason}))
-            if not isinstance(stored, dict) or stored.get("request_id") != request_id or stored.get("handle_id") != value["handle_id"] or stored.get("request_digest") != value["request_digest"] or stored.get("reason") != reason or stored.get("reason_digest") != expected_reason_digest:
+            if stored["schema_version"] != 1 or stored["kind"] != "interrupt_result" or stored["request_id"] != request_id or stored["handle_id"] != value["handle_id"] or stored["request_digest"] != value["request_digest"] or stored["reason"] != reason or stored["reason_digest"] != expected_reason_digest:
                 raise _fail("IDENTITY_MISMATCH", "interrupt reuse identity differs")
-            return stored["response"]
+            outcome = _closed(stored["outcome"], {"ok", "response", "error"}, "interrupt outcome")
+            if outcome["ok"] is True:
+                if not isinstance(outcome["response"], dict) or outcome["error"] is not None: raise _fail("IDENTITY_MISMATCH", "invalid stored interrupt success")
+                return outcome["response"]
+            error = _closed(outcome["error"], {"code", "retryable", "details", "message"}, "interrupt error")
+            if outcome["response"] is not None or error["code"] not in ERROR_CODES or not isinstance(error["retryable"], bool) or not isinstance(error["details"], dict): raise _fail("IDENTITY_MISMATCH", "invalid stored interrupt error")
+            raise ProtocolError(error["code"], error["message"], retryable=error["retryable"], details=error["details"])
         try:
             self._exec([self.herdr, "agent", "send-keys", value["handle_id"], "ctrl-c"], timeout_ms=10_000)
             observed = self._inspect_handle(value)["result"]["status"]
             cleanup = "confirmed" if observed in {"SETTLED", "TERMINATED"} else "uncertain"
             response = {"schema_version": 1, "ok": True, "request_id": request_id, "result": {"attempt_id": value["attempt_id"], "host": value["host"], "requested": True, "observed": observed, "cleanup": cleanup}}
-            interrupt_record = {"schema_version": 1, "request_id": request_id, "handle_id": value["handle_id"], "request_digest": value["request_digest"], "reason": reason, "reason_digest": raw_file_digest(canonical_json({"reason": reason})), "observed": observed, "cleanup": cleanup, "response": response}
+            interrupt_record = {"schema_version": 1, "kind": "interrupt_result", "request_id": request_id, "handle_id": value["handle_id"], "request_digest": value["request_digest"], "reason": reason, "reason_digest": raw_file_digest(canonical_json({"reason": reason})), "outcome": {"ok": True, "response": response, "error": None}}
             interruption_bytes = canonical_json(interrupt_record)
             fd = os.open(interrupt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as stream: stream.write(interruption_bytes); stream.flush(); os.fsync(stream.fileno())
@@ -700,13 +709,16 @@ class HerdrProvider:
             self._settle(value, "INTERRUPTED" if cleanup == "confirmed" else "UNKNOWN", cleanup=cleanup, reason=reason, evidence_refs=[interruption_ref])
             return response
         except ProtocolError as exc:
+            error_record = {"schema_version": 1, "kind": "interrupt_result", "request_id": request_id, "handle_id": value["handle_id"], "request_digest": value["request_digest"], "reason": reason, "reason_digest": raw_file_digest(canonical_json({"reason": reason})), "outcome": {"ok": False, "response": None, "error": {"code": exc.code, "message": str(exc), "retryable": exc.retryable, "details": exc.details}}}
             try:
-                interruption_bytes = self._private_observation(value, "interrupt", {"reason": reason, "observed": "UNKNOWN", "error": str(exc)[:500]})
-                interruption_ref = {"ref": "private/attempt-" + value["attempt_id"] + "/session/interrupt-" + value["attempt_id"] + ".json", "kind": "event", "digest_domain": "raw_file", "digest": raw_file_digest(interruption_bytes), "bytes": len(interruption_bytes)}
-            except ProtocolError:
-                interruption_ref = []
-            try: self._settle(value, "UNKNOWN", cleanup="uncertain", reason=str(exc), evidence_refs=interruption_ref)
-            except ProtocolError: pass
+                error_bytes = canonical_json(error_record); fd = os.open(interrupt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "wb") as stream: stream.write(error_bytes); stream.flush(); os.fsync(stream.fileno())
+                error_ref = {"ref": "private/attempt-" + value["attempt_id"] + "/session/" + interrupt_path.name, "kind": "event", "digest_domain": "raw_file", "digest": raw_file_digest(error_bytes)}
+                self._settle(value, "UNKNOWN", cleanup="uncertain", reason="interrupt failed", evidence_refs=[error_ref])
+            except ProtocolError as settle_exc:
+                if settle_exc.code == "LEDGER_CORRUPT": raise _fail("LEDGER_CORRUPT", "interrupt failure cannot settle") from settle_exc
+            except OSError:
+                pass
             raise
         except OSError as exc:
             try: self._settle(value, "UNKNOWN", cleanup="uncertain", reason=str(exc), evidence_refs=[])
@@ -742,12 +754,13 @@ class HerdrProvider:
                 with os.fdopen(fd, "wb") as stream: stream.write(failure_data); stream.flush(); os.fsync(stream.fileno())
                 failure_ref = {"ref": "private/attempt-" + value["attempt_id"] + "/session/" + failure_path.name, "kind": "event", "digest_domain": "raw_file", "digest": raw_file_digest(failure_data)}
             except OSError:
-                lines = self.ledger.path.read_text(encoding="utf-8").splitlines() if self.ledger and self.ledger.path.exists() else []
-                started = next((json.loads(line) for line in lines if json.loads(line).get("attempt_id") == value["attempt_id"] and json.loads(line).get("event") == "STARTED"), None)
-                failure_ref = started["request_packet"] if started is not None else None
+                failure_ref = None
             try:
                 self._settle(value, "UNKNOWN", cleanup="uncertain", reason="collect artifact persistence failed", evidence_refs=[failure_ref] if failure_ref else [], synthetic=not bool(failure_ref and failure_ref.get("ref", "").startswith("private/")))
-            except (OSError, ProtocolError) as settle_exc:
+            except ProtocolError as settle_exc:
+                if settle_exc.code == "LEDGER_CORRUPT": raise _fail("LEDGER_CORRUPT", "collect failure cannot be settled") from settle_exc
+                raise _fail("CLEANUP_UNKNOWN", "collect failure could not be durably settled") from settle_exc
+            except OSError as settle_exc:
                 raise _fail("CLEANUP_UNKNOWN", "collect failure could not be durably settled") from settle_exc
             raise _fail("ARTIFACT_UNAVAILABLE", "collect artifact persistence failed") from exc
         except ProtocolError as exc:
