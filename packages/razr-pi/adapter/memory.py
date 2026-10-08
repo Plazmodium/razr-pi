@@ -30,6 +30,46 @@ MAX_SUMMARY = 2000
 MAX_TAGS = 32
 MAX_TAG = 80
 MAX_EVIDENCE = 32
+MAX_EVIDENCE_BYTES = 8192
+MAX_TAG_BYTES = 2048
+MAX_RELATED_BYTES = 4096
+MAX_EVIDENCE_CONTENT_BYTES = 1_048_576
+MAX_SCOPE_PATHS = 64
+MAX_SCOPE_BYTES = 8192
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", None)
+_O_DIRECTORY = getattr(os, "O_DIRECTORY", None)
+
+
+def _regular(fd: int, label: str, *, directory: bool = False) -> os.stat_result:
+    try:
+        info = os.fstat(fd)
+    except OSError as exc:
+        raise _fail("LEDGER_CORRUPT", f"{label} identity unavailable") from exc
+    if not (info.st_mode & (0o170000)) == (0o040000 if directory else 0o100000):
+        raise _fail("LEDGER_CORRUPT", f"{label} is not a regular {'directory' if directory else 'file'}")
+    return info
+
+
+def _read_fd(fd: int, label: str, *, max_bytes: int | None = None) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        try:
+            chunk = os.read(fd, 65536)
+        except InterruptedError:
+            continue
+        except OSError as exc:
+            raise _fail("LEDGER_CORRUPT", f"{label} read failed") from exc
+        if not chunk:
+            return b"".join(chunks)
+        total += len(chunk)
+        if max_bytes is not None and total > max_bytes:
+            raise _fail("LIMIT_EXCEEDED", f"{label} exceeds bounds")
+        chunks.append(chunk)
+
+
+def _identity(info: os.stat_result) -> tuple[int, int, int, int]:
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
 
 
 def _fail(code: str, message: str, **details: object) -> ProtocolError:
@@ -119,42 +159,88 @@ class MemoryStore:
             raise _fail("INVALID_REQUEST", "repository root must be canonical")
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_LIMIT:
             raise _fail("INVALID_REQUEST", "invalid memory limit")
+        if _O_NOFOLLOW is None or _O_DIRECTORY is None:
+            raise _fail("UNSUPPORTED_CAPABILITY", "descriptor-safe storage is unavailable")
         self.root = root
         self.path = root / ".razr/memory.jsonl"
         self.lock_path = root / ".razr/memory.jsonl.lock"
+        try:
+            self._root_fd = os.open(root, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
+            self._root_identity = _identity(_regular(self._root_fd, "repository", directory=True))
+        except OSError as exc:
+            raise _fail("INVALID_REQUEST", "repository descriptor unavailable") from exc
         self._now = now
         self.default_limit = limit
 
-    @contextmanager
-    def _locked(self) -> Iterator[None]:
+    def _storage_dir(self) -> int:
         try:
-            self.path.parent.mkdir(mode=0o755, exist_ok=True)
-            with self.lock_path.open("a+") as lock:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-                try:
-                    yield
-                finally:
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            os.mkdir(".razr", 0o755, dir_fd=self._root_fd)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise _fail("LEDGER_CORRUPT", "memory directory unavailable") from exc
+        try:
+            fd = os.open(".razr", os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=self._root_fd)
+            _regular(fd, "memory directory", directory=True)
+            return fd
+        except OSError as exc:
+            raise _fail("LEDGER_CORRUPT", "memory directory is linked or unavailable") from exc
+
+    @contextmanager
+    def _locked(self) -> Iterator[int]:
+        storage_fd = self._storage_dir()
+        lock_fd = -1
+        try:
+            lock_fd = os.open("memory.jsonl.lock", os.O_RDWR | os.O_CREAT | _O_NOFOLLOW, 0o644, dir_fd=storage_fd)
+            _regular(lock_fd, "memory lock")
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield storage_fd
+        except ProtocolError:
+            raise
         except (OSError, BlockingIOError) as exc:
             raise _fail("LOCK_UNAVAILABLE", "memory lock unavailable", retryable=True) from exc
+        finally:
+            if lock_fd >= 0:
+                try:
+                    os.close(lock_fd)
+                except OSError:
+                    pass
+            try:
+                os.close(storage_fd)
+            except OSError:
+                pass
 
-    def _read_locked(self) -> list[dict[str, object]]:
-        if not self.path.exists():
-            return []
+    def _read_locked(self, storage_fd: int) -> list[dict[str, object]]:
         try:
-            raw = self.path.read_bytes()
+            ledger_fd = os.open("memory.jsonl", os.O_RDONLY | _O_NOFOLLOW, dir_fd=storage_fd)
+        except FileNotFoundError:
+            return []
         except OSError as exc:
-            raise _fail("LEDGER_CORRUPT", "memory ledger unavailable") from exc
+            raise _fail("LEDGER_CORRUPT", "memory ledger is linked or unavailable") from exc
+        try:
+            before = _regular(ledger_fd, "memory ledger")
+            raw = _read_fd(ledger_fd, "memory ledger")
+            after = _regular(ledger_fd, "memory ledger")
+            if _identity(before) != _identity(after):
+                raise _fail("LEDGER_CORRUPT", "memory ledger identity changed")
+        finally:
+            os.close(ledger_fd)
         if raw and not raw.endswith(b"\n"):
             raise _fail("LEDGER_CORRUPT", "partial final memory record")
         records: list[dict[str, object]] = []
         previous = GENESIS
         ids: set[str] = set()
+        successors: set[str] = set()
         for line in raw.splitlines(keepends=True):
             value = _parse_record_line(line)
             self._validate_record(value, corruption=True)
             if value["id"] in ids or value["prev_digest"] != previous:
                 raise _fail("LEDGER_CORRUPT", "broken memory chain or duplicate id")
+            source = value.get("supersedes")
+            if source is not None and source in successors:
+                raise _fail("LEDGER_CORRUPT", "multiple memory successors")
+            if source is not None:
+                successors.add(source)
             if value["record_digest"] != _record_digest(value):
                 raise _fail("LEDGER_CORRUPT", "invalid memory record digest")
             records.append(value)
@@ -186,16 +272,18 @@ class MemoryStore:
             raise fail("invalid memory scope")
         try:
             validate_source_digest(scope["repository"])
-            if not isinstance(scope["paths"], list):
+            if not isinstance(scope["paths"], list) or len(scope["paths"]) > MAX_SCOPE_PATHS:
                 raise ValueError
             for path in scope["paths"]:
                 _repo_path(path)
+            if len(canonical_json(scope["paths"])) > MAX_SCOPE_BYTES:
+                raise ValueError
         except (ProtocolError, ValueError) as exc:
             raise fail("invalid memory scope") from exc
         if not _valid_timestamp(value["created_at"]) or not _valid_timestamp(value["updated_at"]):
             raise fail("invalid UTC RFC3339 timestamp")
         evidence = value["evidence"]
-        if not isinstance(evidence, list) or len(evidence) > MAX_EVIDENCE:
+        if not isinstance(evidence, list) or len(evidence) > MAX_EVIDENCE or len(canonical_json(evidence)) > MAX_EVIDENCE_BYTES:
             raise fail("invalid memory evidence")
         for item in evidence:
             if not isinstance(item, dict) or set(item) != {"type", "ref", "digest_domain", "digest"}:
@@ -215,7 +303,8 @@ class MemoryStore:
         if not isinstance(value["record_digest"], str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", value["record_digest"]):
             raise fail("invalid record digest")
         if "tags" in value:
-            if not isinstance(value["tags"], list) or len(value["tags"]) > MAX_TAGS:
+            if (not isinstance(value["tags"], list) or len(value["tags"]) > MAX_TAGS
+                    or len(canonical_json(value["tags"])) > MAX_TAG_BYTES):
                 raise fail("invalid memory tags")
             for tag in value["tags"]:
                 try:
@@ -225,6 +314,7 @@ class MemoryStore:
         if "supersedes" in value and (not isinstance(value["supersedes"], str) or not ID_RE.fullmatch(value["supersedes"])):
             raise fail("invalid supersedes relation")
         if "related_ids" in value and (not isinstance(value["related_ids"], list)
+                                        or len(canonical_json(value["related_ids"])) > MAX_RELATED_BYTES
                                         or any(not isinstance(item, str) or not ID_RE.fullmatch(item)
                                                for item in value["related_ids"])):
             raise fail("invalid related ids")
@@ -246,7 +336,7 @@ class MemoryStore:
         except OSError as exc:
             raise _fail("LOCK_UNAVAILABLE", "memory fsync unavailable", retryable=True) from exc
 
-    def _append_locked(self, record: dict[str, object], records: list[dict[str, object]]) -> dict[str, object]:
+    def _append_locked(self, storage_fd: int, record: dict[str, object], records: list[dict[str, object]]) -> dict[str, object]:
         if any(row["id"] == record["id"] for row in records):
             raise _fail("LEDGER_CORRUPT", "duplicate memory id")
         record["prev_digest"] = records[-1]["record_digest"] if records else GENESIS
@@ -254,15 +344,19 @@ class MemoryStore:
         self._validate_record(record)
         payload = canonical_json(record) + b"\n"
         try:
-            fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+            fd = os.open("memory.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_NOFOLLOW, 0o644, dir_fd=storage_fd)
             try:
+                before = _regular(fd, "memory ledger")
                 self._write_all(fd, payload)
+                after = _regular(fd, "memory ledger")
+                if _identity(before)[:2] != _identity(after)[:2]:
+                    raise _fail("LEDGER_CORRUPT", "memory ledger identity changed")
             finally:
                 os.close(fd)
         except ProtocolError:
             raise
         except OSError as exc:
-            raise _fail("LOCK_UNAVAILABLE", "memory append unavailable", retryable=True) from exc
+            raise _fail("LEDGER_CORRUPT", "memory ledger is linked or unavailable") from exc
         return record
 
     def _logical(self, record: dict[str, object]) -> dict[str, object]:
@@ -275,61 +369,85 @@ class MemoryStore:
         if kind not in KINDS or confidence not in CONFIDENCES:
             raise _fail("INVALID_REQUEST", "invalid memory kind or confidence")
         validate_source_digest(repository)
-        scope = {"repository": repository, "paths": [] if paths is None else [_repo_path(path) for path in paths]}
+        scope_paths = [] if paths is None else [_repo_path(path) for path in paths]
+        if len(scope_paths) > MAX_SCOPE_PATHS or len(canonical_json(scope_paths)) > MAX_SCOPE_BYTES:
+            raise _fail("INVALID_REQUEST", "scope paths exceed bounds")
+        scope = {"repository": repository, "paths": scope_paths}
         checked = self._prepare_evidence([] if evidence is None else evidence)
         checked_tags = [] if tags is None else tags
-        if not isinstance(checked_tags, list) or len(checked_tags) > MAX_TAGS:
+        if (not isinstance(checked_tags, list) or len(checked_tags) > MAX_TAGS
+                or len(canonical_json(checked_tags)) > MAX_TAG_BYTES):
             raise _fail("INVALID_REQUEST", "invalid tags")
         checked_tags = [_safe_text(tag, "tag", MAX_TAG) for tag in checked_tags]
         checked_relations = [] if related_ids is None else related_ids
-        if not isinstance(checked_relations, list) or any(not isinstance(item, str) or not ID_RE.fullmatch(item) for item in checked_relations):
+        if (not isinstance(checked_relations, list) or len(canonical_json(checked_relations)) > MAX_RELATED_BYTES
+                or any(not isinstance(item, str) or not ID_RE.fullmatch(item) for item in checked_relations)):
             raise _fail("INVALID_REQUEST", "invalid related ids")
         result: dict[str, object] = {"kind": kind, "summary": summary, "scope": scope, "confidence": confidence,
                                      "evidence": checked, "tags": checked_tags, "related_ids": checked_relations}
         return result
 
-    def _safe_evidence_path(self, ref: str) -> Path:
+    def _read_evidence(self, ref: str) -> bytes:
         relative = _repo_path(ref)
-        candidate = self.root
-        for component in PurePosixPath(relative).parts:
-            candidate = candidate / component
-            try:
-                if os.path.islink(candidate):
-                    raise _fail("PATH_ESCAPE", "symlink evidence path refused")
-            except OSError as exc:
-                raise _fail("PATH_ESCAPE", "evidence path unavailable") from exc
+        if _identity(_regular(self._root_fd, "repository", directory=True))[:2] != self._root_identity[:2]:
+            raise _fail("PATH_ESCAPE", "repository identity changed")
+        current = self._root_fd
+        owned: list[int] = []
         try:
-            resolved = candidate.resolve(strict=True)
-        except OSError as exc:
-            raise _fail("PATH_ESCAPE", "evidence path unavailable") from exc
-        if not resolved.is_relative_to(self.root) or not resolved.is_file():
-            raise _fail("PATH_ESCAPE", "evidence path escapes repository")
-        checked = self.root
-        for component in resolved.relative_to(self.root).parts:
-            checked = checked / component
+            components = PurePosixPath(relative).parts
+            for component in components[:-1]:
+                try:
+                    fd = os.open(component, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=current)
+                    _regular(fd, "evidence directory", directory=True)
+                except OSError as exc:
+                    raise _fail("PATH_ESCAPE", "evidence component is linked or unavailable") from exc
+                owned.append(fd)
+                current = fd
             try:
-                if os.path.islink(checked):
-                    raise _fail("PATH_ESCAPE", "symlink evidence path refused")
+                fd = os.open(components[-1], os.O_RDONLY | _O_NOFOLLOW, dir_fd=current)
+                before = _regular(fd, "evidence file")
+                content = _read_fd(fd, "evidence file", max_bytes=MAX_EVIDENCE_CONTENT_BYTES)
+                after = _regular(fd, "evidence file")
             except OSError as exc:
-                raise _fail("PATH_ESCAPE", "evidence path unavailable") from exc
-        return resolved
+                raise _fail("PATH_ESCAPE", "evidence file is linked or unavailable") from exc
+            finally:
+                try:
+                    os.close(fd)
+                except UnboundLocalError:
+                    pass
+            if _identity(before) != _identity(after):
+                raise _fail("PATH_ESCAPE", "evidence file identity changed")
+            return content
+        except ProtocolError as exc:
+            if exc.code == "LEDGER_CORRUPT":
+                raise _fail("PATH_ESCAPE", "evidence read failed") from exc
+            raise
+        finally:
+            for fd in reversed(owned):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
     def _prepare_evidence(self, evidence: list[dict[str, str]]) -> list[dict[str, str]]:
         if not isinstance(evidence, list) or len(evidence) > MAX_EVIDENCE:
             raise _fail("INVALID_REQUEST", "invalid memory evidence")
         checked: list[dict[str, str]] = []
+        content_bytes = 0
         for item in evidence:
             if not isinstance(item, dict) or set(item) != {"type", "ref", "digest_domain", "digest"}:
                 raise _fail("INVALID_REQUEST", "evidence must be closed")
-            if item["type"] not in EVIDENCE_TYPES:
+            if not isinstance(item["type"], str) or item["type"] not in EVIDENCE_TYPES:
                 raise _fail("INVALID_REQUEST", "invalid evidence type")
             _safe_text(item["ref"], "evidence reference", 512)
             _digest(item["digest"], item["digest_domain"])
             if item["type"] == "path":
                 if item["digest_domain"] != "raw_file":
                     raise _fail("INVALID_REQUEST", "path evidence must use raw-file digest")
-                target = self._safe_evidence_path(item["ref"])
-                content = target.read_bytes()
+                content = self._read_evidence(item["ref"])
+                content_bytes += len(content)
+                if content_bytes > MAX_EVIDENCE_CONTENT_BYTES:
+                    raise _fail("LIMIT_EXCEEDED", "evidence content exceeds bounds")
                 if SECRET_RE.search(content.decode("utf-8", errors="replace")):
                     raise _fail("INVALID_REQUEST", "secret-like evidence refused")
                 if item["digest"] != raw_file_digest(content):
@@ -350,18 +468,18 @@ class MemoryStore:
                   "created_at": self._now(), "updated_at": self._now()}
         record.pop("tags", None) if not logical["tags"] else None
         record.pop("related_ids", None) if not logical["related_ids"] else None
-        with self._locked():
-            rows = self._read_locked()
+        with self._locked() as storage_fd:
+            rows = self._read_locked(storage_fd)
             existing = next((row for row in rows if row["id"] == requested_id), None)
             if existing is not None:
                 if self._logical(existing) == self._logical(record) and existing["status"] == "active":
                     return existing
                 raise _fail("INVALID_REQUEST", "memory id conflicts with different logical payload", id=requested_id)
-            return self._append_locked(record, rows)
+            return self._append_locked(storage_fd, record, rows)
 
     def records(self) -> list[dict[str, object]]:
-        with self._locked():
-            return self._read_locked()
+        with self._locked() as storage_fd:
+            return self._read_locked(storage_fd)
 
     def inspect(self) -> list[dict[str, object]]:
         return self.records()
@@ -400,8 +518,7 @@ class MemoryStore:
         for item in row["evidence"]:
             if item["type"] == "path" and item["digest_domain"] == "raw_file":
                 try:
-                    target = self._safe_evidence_path(item["ref"])
-                    if raw_file_digest(target.read_bytes()) != item["digest"]:
+                    if raw_file_digest(self._read_evidence(item["ref"])) != item["digest"]:
                         return True
                 except (OSError, ProtocolError):
                     return True
@@ -423,9 +540,12 @@ class MemoryStore:
                     confidence: str | None = None) -> dict[str, object]:
         if not isinstance(record_id, str) or not ID_RE.fullmatch(record_id):
             raise _fail("INVALID_REQUEST", "invalid memory id")
-        with self._locked():
-            rows = self._read_locked()
+        with self._locked() as storage_fd:
+            rows = self._read_locked(storage_fd)
             old = next((row for row in rows if row["id"] == record_id), None)
+            successors = [row for row in rows if row.get("supersedes") == record_id]
+            if len(successors) > 1:
+                raise _fail("LEDGER_CORRUPT", "multiple memory successors")
             if old is None or old["status"] in {"retired", "superseded"}:
                 raise _fail("INVALID_REQUEST", "memory record is unavailable")
             new_summary = old["summary"] if summary is None else summary
@@ -451,7 +571,12 @@ class MemoryStore:
                 record.pop("tags")
             if not record["related_ids"]:
                 record.pop("related_ids")
-            return self._append_locked(record, rows)
+            if successors:
+                existing = successors[0]
+                if existing["id"] == record["id"] and self._logical(existing) == self._logical(record) and existing["status"] == record["status"]:
+                    return existing
+                raise _fail("INVALID_REQUEST", "memory record already has a different successor", id=record_id)
+            return self._append_locked(storage_fd, record, rows)
 
     def validate(self) -> dict[str, object]:
         return {"records": len(self.records()), "valid": True}

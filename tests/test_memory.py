@@ -147,6 +147,62 @@ class MemoryTests(unittest.TestCase):
         self.assertTrue(all(worker.exitcode == 0 for worker in workers))
         self.assertEqual(len(self.store.inspect()), 4)
 
+    def test_storage_links_and_component_identity_fail_closed(self):
+        outside = Path(tempfile.mkdtemp())
+        self.root.joinpath(".razr").symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(ProtocolError):
+            self.store.remember(kind="learning", summary="linked storage", repository=self.repo)
+        self.root.joinpath(".razr").unlink()
+        (self.root / ".razr").mkdir()
+        (self.root / "target.jsonl").write_text("")
+        (self.root / ".razr/memory.jsonl").symlink_to(self.root / "target.jsonl")
+        with self.assertRaises(ProtocolError):
+            self.store.inspect()
+        (self.root / ".razr/memory.jsonl").unlink()
+        (self.root / ".razr/memory.jsonl.lock").unlink()
+        (self.root / ".razr/memory.jsonl.lock").symlink_to(self.root / "target.jsonl")
+        with self.assertRaises(ProtocolError):
+            self.store.inspect()
+        (self.root / ".razr/memory.jsonl.lock").unlink()
+        evidence = self.root / "identity.txt"
+        evidence.write_text("one")
+        digest = raw_file_digest(evidence.read_bytes())
+        original_identity = __import__("adapter.memory", fromlist=["_identity"])._identity
+        calls = {"count": 0}
+        def changing_identity(info):
+            calls["count"] += 1
+            value = original_identity(info)
+            return (value[0], value[1] + 1, value[2], value[3]) if calls["count"] == 3 else value
+        with patch("adapter.memory._identity", side_effect=changing_identity):
+            with self.assertRaises(ProtocolError) as caught:
+                self.store.remember(kind="learning", summary="identity", repository=self.repo,
+                    evidence=[{"type":"path", "ref":"identity.txt", "digest_domain":"raw_file", "digest":digest}])
+        self.assertEqual(caught.exception.code, "PATH_ESCAPE")
+
+    def test_repeated_transitions_are_idempotent_or_conflicts(self):
+        record = self.store.remember(kind="learning", summary="transition", repository=self.repo)
+        retired = self.store.retire(record["id"])
+        self.assertEqual(self.store.retire(record["id"]), retired)
+        with self.assertRaises(ProtocolError):
+            self.store.supersede(record["id"], summary="different")
+        replacement_source = self.store.remember(kind="learning", summary="replace", repository=self.repo)
+        replacement = self.store.supersede(replacement_source["id"], summary="new")
+        self.assertEqual(self.store.supersede(replacement_source["id"], summary="new"), replacement)
+        with self.assertRaises(ProtocolError):
+            self.store.supersede(replacement_source["id"], summary="other")
+
+    def test_oversized_collections_are_refused(self):
+        with self.assertRaises(ProtocolError):
+            self.store.remember(kind="learning", summary="evidence", repository=self.repo,
+                evidence=[{"type":"external", "ref":"x" * 512, "digest_domain":"raw_file",
+                           "digest":"sha256:" + "a" * 64}] * 32)
+        with self.assertRaises(ProtocolError):
+            self.store.remember(kind="learning", summary="tags", repository=self.repo,
+                                tags=["t" * 80] * 32)
+        with self.assertRaises(ProtocolError):
+            self.store.remember(kind="learning", summary="relations", repository=self.repo,
+                                related_ids=["r" * 128] * 32)
+
     def test_portable_paths_and_validate(self):
         record = self.store.remember(kind="preference", summary="portable", repository=self.repo,
                                      paths=["a/b.txt"])
