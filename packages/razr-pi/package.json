@@ -5,5 +5,5 @@
   "description": "Public source bootstrap for explicit safe adoption and discovery; not delivery automation",
   "keywords": ["pi-package"],
   "pi": { "skills": ["./skills"] },
-  "files": ["skills", "runtime", "scripts", "README.md"]
+  "files": ["skills", "runtime", "scripts", "adapter", "README.md"]
 }

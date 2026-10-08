@@ -34,7 +34,7 @@ const manifest = JSON.parse(readFileSync(join(pkg, 'package.json'), 'utf8'));
 assert.deepEqual(manifest.pi, { skills: ['./skills'] });
 assert.deepEqual(Object.keys(manifest).sort(), ['description','files','keywords','name','pi','private','version']);
 assert.equal(manifest.private, true);
-assert.deepEqual(manifest.files, ['skills','runtime','scripts','README.md']);
+assert.deepEqual(manifest.files, ['skills','runtime','scripts','adapter','README.md']);
 const skillStat = lstatSync(join(pkg, 'skills/razr/SKILL.md'));
 assert.ok(skillStat.isFile() && !skillStat.isSymbolicLink(), 'missing/linked declared skill');
 const installed = JSON.parse(readFileSync(join(piDir, 'package.json'), 'utf8'));

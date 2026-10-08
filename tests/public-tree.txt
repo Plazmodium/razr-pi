@@ -16,6 +16,8 @@ docs/capabilities.md
 docs/design/execution-provider.md
 docs/testing.md
 packages/razr-pi/README.md
+packages/razr-pi/adapter/core_subprocess.py
+packages/razr-pi/adapter/protocol.py
 packages/razr-pi/package.json
 packages/razr-pi/runtime/AGENTS.project-razr.md
 packages/razr-pi/runtime/provenance.json
@@ -39,6 +41,7 @@ tests/fixtures/public-contract/executable.yaml
 tests/fixtures/public-contract/spec.md
 tests/public-tree.txt
 tests/run_public.py
+tests/test_adapter_foundation.py
 tests/test_adoption.py
 tests/test_clean_package.py
 tests/test_contract_preflight.py
