@@ -138,10 +138,10 @@ class HerdrProviderTests(unittest.TestCase):
             open_calls = []; list_calls = [0]
             def run(argv, **kwargs):
                 if argv[:3] == ["herdr", "agent", "start"]:
-                    result = {"agent_id": "agent-1", "workspace_id": "w", "tab_id": "t", "pane_id": "p", "pi_session_id": "pi-1"}
+                    result = {"agent": {"name": "worker-1", "agent": "agent-1", "agent_session": {"value": "pi-1"}, "workspace_id": "w", "tab_id": "t", "pane_id": "p", "telemetry": {"status": "ready"}}, "type": "agent_started"}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "start", "result": result}).encode(), b"")
                 if argv[:3] == ["herdr", "agent", "get"]:
-                    result = {"status": "SETTLED", "workspace_id": "w", "tab_id": "t", "pane_id": "p", "observed_at": "2026-01-01T00:00:00Z", "source": "herdr"}
+                    result = {"status": "SETTLED", "workspace_id": "w", "tab_id": "t", "pane_id": "p", "observed_at": "2026-01-01T00:00:00Z", "source": "herdr", "agent_session": {"value": "pi-1"}, "telemetry": {"live": True}}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "get", "result": result}).encode(), b"")
                 if argv[:3] == ["herdr", "worktree", "list"]:
                     list_calls[0] += 1
@@ -149,7 +149,7 @@ class HerdrProviderTests(unittest.TestCase):
                     result = {"source": {"repo_key": str(worktree / ".git"), "repo_name": "repo", "repo_root": str(worktree), "source_checkout_path": str(worktree), "source_workspace_id": "w"}, "type": "worktree_list", "worktrees": [{"branch": "feature/x", "is_bare": False, "is_detached": False, "is_linked_worktree": False, "is_prunable": False, "label": "worktree", "open_workspace_id": "w", "path": str(worktree)}]}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "list", "result": result}).encode(), b"")
                 if argv[:3] == ["herdr", "pane", "list"]:
-                    pane = {"agent_status": "unknown", "cwd": str(worktree), "focused": False, "foreground_cwd": str(worktree), "pane_id": "p", "revision": 0, "scroll": {"max_offset_from_bottom": 0, "offset_from_bottom": 0, "viewport_rows": 29}, "tab_id": "t", "terminal_id": "term", "workspace_id": "w"}
+                    pane = {"agent_status": "unknown", "cwd": str(worktree), "focused": False, "foreground_cwd": str(worktree), "pane_id": "p", "revision": 0, "scroll": {"max_offset_from_bottom": 0, "offset_from_bottom": 0, "viewport_rows": 29}, "tab_id": "t", "terminal_id": "term", "workspace_id": "w", "workspace_telemetry": {"layout": "grid"}}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "panes", "result": {"panes": [pane], "type": "pane_list"}}).encode(), b"")
                 if argv[:3] == ["herdr", "worktree", "open"]:
                     if "--help" not in argv: open_calls.append(argv)

@@ -446,7 +446,7 @@ class HerdrProvider:
         response = _envelope(self._exec([self.herdr, "worktree", "open", "--path", str(root), "--no-focus"], timeout_ms=120_000), "worktree")
         return {**response, "result": self._parse_worktree_response(response, root)}
 
-    def _resolve_existing_worktree(self, path: Path) -> dict[str, str] | None:
+    def _resolve_existing_worktree(self, path: Path, expected_host: Mapping[str, object] | None = None) -> dict[str, str] | None:
         response = _envelope(self._exec([self.herdr, "worktree", "list", "--cwd", str(path)], timeout_ms=_CLI_TIMEOUT_MS), "worktree list")
         result = _closed(response["result"], {"source", "type", "worktrees"}, "worktree list result")
         _closed(result["source"], {"repo_key", "repo_name", "repo_root", "source_checkout_path", "source_workspace_id"}, "worktree list source")
@@ -468,19 +468,25 @@ class HerdrProvider:
         panes_result = _closed(panes_response["result"], {"panes", "type"}, "pane list result")
         if panes_result["type"] != "pane_list" or not isinstance(panes_result["panes"], list): raise _fail("HERDR_IDENTITY_INCOMPLETE", "pane list is malformed")
         roots = []
-        for pane in panes_result["panes"]:
-            pane = _closed(pane, {"agent_status", "cwd", "focused", "foreground_cwd", "pane_id", "revision", "scroll", "tab_id", "terminal_id", "workspace_id"}, "listed pane")
-            _closed(pane["scroll"], {"max_offset_from_bottom", "offset_from_bottom", "viewport_rows"}, "pane scroll")
+        for raw_pane in panes_result["panes"]:
+            if not isinstance(raw_pane, dict): continue
+            if not all(field in raw_pane for field in ("pane_id", "workspace_id", "tab_id", "cwd")): continue
+            pane = raw_pane
             for field in ("workspace_id", "tab_id", "pane_id"): _id(pane[field], field)
-            if pane["workspace_id"] != workspace_id: raise _fail("IDENTITY_MISMATCH", "listed pane workspace differs")
+            if not isinstance(pane["cwd"], str): raise _fail("HERDR_IDENTITY_INCOMPLETE", "listed pane cwd is malformed")
+            if pane["workspace_id"] != workspace_id: continue
+            if expected_host is not None and pane["pane_id"] != expected_host["pane_id"]: continue
             if _canonical_dir(pane["cwd"], "listed pane cwd") == path: roots.append(pane)
-        if len(roots) != 1: raise _fail("IDENTITY_MISMATCH", "open worktree root pane is ambiguous")
-        return {"workspace_id": workspace_id, "tab_id": roots[0]["tab_id"], "pane_id": roots[0]["pane_id"]}
+        if expected_host is not None:
+            if len(roots) != 1 or roots[0]["workspace_id"] != expected_host["workspace_id"] or roots[0]["tab_id"] != expected_host["tab_id"]:
+                raise _fail("IDENTITY_MISMATCH", "expected root pane identity is not present")
+        elif len(roots) != 1: raise _fail("IDENTITY_MISMATCH", "open worktree root pane is ambiguous")
+        return {"workspace_id": roots[0]["workspace_id"], "tab_id": roots[0]["tab_id"], "pane_id": roots[0]["pane_id"]}
 
     def _verify_candidate(self, request: ProviderRequest) -> None:
         value = request.value
         root = _canonical_dir(value["worktree"], "worktree")
-        existing = self._resolve_existing_worktree(root)
+        existing = self._resolve_existing_worktree(root, value["host"])
         opened = {**existing, "path": str(root)} if existing is not None else self.worktree_open(path=str(root))["result"]
         if any(opened[key] != value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")):
             raise _fail("IDENTITY_MISMATCH", "dedicated worktree workspace differs from request host")
@@ -569,8 +575,28 @@ class HerdrProvider:
             raise
         try:
             envelope = _envelope(response, "agent start"); result = envelope["result"]
-            if not isinstance(result, dict) or set(result) != {"agent_id", "workspace_id", "tab_id", "pane_id", "pi_session_id"}: raise _fail("HERDR_IDENTITY_INCOMPLETE", "agent response is not closed")
-            for key in ("agent_id", "workspace_id", "tab_id", "pane_id", "pi_session_id"): _id(result[key], key)
+            if not isinstance(result, dict) or not isinstance(result.get("agent"), dict): raise _fail("HERDR_IDENTITY_INCOMPLETE", "agent response lacks nested agent identity")
+            agent = result["agent"]
+            if "name" in agent:
+                if not isinstance(agent["name"], str) or agent["name"] != value["worker_id"]: raise _fail("IDENTITY_MISMATCH", "agent name differs")
+            elif "agent" not in agent or not isinstance(agent["agent"], str) or agent["agent"] != value["worker_id"]:
+                raise _fail("IDENTITY_MISMATCH", "agent name is missing")
+            for key in ("workspace_id", "tab_id", "pane_id"):
+                if not isinstance(agent.get(key), str) or agent[key] != value["host"][key]: raise _fail("IDENTITY_MISMATCH", "agent host identity differs")
+            agent_id = agent.get("agent_id", agent.get("agent", value["worker_id"]))
+            _id(agent_id, "agent_id")
+            session_value = agent.get("agent_session", result.get("agent_session"))
+            if isinstance(session_value, dict): session_value = session_value.get("value")
+            if session_value is None:
+                for _ in range(3):
+                    observed = _envelope(self._exec([self.herdr, "agent", "get", agent_id], timeout_ms=_CLI_TIMEOUT_MS), "agent get")["result"]
+                    if isinstance(observed, dict):
+                        observed_agent = observed.get("agent") if isinstance(observed.get("agent"), dict) else observed
+                        candidate_session = observed_agent.get("agent_session") if isinstance(observed_agent, dict) else None
+                        if isinstance(candidate_session, dict): candidate_session = candidate_session.get("value")
+                        if candidate_session is not None: session_value = candidate_session; break
+            _id(session_value, "pi_session_id")
+            result = {"agent_id": agent_id, "workspace_id": agent["workspace_id"], "tab_id": agent["tab_id"], "pane_id": agent["pane_id"], "pi_session_id": session_value}
             if any(result[key] != value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")): raise _fail("IDENTITY_MISMATCH", "agent host identity differs")
             pane = _envelope(self._exec([self.herdr, "pane", "get", value["host"]["pane_id"]], timeout_ms=10_000), "pane")
             pane_result = pane["result"]
@@ -719,7 +745,10 @@ class HerdrProvider:
         return _envelope(self._exec([self.herdr, "agent", "prompt", target, text, "--wait", "--timeout", str(timeout_ms)], timeout_ms=timeout_ms), "prompt")
 
     def _inspect_handle(self, handle: Mapping[str, object]) -> object:
-        value = self._handle(handle); response = _envelope(self._exec([self.herdr, "agent", "get", value["handle_id"]], timeout_ms=10_000), "inspect"); result = _closed(response["result"], {"status", "workspace_id", "tab_id", "pane_id", "observed_at", "source"}, "status")
+        value = self._handle(handle); response = _envelope(self._exec([self.herdr, "agent", "get", value["handle_id"]], timeout_ms=10_000), "inspect"); result = response["result"]
+        if not isinstance(result, dict) or not all(key in result for key in ("status", "workspace_id", "tab_id", "pane_id", "observed_at", "source")):  raise _fail("ARTIFACT_UNAVAILABLE", "invalid Herdr status")
+        for key in ("workspace_id", "tab_id", "pane_id", "source", "status"):
+            if not isinstance(result[key], str): raise _fail("ARTIFACT_UNAVAILABLE", "invalid Herdr status")
         if result["status"] not in _STATUSES or result["source"] != "herdr": raise _fail("ARTIFACT_UNAVAILABLE", "invalid Herdr status")
         _timestamp(result["observed_at"], "observed_at")
         if any(result[key] != value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")): raise _fail("IDENTITY_MISMATCH", "status host differs")
