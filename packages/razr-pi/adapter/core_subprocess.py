@@ -355,6 +355,18 @@ def _environment() -> dict[str, str]:
     return env
 
 
+def _child_request_id(parent: str, suffix: str) -> str:
+    if not isinstance(parent, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", parent):
+        raise _fail("INVALID_REQUEST", "invalid parent request ID")
+    value = parent[:128 - len(suffix) - 1] + "-" + suffix
+    return value
+
+
+def _require_response_id(response: CoreResponse, expected: str) -> None:
+    if response.request_id != expected:
+        raise _fail("IDENTITY_MISMATCH", "core response correlation differs")
+
+
 def _nullable_string(value: object) -> str | None:
     if value is not None and not isinstance(value, str):
         raise _fail("READBACK_FAILED", "nullable string field is malformed")
@@ -362,7 +374,7 @@ def _nullable_string(value: object) -> str | None:
 
 
 def _workflow_projection(status_row: object, state: object, work_id: str, node_id: str,
-                         raw: ReadbackResult, response: CoreResponse, root: Path) -> WorkflowRead:
+                         raw: ReadbackResult, response: CoreResponse, root: Path, correlation_id: str) -> WorkflowRead:
     row_fields = {"id", "stage", "status", "depth", "priority", "approved_at", "candidate", "pull_request"}
     if not isinstance(status_row, dict) or set(status_row) != row_fields:
         raise _fail("READBACK_FAILED", "status row fields differ")
@@ -372,6 +384,11 @@ def _workflow_projection(status_row: object, state: object, work_id: str, node_i
         raise _fail("READBACK_FAILED", "status row domain differs")
     _nullable_string(status_row["approved_at"])
     _nullable_string(status_row["candidate"])
+    if status_row["candidate"] is not None:
+        try:
+            validate_git_object_id(status_row["candidate"])
+        except ProtocolError as exc:
+            raise _fail("READBACK_FAILED", "core status candidate identity is malformed") from exc
     _nullable_string(status_row["pull_request"])
     if not isinstance(state, dict):
         raise _fail("READBACK_FAILED", "state is not an object")
@@ -391,10 +408,13 @@ def _workflow_projection(status_row: object, state: object, work_id: str, node_i
     values = {key: candidate[key] for key in candidate}
     for key in ("repository", "branch", "commit", "source_digest"):
         _nullable_string(values[key])
-    if values["commit"] is not None:
-        validate_git_object_id(values["commit"])
-    if values["source_digest"] is not None:
-        validate_source_digest(values["source_digest"])
+    try:
+        if values["commit"] is not None:
+            validate_git_object_id(values["commit"])
+        if values["source_digest"] is not None:
+            validate_source_digest(values["source_digest"])
+    except ProtocolError as exc:
+        raise _fail("READBACK_FAILED", "core candidate identity is malformed") from exc
     if status_row["candidate"] != values["commit"]:
         raise _fail("READBACK_FAILED", "status candidate differs")
     delivery = state["delivery"]
@@ -407,7 +427,7 @@ def _workflow_projection(status_row: object, state: object, work_id: str, node_i
     if node["status"] not in {"pending", "waiting", "running", "blocked", "complete", "failed"} or not isinstance(node["attempt"], int) or isinstance(node["attempt"], bool) or node["attempt"] < 0:
         raise _fail("READBACK_FAILED", "state node domain differs")
     result_ref = _nullable_string(node["result_ref"])
-    return WorkflowRead(work_id, state["stage"], state["status"], state["generation"], node_id,
+    return WorkflowRead(correlation_id, work_id, state["stage"], state["status"], state["generation"], node_id,
                         node["status"], node["attempt"], result_ref, values["repository"], values["branch"],
                         values["commit"], values["source_digest"], status_row, raw.path, raw.digest,
                         raw.bytes, root, response.core_identity, response.source_digest, response.provenance)
@@ -418,16 +438,21 @@ def read_workflow(request: CoreRequest, work_id: str, node_id: str) -> WorkflowR
     import dataclasses
     if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", work_id) or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", node_id):
         raise _fail("INVALID_REQUEST", "invalid core work or node ID")
-    status_request = dataclasses.replace(request, argv=("status", work_id, "--json"), expected_readback=())
+    status_id = _child_request_id(request.request_id, "status")
+    validate_id = _child_request_id(request.request_id, "validate")
+    state_id = _child_request_id(request.request_id, "state")
+    status_request = dataclasses.replace(request, request_id=status_id, argv=("status", work_id, "--json"), expected_readback=())
     status_response = invoke_core(status_request)
+    _require_response_id(status_response, status_id)
     try:
         rows = json.loads(status_response.stdout.decode("utf-8"), object_pairs_hook=_json_object)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise _fail("MALFORMED_RESPONSE", "status JSON is malformed") from exc
     if not isinstance(rows, list) or len(rows) != 1:
         raise _fail("READBACK_FAILED", "status row count differs")
-    validate_request = dataclasses.replace(request, argv=("validate", work_id), expected_readback=())
+    validate_request = dataclasses.replace(request, request_id=validate_id, argv=("validate", work_id), expected_readback=())
     validation = invoke_core(validate_request)
+    _require_response_id(validation, validate_id)
     try:
         lines = validation.stdout.decode("utf-8").splitlines()
     except UnicodeDecodeError as exc:
@@ -438,8 +463,9 @@ def read_workflow(request: CoreRequest, work_id: str, node_id: str) -> WorkflowR
     work_root = _core_work_root(root, request.expected_commit)
     state_path = f"{work_root}/{work_id}/state.yaml"
     state_specs = (ReadbackSpec(state_path, True, 1_048_576, "bytes"),)
-    state_request = dataclasses.replace(request, argv=("status", work_id, "--json"), expected_readback=state_specs)
+    state_request = dataclasses.replace(request, request_id=state_id, argv=("status", work_id, "--json"), expected_readback=state_specs)
     state_response = invoke_core(state_request)
+    _require_response_id(state_response, state_id)
     if len(state_response.readback) != 1 or state_response.readback[0].digest_domain != "raw_file":
         raise _fail("READBACK_FAILED", "state raw read-back missing")
     raw_state = state_response.readback[0]
@@ -447,7 +473,7 @@ def read_workflow(request: CoreRequest, work_id: str, node_id: str) -> WorkflowR
         state = json.loads(raw_state.raw_bytes.decode("utf-8"), object_pairs_hook=_json_object)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise _fail("MALFORMED_RESPONSE", "state JSON is malformed") from exc
-    return _workflow_projection(rows[0], state, work_id, node_id, raw_state, state_response, request.repository_root)
+    return _workflow_projection(rows[0], state, work_id, node_id, raw_state, state_response, request.repository_root, request.request_id)
 
 
 def invoke_core(request: CoreRequest) -> CoreResponse:

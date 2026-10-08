@@ -167,6 +167,7 @@ class CoreResponse:
 
 @dataclass(frozen=True, slots=True)
 class WorkflowRead:
+    request_id: str
     work_id: str
     stage: str
     status: str

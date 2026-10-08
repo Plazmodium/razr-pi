@@ -141,13 +141,13 @@ class AdapterFoundationTests(unittest.TestCase):
                "priority": 4, "approved_at": None, "candidate": None, "pull_request": None}
         raw = ReadbackResult(".razr/work/work/state.yaml", "raw_file", "sha256:" + "a" * 64, 12, None, b"raw-state!!")
         response = CoreResponse("r", 0, b"", b"", 1, "sha256:" + "b" * 64, (), "sha256:" + "c" * 64, (raw,))
-        projected = _workflow_projection(row, state, "work", "node", raw, response, ROOT)
+        projected = _workflow_projection(row, state, "work", "node", raw, response, ROOT, "r")
         self.assertEqual(projected.raw_state_digest, raw.digest)
         self.assertEqual(projected.raw_state_bytes, 12)
         self.assertEqual(projected.raw_state_root, ROOT)
         row.pop("candidate")
         with self.assertRaises(ProtocolError):
-            _workflow_projection(row, state, "work", "node", raw, response, ROOT)
+            _workflow_projection(row, state, "work", "node", raw, response, ROOT, "r")
 
     def test_status_validate_raw_projection_uses_internal_state_path(self):
         state = {"schema_version": 1, "id": "work", "stage": "build", "status": "active",
@@ -158,10 +158,10 @@ class AdapterFoundationTests(unittest.TestCase):
                  "commit": None, "source_digest": None}, "critics": {},
                  "delivery": {"pull_request": None}, "last_transition": {}}
         state_bytes = (json.dumps(state, separators=(",", ":")) + "\n").encode()
-        status = CoreResponse("r", 0, b'[{"id":"work","stage":"build","status":"active","depth":"tiny","priority":4,"approved_at":null,"candidate":null,"pull_request":null}]', b"", 1, "sha256:" + "b" * 64, (), "sha256:" + "c" * 64, ())
-        validation = CoreResponse("r", 0, b"PASS work\n", b"", 1, status.core_identity, (), status.source_digest, ())
+        status = CoreResponse("r-status", 0, b'[{"id":"work","stage":"build","status":"active","depth":"tiny","priority":4,"approved_at":null,"candidate":null,"pull_request":null}]', b"", 1, "sha256:" + "b" * 64, (), "sha256:" + "c" * 64, ())
+        validation = CoreResponse("r-validate", 0, b"PASS work\n", b"", 1, status.core_identity, (), status.source_digest, ())
         raw = ReadbackResult(".razr/work/work/state.yaml", "raw_file", raw_file_digest(state_bytes), len(state_bytes), None, state_bytes)
-        state_response = CoreResponse("r", 0, b"", b"", 1, status.core_identity, (), status.source_digest, (raw,))
+        state_response = CoreResponse("r-state", 0, b"", b"", 1, status.core_identity, (), status.source_digest, (raw,))
         request = CoreRequest("r", ROOT, (), ROOT, ROOT / "packages/razr-pi", Path(__import__("sys").executable).resolve(),
                               ROOT / "packages/razr-pi/runtime/scripts/razr.py", "0" * 40, status.source_digest,
                               status.core_identity, (), (), 1, 1, 1, 1)
@@ -169,9 +169,14 @@ class AdapterFoundationTests(unittest.TestCase):
                 "adapter.core_subprocess.invoke_core", side_effect=[status, validation, state_response]) as called:
             result = __import__("adapter.core_subprocess", fromlist=["read_workflow"]).read_workflow(request, "work", "node")
         self.assertEqual(called.call_count, 3)
+        self.assertEqual([call.args[0].request_id for call in called.call_args_list], ["r-status", "r-validate", "r-state"])
         self.assertEqual(called.call_args_list[2].args[0].expected_readback[0].path, ".razr/work/work/state.yaml")
         self.assertEqual(result.raw_state_digest, raw.digest)
         self.assertEqual(result.raw_state_bytes, len(state_bytes))
+        with patch("adapter.core_subprocess.invoke_core", return_value=dataclasses.replace(status, request_id="wrong")):
+            with self.assertRaises(ProtocolError) as caught:
+                __import__("adapter.core_subprocess", fromlist=["read_workflow"]).read_workflow(request, "work", "node")
+            self.assertEqual(caught.exception.code, "IDENTITY_MISMATCH")
         with patch("adapter.core_subprocess.invoke_core") as never:
             with self.assertRaises(ProtocolError):
                 __import__("adapter.core_subprocess", fromlist=["read_workflow"]).read_workflow(request, "../bad", "node")
