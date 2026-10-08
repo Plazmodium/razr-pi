@@ -788,7 +788,26 @@ class HerdrProvider:
                 except OSError: canonical = None
                 if canonical is not None and path == canonical and canonical.is_relative_to(session_root) and canonical.is_file() and not canonical.is_symlink() and stat.st_nlink == 1: candidate_path = canonical; break
             if attempt < 2: time.sleep(0.05)
-        if candidate_path is None: return False
+        if candidate_path is None:
+            dirfd = os.open(session_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                names = os.listdir(dirfd); candidates = []
+                known = {".razr-herdr-root.json", "agent-status-" + value["attempt_id"] + ".json", "interrupt-" + value["attempt_id"] + ".json", "collect-failure-" + value["attempt_id"] + ".json"}
+                for name in names:
+                    if name in known: continue
+                    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+                    try:
+                        file_stat = os.fstat(fd)
+                        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*\.jsonl", name): os.close(fd); return False
+                        with os.fdopen(fd, "rb") as stream: content = stream.read(1_048_577)
+                        if not content or len(content) > 1_048_576 or not content.endswith(b"\\n"): return False
+                        for line in content.splitlines():
+                            if not line.strip() or not isinstance(json.loads(line), dict): return False
+                        candidates.append(session_root / name)
+                    except (OSError, UnicodeDecodeError, UnicodeError, json.JSONDecodeError, TypeError): return False
+                if len(candidates) != 1: return False
+                candidate_path = candidates[0]
+            finally: os.close(dirfd)
         opaque = "pi-session-" + hashlib.sha256(str(candidate_path).encode("utf-8")).hexdigest()
         record = {"schema_version": 1, "kind": "pi_session", "handle_id": value["handle_id"], "attempt_id": value["attempt_id"], "request_digest": value["request_digest"], "host": value["host"], "pi_session_path": str(candidate_path), "pi_session_id": opaque}
         record["record_digest"] = raw_file_digest(canonical_json(record))
@@ -1108,7 +1127,8 @@ class HerdrProvider:
             response_refs = [{"ref": "private/attempt-" + value["attempt_id"] + "/output/" + output_artifact.name, "kind": "stdout", "digest_domain": "raw_file", "digest": raw_file_digest(data), "bytes": len(data)}, {"ref": "private/attempt-" + value["attempt_id"] + "/session/" + status_artifact.name, "kind": "session", "digest_domain": "raw_file", "digest": raw_file_digest(status_bytes), "bytes": len(status_bytes)}]
             ledger_refs = [self._public_evidence(value["attempt_id"], "collect-" + ref["kind"], {"kind": ref["kind"], "private_ref": ref["ref"], "private_digest": ref["digest"], "bytes": ref["bytes"]}) for ref in response_refs]
             self._settle(value, "UNKNOWN", reason="Herdr status/read observed; termination UNKNOWN", evidence_refs=ledger_refs)
-            return {"schema_version": 1, "ok": True, "request_id": "collect", "result": {"attempt_id": value["attempt_id"], "termination": "UNKNOWN", "runtime_identity": _MODEL + ":medium", "host": value["host"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"], "artifact_refs": response_refs, "cleanup": "not_applicable"}}
+            public_refs = [{key: ref[key] for key in ("kind", "digest_domain", "digest", "bytes")} for ref in response_refs]
+            return {"schema_version": 1, "ok": True, "request_id": "collect", "result": {"attempt_id": value["attempt_id"], "termination": "UNKNOWN", "runtime_identity": _MODEL + ":medium", "host": value["host"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"], "artifact_refs": public_refs, "cleanup": "not_applicable"}}
         except OSError as exc:
             failure_data = canonical_json({"schema_version": 1, "kind": "collect_failure", "attempt_id": value["attempt_id"], "error": str(exc)[:500]})
             failure_path = self._attempt_sessions[value["attempt_id"]] / ("collect-failure-" + value["attempt_id"] + ".json")
