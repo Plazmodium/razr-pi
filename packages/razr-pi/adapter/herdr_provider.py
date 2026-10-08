@@ -273,6 +273,31 @@ class AttemptLedger:
             previous = row["record_digest"]
         return records
 
+    def _verify_settlement_evidence(self, event: Mapping[str, object], root: Path | None = None) -> None:
+        if root is None:
+            try: root = self.path.parent.parent.resolve(strict=True)
+            except OSError as exc: raise _fail("LEDGER_CORRUPT", "attempt worktree is unavailable") from exc
+        for ref in event["evidence_refs"]:
+            relative = PurePosixPath(ref["ref"])
+            if len(relative.parts) < 3 or relative.parts[:2] != (".razr", "evidence"):
+                raise _fail("LEDGER_CORRUPT", "settlement evidence escapes attempt boundary")
+            path = root.joinpath(*relative.parts)
+            cursor = root
+            try:
+                for part in relative.parts:
+                    cursor = cursor / part
+                    if cursor.is_symlink(): raise _fail("LEDGER_CORRUPT", "settlement evidence contains a symlink")
+                info = path.stat()
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1: raise _fail("LEDGER_CORRUPT", "settlement evidence is not a private regular file")
+                data = path.read_bytes()
+            except ProtocolError: raise
+            except OSError as exc: raise _fail("LEDGER_CORRUPT", "settlement evidence is unavailable") from exc
+            actual = raw_file_digest(data)
+            if ref["digest_domain"] == "canonical_json":
+                try: actual = raw_file_digest(canonical_json(json.loads(data.decode("utf-8"))))
+                except (UnicodeDecodeError, json.JSONDecodeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "settlement canonical evidence is malformed") from exc
+            if actual != ref["digest"]: raise _fail("LEDGER_CORRUPT", "settlement evidence digest differs")
+
     def append(self, event: Mapping[str, object]) -> dict[str, object]:
         import copy
         event = copy.deepcopy(dict(event))
@@ -281,9 +306,29 @@ class AttemptLedger:
         event.pop("prev_digest", None); event.pop("record_digest", None)
         try: self.path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc: raise _fail("LOCK_UNAVAILABLE", "attempt ledger cannot create its parent") from exc
-        try: stream = self.path.open("a+", encoding="utf-8")
-        except OSError as exc: raise _fail("LOCK_UNAVAILABLE", "attempt ledger cannot be opened") from exc
-        locked = False; original_length = 0
+        try:
+            parent = self.path.parent.resolve(strict=True)
+            if not parent.is_dir(): raise _fail("LOCK_UNAVAILABLE", "attempt ledger parent is not a directory")
+            basename = self.path.name
+            if not basename or basename in {".", ".."} or "/" in basename or "\\" in basename: raise _fail("LOCK_UNAVAILABLE", "attempt ledger basename is unsafe")
+            dirfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            fd = os.open(basename, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=dirfd)
+            file_stat = os.fstat(fd)
+            if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1: raise _fail("LOCK_UNAVAILABLE", "attempt ledger is not a private regular file")
+            stream = os.fdopen(fd, "a+", encoding="utf-8")
+        except ProtocolError:
+            try: os.close(fd)
+            except (NameError, OSError): pass
+            try: os.close(dirfd)
+            except (NameError, OSError): pass
+            raise
+        except OSError as exc:
+            try: os.close(fd)
+            except (NameError, OSError): pass
+            try: os.close(dirfd)
+            except (NameError, OSError): pass
+            raise _fail("LOCK_UNAVAILABLE", "attempt ledger cannot be opened") from exc
+        locked = False; committed = False; original_length = 0
         try:
             try: fcntl.flock(stream.fileno(), fcntl.LOCK_EX); locked = True
             except OSError as exc: raise _fail("LOCK_UNAVAILABLE", "attempt ledger cannot be locked") from exc
@@ -308,11 +353,11 @@ class AttemptLedger:
                 raise _fail("INVALID_ORDER", "SETTLED requires one prior STARTED")
             if event["event"] == "SETTLED":
                 started = same[0]
-                for key in ("work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "branch", "worktree_ref", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest"):
+                for key in ("work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "branch", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest"):
                     if event.get(key) != started.get(key): raise _fail("IDENTITY_MISMATCH", f"settlement {key} differs")
                 if event.get("herdr") != started.get("herdr"): raise _fail("IDENTITY_MISMATCH", "settlement Herdr identity differs")
             try:
-                stream.seek(0, 2); stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"); stream.flush(); os.fsync(stream.fileno())
+                stream.seek(0, 2); stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"); stream.flush(); os.fsync(stream.fileno()); committed = True
             except OSError as exc:
                 try:
                     stream.seek(original_length); stream.truncate(); stream.flush(); os.fsync(stream.fileno())
@@ -327,7 +372,10 @@ class AttemptLedger:
             try: stream.close()
             except OSError as exc:
                 if unlock_error is None: unlock_error = exc
-            if unlock_error is not None: raise _fail("LOCK_UNAVAILABLE", "attempt ledger lock could not be released") from unlock_error
+            try: os.close(dirfd)
+            except OSError as exc:
+                if unlock_error is None: unlock_error = exc
+            if unlock_error is not None and not committed: raise _fail("LOCK_UNAVAILABLE", "attempt ledger lock could not be released") from unlock_error
         return event
 
 
@@ -634,12 +682,14 @@ class HerdrProvider:
             packet_path = evidence / ("attempt-" + values["attempt_id"] + ".json")
             candidate_bytes = canonical_json(values["candidate"])
             packet_bytes = canonical_json(packet)
-            for path, data in ((candidate_path, candidate_bytes), (packet_path, packet_bytes)):
+            boundary_path = evidence / ("launch-boundary-" + values["attempt_id"] + ".json")
+            boundary_bytes = canonical_json({"schema_version": 1, "kind": "launch_boundary", "attempt_id": values["attempt_id"], "request_digest": packet["request_digest"]})
+            for path, data in ((candidate_path, candidate_bytes), (packet_path, packet_bytes), (boundary_path, boundary_bytes)):
                 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 with os.fdopen(fd, "wb") as stream: stream.write(data); stream.flush(); os.fsync(stream.fileno())
         except FileExistsError as exc: raise _fail("RESOURCE_REUSED", "attempt evidence already exists") from exc
         return {"candidate": {"ref": str(candidate_path.relative_to(_canonical_dir(values["worktree"], "worktree"))), "digest_domain": "canonical_json", "digest": raw_file_digest(candidate_bytes)},
-                "packet": {"ref": str(packet_path.relative_to(_canonical_dir(values["worktree"], "worktree"))), "digest_domain": "canonical_json", "digest": raw_file_digest(packet_bytes)}, "request_digest": packet["request_digest"], "capability_report_digest": capability_report_digest}
+                "packet": {"ref": str(packet_path.relative_to(_canonical_dir(values["worktree"], "worktree"))), "digest_domain": "canonical_json", "digest": raw_file_digest(packet_bytes)}, "launch_boundary": {"ref": str(boundary_path.relative_to(_canonical_dir(values["worktree"], "worktree"))), "digest_domain": "raw_file", "digest": raw_file_digest(boundary_bytes)}, "request_digest": packet["request_digest"], "capability_report_digest": capability_report_digest}
 
     def _release_unlaunched_claims(self, value: Mapping[str, object]) -> None:
         for root_key, id_key in (("output_root", "output_root_id"), ("session_root", "session_root_id")):
@@ -677,11 +727,16 @@ class HerdrProvider:
             response = self._exec([self.herdr, "agent", "start", value["worker_id"], "--kind", "pi", "--pane", value["host"]["pane_id"], "--timeout", str(min(deadline, 300_000)), "--", "--model", _MODEL, "--thinking", "medium", "--session-dir", value["session_root"], "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve"], timeout_ms=min(deadline, 300_000), cwd=_canonical_dir(value["cwd"], "cwd"), max_output=value["limits"]["max_output_bytes"])
         except ProtocolError as exc:
             failure = _canonical_dir(value["worktree"], "worktree") / ".razr" / "evidence" / ("launch-failure-" + value["attempt_id"] + ".json")
-            data = canonical_json({"error_code": exc.code, "message": str(exc)[:500]})
-            fd = os.open(failure, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "wb") as stream: stream.write(data); stream.write(b"\n"); stream.flush(); os.fsync(stream.fileno())
+            data = canonical_json({"error_code": exc.code, "message": str(exc)[:500]}) + b"\n"
+            try:
+                fd = os.open(failure, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "wb") as stream: stream.write(data); stream.flush(); os.fsync(stream.fileno())
+                failure_ref = {"ref": str(failure.relative_to(_canonical_dir(value["worktree"], "worktree"))), "digest_domain": "raw_file", "digest": raw_file_digest(data), "kind": "launch_failure", "error_code": exc.code}
+            except OSError:
+                failure_ref = dict(evidence["launch_boundary"]); failure_ref.update({"kind": "launch_failure", "error_code": "LAUNCH_FAILED"})
             settled = {key: started[key] for key in ("schema_version", "attempt_id", "work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "worktree_ref", "branch", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest", "herdr")}
-            settled.update({"event": "SETTLED", "settled_at": _now(), "outcome": "UNKNOWN" if exc.code == "TIMEOUT" else "FAILED", "evidence_refs": [{"ref": str(failure.relative_to(_canonical_dir(value["worktree"], "worktree"))), "digest_domain": "raw_file", "digest": raw_file_digest(data + b"\n"), "kind": "launch_failure", "error_code": exc.code}], "prev_digest": started["record_digest"], "cleanup": "not_applicable"})
+            settled.update({"event": "SETTLED", "settled_at": _now(), "outcome": "UNKNOWN" if exc.code == "TIMEOUT" else "FAILED", "evidence_refs": [failure_ref], "prev_digest": started["record_digest"], "cleanup": "not_applicable"})
+            self.ledger._verify_settlement_evidence(settled, _canonical_dir(value["worktree"], "worktree"))
             settled["record_digest"] = raw_file_digest(canonical_json(settled)); self.ledger.append(settled)
             raise
         try:
@@ -793,6 +848,7 @@ class HerdrProvider:
         settled = {key: started[key] for key in ("schema_version", "attempt_id", "work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "worktree_ref", "branch", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest", "herdr")}
         supplemental = [{"ref": str(artifact.relative_to(root)), "digest_domain": "raw_file", "digest": raw_file_digest(data), "kind": "result"}] if synthetic else []
         settled.update({"event": "SETTLED", "settled_at": _now(), "outcome": outcome, "evidence_refs": collected + supplemental, "prev_digest": started["record_digest"], "cleanup": cleanup})
+        self.ledger._verify_settlement_evidence(settled, root)
         settled["record_digest"] = raw_file_digest(canonical_json(settled)); self.ledger.append(settled); self._settled.add(handle["attempt_id"])
 
     def _bind_session_if_available(self, value: Mapping[str, object]) -> bool:
