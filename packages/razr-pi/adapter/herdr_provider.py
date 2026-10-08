@@ -446,9 +446,38 @@ class HerdrProvider:
         response = _envelope(self._exec([self.herdr, "worktree", "open", "--path", str(root), "--no-focus"], timeout_ms=120_000), "worktree")
         return {**response, "result": self._parse_worktree_response(response, root)}
 
+    def _resolve_existing_worktree(self, path: Path) -> dict[str, str] | None:
+        response = _envelope(self._exec([self.herdr, "worktree", "list"], timeout_ms=_CLI_TIMEOUT_MS), "worktree list")
+        result = _closed(response["result"], {"source", "type", "worktrees"}, "worktree list result")
+        _closed(result["source"], {"repo_key", "repo_name", "repo_root", "source_checkout_path", "source_workspace_id"}, "worktree list source")
+        if result["type"] != "worktree_list" or not isinstance(result["worktrees"], list): raise _fail("HERDR_IDENTITY_INCOMPLETE", "worktree list is malformed")
+        matches = []
+        for item in result["worktrees"]:
+            item = _closed(item, {"branch", "is_bare", "is_detached", "is_linked_worktree", "is_prunable", "label", "open_workspace_id", "path"}, "worktree list entry")
+            if not {"is_bare", "is_detached", "is_linked_worktree", "is_prunable", "label", "path"} <= set(item): raise _fail("HERDR_IDENTITY_INCOMPLETE", "worktree list entry is incomplete")
+            listed_path = _canonical_dir(item["path"], "listed worktree path")
+            if listed_path == path: matches.append(item)
+        if len(matches) > 1: raise _fail("IDENTITY_MISMATCH", "duplicate worktree paths are listed")
+        if not matches or "open_workspace_id" not in matches[0]: return None
+        workspace_id = matches[0]["open_workspace_id"]; _id(workspace_id, "workspace_id")
+        panes_response = _envelope(self._exec([self.herdr, "pane", "list", "--workspace", workspace_id], timeout_ms=_CLI_TIMEOUT_MS), "pane list")
+        panes_result = _closed(panes_response["result"], {"panes", "type"}, "pane list result")
+        if panes_result["type"] != "pane_list" or not isinstance(panes_result["panes"], list): raise _fail("HERDR_IDENTITY_INCOMPLETE", "pane list is malformed")
+        roots = []
+        for pane in panes_result["panes"]:
+            pane = _closed(pane, {"agent_status", "cwd", "focused", "foreground_cwd", "pane_id", "revision", "scroll", "tab_id", "terminal_id", "workspace_id"}, "listed pane")
+            _closed(pane["scroll"], {"max_offset_from_bottom", "offset_from_bottom", "viewport_rows"}, "pane scroll")
+            for field in ("workspace_id", "tab_id", "pane_id"): _id(pane[field], field)
+            if pane["workspace_id"] != workspace_id: raise _fail("IDENTITY_MISMATCH", "listed pane workspace differs")
+            if _canonical_dir(pane["cwd"], "listed pane cwd") == path: roots.append(pane)
+        if len(roots) != 1: raise _fail("IDENTITY_MISMATCH", "open worktree root pane is ambiguous")
+        return {"workspace_id": workspace_id, "tab_id": roots[0]["tab_id"], "pane_id": roots[0]["pane_id"]}
+
     def _verify_candidate(self, request: ProviderRequest) -> None:
         value = request.value
-        opened = self.worktree_open(path=value["worktree"])["result"]
+        root = _canonical_dir(value["worktree"], "worktree")
+        existing = self._resolve_existing_worktree(root)
+        opened = {**existing, "path": str(root)} if existing is not None else self.worktree_open(path=str(root))["result"]
         if any(opened[key] != value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")):
             raise _fail("IDENTITY_MISMATCH", "dedicated worktree workspace differs from request host")
         root = _canonical_dir(value["worktree"], "worktree")

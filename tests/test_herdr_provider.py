@@ -120,6 +120,7 @@ class HerdrProviderTests(unittest.TestCase):
             tree = b"100644 blob " + b"0" * 40 + b"\tfile.txt\0"
             source_digest = "sha256:" + hashlib.sha256(tree).hexdigest()
             empty_digest = raw_file_digest(canonical_json([]))
+            open_calls = []; list_calls = [0]
             def run(argv, **kwargs):
                 if argv[:3] == ["herdr", "agent", "start"]:
                     result = {"agent_id": "agent-1", "workspace_id": "w", "tab_id": "t", "pane_id": "p", "pi_session_id": "pi-1"}
@@ -127,7 +128,16 @@ class HerdrProviderTests(unittest.TestCase):
                 if argv[:3] == ["herdr", "agent", "get"]:
                     result = {"status": "SETTLED", "workspace_id": "w", "tab_id": "t", "pane_id": "p", "observed_at": "2026-01-01T00:00:00Z", "source": "herdr"}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "get", "result": result}).encode(), b"")
+                if argv[:3] == ["herdr", "worktree", "list"]:
+                    list_calls[0] += 1
+                    if list_calls[0] > 1: return subprocess.CompletedProcess(argv, 0, b"[]", b"")
+                    result = {"source": {"repo_key": str(worktree / ".git"), "repo_name": "repo", "repo_root": str(worktree), "source_checkout_path": str(worktree), "source_workspace_id": "w"}, "type": "worktree_list", "worktrees": [{"branch": "feature/x", "is_bare": False, "is_detached": False, "is_linked_worktree": False, "is_prunable": False, "label": "worktree", "open_workspace_id": "w", "path": str(worktree)}]}
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "list", "result": result}).encode(), b"")
+                if argv[:3] == ["herdr", "pane", "list"]:
+                    pane = {"agent_status": "unknown", "cwd": str(worktree), "focused": False, "foreground_cwd": str(worktree), "pane_id": "p", "revision": 0, "scroll": {"max_offset_from_bottom": 0, "offset_from_bottom": 0, "viewport_rows": 29}, "tab_id": "t", "terminal_id": "term", "workspace_id": "w"}
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "panes", "result": {"panes": [pane], "type": "pane_list"}}).encode(), b"")
                 if argv[:3] == ["herdr", "worktree", "open"]:
+                    if "--help" not in argv: open_calls.append(argv)
                     result = {"root_pane": {"agent_status": "unknown", "cwd": str(worktree), "focused": False, "foreground_cwd": str(worktree), "pane_id": "p", "revision": 0, "scroll": {"max_offset_from_bottom": 0, "offset_from_bottom": 0, "viewport_rows": 29}, "tab_id": "t", "terminal_id": "term", "workspace_id": "w"}, "tab": {"agent_status": "unknown", "focused": False, "label": "1", "number": 1, "pane_count": 1, "tab_id": "t", "workspace_id": "w"}, "type": "worktree_opened", "workspace": {"active_tab_id": "t", "agent_status": "unknown", "focused": False, "label": "worktree", "number": 1, "pane_count": 1, "tab_count": 1, "workspace_id": "w", "worktree": {"checkout_path": str(worktree), "is_linked_worktree": False, "repo_key": str(worktree / ".git"), "repo_name": "repo", "repo_root": str(worktree)}}, "worktree": {"branch": "feature/x", "is_bare": False, "is_detached": False, "is_linked_worktree": False, "is_prunable": False, "label": "worktree", "open_workspace_id": "w", "path": str(worktree)}}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "open", "result": result}).encode(), b"")
                 if argv[:3] == ["herdr", "pane", "get"]:
@@ -156,6 +166,7 @@ class HerdrProviderTests(unittest.TestCase):
             ledger = AttemptLedger(base / "attempts.jsonl")
             provider = HerdrProvider(runner=run, ledger=ledger, private_root=private)
             response = provider.launch(request); handle = response["result"]["handle"]
+            self.assertEqual(open_calls, [])
             self.assertEqual(set(handle), {"provider_id", "handle_id", "request_digest", "attempt_id", "host", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest"})
             self.assertEqual(response["result"]["capability_report_digest"], provider.probe({"schema_version": 1, "request_id": "probe-after-launch", "required_capabilities": ["runtime_identity"], "runtime": request["runtime"]})["result"]["report_digest"])
             self.assertEqual(provider.inspect({"schema_version": 1, "request_id": "inspect-unique", "handle": handle})["request_id"], "inspect-unique")
