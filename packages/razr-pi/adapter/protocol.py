@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
+import math
 import re
 from typing import Literal, TypeAlias
 
@@ -70,10 +71,27 @@ def _reject_duplicate(keys: list[str]) -> dict[str, object]:
     raise ValueError("duplicate JSON object key")
 
 
+def _json_value(value: object) -> JsonValue:
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ProtocolError("INVALID_REQUEST", "non-finite JSON number")
+        return value
+    if isinstance(value, list):
+        return [_json_value(item) for item in value]
+    if isinstance(value, dict):
+        if not all(isinstance(key, str) for key in value):
+            raise ProtocolError("INVALID_REQUEST", "JSON object keys must be strings")
+        return {key: _json_value(item) for key, item in value.items()}
+    raise ProtocolError("INVALID_REQUEST", "value is not a JSON type")
+
+
 def canonical_json(value: JsonValue) -> bytes:
-    """Serialize canonical JSON, rejecting duplicate keys and non-finite numbers."""
+    """Serialize canonical JSON after recursively enforcing the JSON value model."""
     try:
-        return json.dumps(value, sort_keys=True, separators=(",", ":"),
+        checked = _json_value(value)
+        return json.dumps(checked, sort_keys=True, separators=(",", ":"),
                           ensure_ascii=False, allow_nan=False).encode("utf-8")
     except (TypeError, ValueError, UnicodeEncodeError) as exc:
         raise ProtocolError("INVALID_REQUEST", "value is not canonical JSON") from exc
@@ -113,6 +131,7 @@ class CoreRequest:
     package_root: Path
     python_executable: Path
     runtime_script: Path
+    expected_commit: str
     expected_source_digest: str
     expected_core_identity: str
     expected_provenance: tuple[ProvenancePin, ...]
@@ -143,3 +162,20 @@ class CoreResponse:
     provenance: tuple[ProvenancePin, ...]
     source_digest: str
     readback: tuple[ReadbackResult, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowRead:
+    work_id: str
+    stage: str
+    status: str
+    generation: int
+    node_id: str
+    node_status: str
+    node_attempt: int
+    node_result_ref: str | None
+    candidate_repository: str | None
+    candidate_branch: str | None
+    candidate_commit: str | None
+    candidate_source_digest: str | None
+    status_row: dict[str, object]

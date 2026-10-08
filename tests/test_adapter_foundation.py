@@ -44,15 +44,22 @@ class AdapterFoundationTests(unittest.TestCase):
             (fixture / "input.txt").write_text("fixture\n")
             subprocess.run(["git", "-C", str(fixture), "add", "input.txt"], check=True, env=env)
             subprocess.run(["git", "-C", str(fixture), "commit", "-q", "-m", "fixture"], check=True, env=env)
+            commit = subprocess.check_output(["git", "-C", str(fixture), "rev-parse", "HEAD"], env=env, text=True).strip()
             request = CoreRequest(
                 request_id="adapter-test", repository_root=fixture, cwd=fixture,
                 package_root=package, python_executable=Path(sys.executable).resolve(),
                 runtime_script=(package / "runtime/scripts/razr.py").resolve(), argv=("--help",),
-                expected_source_digest=_source_digest(fixture),
+                expected_commit=commit,
+                expected_source_digest=_source_digest(fixture, commit),
                 expected_core_identity=raw_file_digest((package / "runtime/provenance.json").read_bytes()),
                 expected_provenance=pins, expected_readback=(), timeout_ms=120_000,
                 termination_grace_ms=5_000, max_stdout_bytes=1_048_576, max_stderr_bytes=262_144)
-            response = invoke_core(request)
+            forbidden = {name: os.environ.pop(name) for name in list(os.environ)
+                         if name.startswith("GIT_") and name not in {"GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_OPTIONAL_LOCKS", "GIT_TERMINAL_PROMPT"}}
+            try:
+                response = invoke_core(request)
+            finally:
+                os.environ.update(forbidden)
             self.assertEqual(response.request_id, request.request_id)
             self.assertEqual(response.returncode, 0)
             self.assertEqual(response.source_digest, request.expected_source_digest)
@@ -64,11 +71,17 @@ class AdapterFoundationTests(unittest.TestCase):
             request_id="adapter-test", repository_root=ROOT, cwd=ROOT,
             package_root=package, python_executable=Path(sys.executable).resolve(),
             runtime_script=(package / "runtime/scripts/razr.py").resolve(), argv=("--help",),
+            expected_commit="0" * 40,
             expected_source_digest="sha256:" + "0" * 64,
             expected_core_identity="sha256:" + "0" * 64, expected_provenance=(), expected_readback=(),
             timeout_ms=1, termination_grace_ms=1, max_stdout_bytes=1, max_stderr_bytes=1)
-        with self.assertRaises(ProtocolError) as caught:
-            invoke_core(request)
+        forbidden = {name: os.environ.pop(name) for name in list(os.environ)
+                     if name.startswith("GIT_") and name not in {"GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_OPTIONAL_LOCKS", "GIT_TERMINAL_PROMPT"}}
+        try:
+            with self.assertRaises(ProtocolError) as caught:
+                invoke_core(request)
+        finally:
+            os.environ.update(forbidden)
         self.assertEqual(caught.exception.code, "PROVENANCE_MISMATCH")
 
 
