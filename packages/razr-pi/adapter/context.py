@@ -34,6 +34,25 @@ def _error(code: str, message: str, **details: object) -> ProtocolError:
     return ProtocolError(code, message, details=details)
 
 
+def _without_nulls(value: object) -> object:
+    if isinstance(value, dict):
+        return {key: _without_nulls(item) for key, item in value.items() if item is not None}
+    if isinstance(value, list):
+        if any(item is None for item in value):
+            raise _error("INTERNAL", "null is not permitted in context arrays")
+        return [_without_nulls(item) for item in value]
+    return value
+
+
+def _assert_no_nulls(value: object, path: str = "response") -> None:
+    if value is None:
+        raise _error("INTERNAL", "null is not permitted in context response", path=path)
+    if isinstance(value, dict):
+        for key, item in value.items(): _assert_no_nulls(item, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value): _assert_no_nulls(item, f"{path}[{index}]")
+
+
 def _ref(value: str) -> str:
     if not isinstance(value, str) or not value or "\\" in value:
         raise _error("PATH_ESCAPE", "repository-relative POSIX path required")
@@ -241,20 +260,20 @@ class ContextEngine:
             except OSError:
                 continue
             if len(entries) > _MAX_DIR_ENTRIES:
-                omitted.append({"ref": directory.relative_to(self.root).as_posix() or ".", "reason": "directory-entry-limit"})
+                omitted.append({"ref": directory.relative_to(self.root).as_posix() or ".", "reason": "limit"})
                 entries = entries[:_MAX_DIR_ENTRIES]
             for entry in entries:
                 visited_entries += 1
                 ref = Path(entry.path).relative_to(self.root).as_posix()
                 if entry.name in _PRIVATE_DIRS or entry.name in _PRIVATE_NAMES or entry.name.startswith(".env"):
-                    omitted.append({"ref": ref, "reason": "private"}); continue
+                    omitted.append({"ref": ref, "reason": "unsafe"}); continue
                 try: info = entry.stat(follow_symlinks=False)
                 except OSError:
                     omitted.append({"ref": ref, "reason": "unsafe"}); continue
                 mode = info.st_mode & 0o170000
                 if mode == 0o040000:
                     if depth >= _MAX_DEPTH or len(queue) >= _MAX_QUEUE:
-                        omitted.append({"ref": ref, "reason": "traversal-limit"})
+                        omitted.append({"ref": ref, "reason": "limit"})
                     elif len(queue) < _MAX_QUEUE:
                         queue.append((Path(entry.path), depth + 1))
                     continue
@@ -262,7 +281,7 @@ class ContextEngine:
                 discovered += 1
                 if ref not in seen: refs.append(ref); seen.add(ref)
         if queue or visited_dirs >= _MAX_VISITED_DIRS or visited_entries >= _MAX_VISITED_ENTRIES or discovered >= _MAX_DISCOVERED:
-            omitted.append({"ref": ".", "reason": "traversal-limit"})
+            omitted.append({"ref": ".", "reason": "limit"})
         def score(ref: str) -> tuple[int, str]:
             low, base = ref.lower(), Path(ref).name.lower(); rank = 0
             if any(token in low for token in objective): rank -= 30
@@ -287,11 +306,11 @@ class ContextEngine:
     def _workflow_value(read: WorkflowRead) -> dict[str, object]:
         candidate = {"repository": read.candidate_repository, "branch": read.candidate_branch,
                      "commit": read.candidate_commit, "source_digest": read.candidate_source_digest}
-        return {"work_id": read.work_id, "stage": read.stage, "status": read.status, "generation": read.generation,
+        return _without_nulls({"work_id": read.work_id, "stage": read.stage, "status": read.status, "generation": read.generation,
                 "node_id": read.node_id, "node_status": read.node_status, "node_attempt": read.node_attempt,
                 "node_result_ref": read.node_result_ref, "candidate": candidate, "status_row": read.status_row,
                 "raw_state_digest": read.raw_state_digest, "raw_state_bytes": read.raw_state_bytes,
-                "core_identity": read.raw_state_core_identity, "source_digest": read.raw_state_source_digest}
+                "core_identity": read.raw_state_core_identity, "source_digest": read.raw_state_source_digest})
 
     def _read_workflow(self, request: ContextRequest) -> WorkflowRead:
         if not request.work_id: raise _error("INVALID_REQUEST", "work_id is required for workflow context")
@@ -392,7 +411,9 @@ class ContextEngine:
             sources.append({"kind": source_kind, "ref": item["ref"], "digest_domain": item["digest_domain"], "digest": item["digest"], "reason": item["reason"]})
         packet = {"schema_version": 1, "request_id": parsed.request_id, "authoritative_sources": sources,
                   "items": items, "omitted": omitted, "stale_memory_ids": sorted(stale)}
+        _assert_no_nulls(packet)
         packet["packet_digest"] = raw_file_digest(canonical_json(packet))
+        _assert_no_nulls(packet)
         return packet
 
     def context(self, request: ContextRequest | Mapping[str, object]) -> dict[str, object]:

@@ -10,7 +10,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "packages/razr-pi"))
-from adapter.context import ContextEngine, ContextRequest  # noqa: E402
+from adapter.context import ContextEngine, ContextRequest, _without_nulls  # noqa: E402
 from adapter.memory import MemoryStore  # noqa: E402
 from adapter.protocol import ProtocolError, raw_file_digest  # noqa: E402
 from adapter.core_subprocess import _git_head, _source_digest  # noqa: E402
@@ -50,7 +50,19 @@ class ContextEngineTests(unittest.TestCase):
         packet = ContextEngine(self.root).build(request)
         self.assertLessEqual(len(packet["items"]), 2)  # one bounded file plus git metadata
         self.assertTrue(packet["omitted"])
+        self.assertTrue(all(row["reason"] in {"limit", "irrelevant", "stale", "unsafe"} for row in packet["omitted"]))
         self.assertTrue(all("content_utf8" not in item or item["bytes"] <= 5 for item in packet["items"]))
+
+    def test_response_and_nested_workflow_projection_have_no_nulls(self):
+        result = ContextEngine(self.root).context(self.request)
+        def visit(value):
+            self.assertIsNotNone(value)
+            if isinstance(value, dict):
+                for child in value.values(): visit(child)
+            elif isinstance(value, list):
+                for child in value: visit(child)
+        visit(result)
+        self.assertEqual(_without_nulls({"optional": None, "nested": {"value": None, "kept": 1}}), {"nested": {"kept": 1}})
 
     def test_memory_is_labelled_and_stale_is_exposed(self):
         store = MemoryStore(self.root)
