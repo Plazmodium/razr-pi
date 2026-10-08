@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import dataclasses
 import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -13,8 +15,8 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "packages/razr-pi"))
 
-from adapter.core_subprocess import (_environment, _readback, _source_digest, _validate_core_config,
-                                      _workflow_projection, invoke_core)
+from adapter.core_subprocess import (_environment, _git_head, _readback, _reject_dirty_checkout,
+                                      _source_digest, _validate_core_config, _workflow_projection, invoke_core)
 from adapter.protocol import (CoreRequest, CoreResponse, ProtocolError, ProvenancePin, ReadbackResult,
                               ReadbackSpec, canonical_json, raw_file_digest, validate_git_object_id,
                               validate_source_digest)
@@ -79,6 +81,30 @@ class AdapterFoundationTests(unittest.TestCase):
         self.assertNotIn("GIT_DIR", env)
         self.assertNotIn("PYTHONPATH", env)
         self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
+
+    def test_full_porcelain_dirty_and_head_identity_policy(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            root = Path(directory)
+            env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                   "GIT_AUTHOR_NAME": "fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+                   "GIT_COMMITTER_NAME": "fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid"}
+            subprocess.run(["git", "init", "-q", str(root)], check=True, env=env)
+            (root / "tracked").write_text("one")
+            subprocess.run(["git", "-C", str(root), "add", "tracked"], check=True, env=env)
+            subprocess.run(["git", "-C", str(root), "commit", "-q", "-m", "fixture"], check=True, env=env)
+            head = _git_head(root)
+            self.assertEqual(len(head), 40)
+            (root / "source.py").write_text("untracked")
+            with self.assertRaises(ProtocolError) as caught:
+                _reject_dirty_checkout(root, ".razr/work")
+            self.assertEqual(caught.exception.code, "SOURCE_CHANGED")
+            (root / "source.py").unlink()
+            (root / ".razr/work").mkdir(parents=True)
+            (root / ".razr/work/cache").write_text("owned")
+            _reject_dirty_checkout(root, ".razr/work")
+            (root / "tracked").write_text("dirty")
+            with self.assertRaises(ProtocolError):
+                _reject_dirty_checkout(root, ".razr/work")
 
     def test_core_config_shape_is_closed_and_typed(self):
         valid = {"schema_version": 1, "work_root": ".razr/work", "retention": "commit",
@@ -151,6 +177,51 @@ class AdapterFoundationTests(unittest.TestCase):
             with self.assertRaises(ProtocolError):
                 __import__("adapter.core_subprocess", fromlist=["read_workflow"]).read_workflow(request, "../bad", "node")
             never.assert_not_called()
+
+    def test_actual_subprocess_limits_exit_timeout_and_signal_codes(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            root = Path(directory) / "repo"; root.mkdir()
+            package = Path(directory) / "package"
+            shutil.copytree(ROOT / "packages/razr-pi", package)
+            script = package / "runtime/scripts/razr.py"
+            script.write_text("import os, signal, sys, time\nmode=sys.argv[1]\nif mode == 'timeout': time.sleep(2)\nelif mode == 'stdout': print('x' * 100)\nelif mode == 'stderr': print('x' * 100, file=sys.stderr)\nelif mode == 'exit': sys.exit(7)\nelif mode == 'signal': os.kill(os.getpid(), signal.SIGTERM)\nelif mode == 'malformed': print('not-json')\n")
+            declaration_path = package / "runtime/provenance.json"
+            declaration = json.loads(declaration_path.read_bytes())
+            declaration["files"][0]["sha256"] = __import__("hashlib").sha256(script.read_bytes()).hexdigest()
+            declaration_path.write_text(json.dumps(declaration) + "\n")
+            env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                   "GIT_AUTHOR_NAME": "fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+                   "GIT_COMMITTER_NAME": "fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid"}
+            subprocess.run(["git", "init", "-q", str(root)], check=True, env=env)
+            config = {"schema_version": 1, "work_root": ".razr/work", "retention": "commit",
+                      "adapter": {"mode": "process-local", "max_active_work_items": 5,
+                      "queue_order": ["priority", "approved_at", "id"]}}
+            (root / "razr.yaml").write_text(json.dumps(config) + "\n")
+            subprocess.run(["git", "-C", str(root), "add", "razr.yaml"], check=True, env=env)
+            subprocess.run(["git", "-C", str(root), "commit", "-q", "-m", "fixture"], check=True, env=env)
+            commit = _git_head(root)
+            pins = tuple(ProvenancePin(row["path"], row["sha256"]) for row in declaration["files"])
+            def request(mode, timeout=1000, stdout=1_048_576, stderr=262_144):
+                return CoreRequest("run-" + mode, root, (mode,), root, package,
+                    Path(sys.executable).resolve(), script.resolve(), commit, _source_digest(root, commit),
+                    raw_file_digest(declaration_path.read_bytes()), pins, (), timeout, 100, stdout, stderr)
+            forbidden = {name: os.environ.pop(name) for name in list(os.environ)
+                         if name.startswith("GIT_") and name not in {"GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_OPTIONAL_LOCKS", "GIT_TERMINAL_PROMPT"}}
+            try:
+                for mode, code in (("timeout", "TIMEOUT"), ("stdout", "OUTPUT_LIMIT"),
+                                   ("stderr", "OUTPUT_LIMIT"), ("exit", "CORE_EXIT"), ("signal", "INTERRUPTED")):
+                    kwargs = {"timeout": 5000, "stdout": 10, "stderr": 10} if mode in {"stdout", "stderr"} else {}
+                    with self.assertRaises(ProtocolError) as caught:
+                        invoke_core(request(mode, **kwargs))
+                    self.assertEqual(caught.exception.code, code)
+                response = invoke_core(request("malformed"))
+                self.assertEqual(response.stdout, b"not-json\n")
+                duplicate = dataclasses.replace(request("malformed"), expected_provenance=pins + (pins[0],))
+                with self.assertRaises(ProtocolError) as caught:
+                    invoke_core(duplicate)
+                self.assertEqual(caught.exception.code, "PROVENANCE_MISMATCH")
+            finally:
+                os.environ.update(forbidden)
 
     def test_provenance_refusal_precedes_launch(self):
         package = ROOT / "packages/razr-pi"

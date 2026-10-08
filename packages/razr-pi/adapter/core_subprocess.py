@@ -121,6 +121,29 @@ def _verify_git_identity(root: Path) -> None:
     git_entry = root / ".git"
     if not git_entry.exists() or git_entry.is_symlink() or not (git_entry.is_dir() or git_entry.is_file()):
         raise _fail("IDENTITY_MISMATCH", "ambiguous or missing Git administration")
+    administrative = git_entry
+    if git_entry.is_file():
+        try:
+            raw = git_entry.read_bytes()
+            text = raw.decode("utf-8")
+            if not text.startswith("gitdir: ") or text.count("\n") != 1 or not text.endswith("\n"):
+                raise ValueError("malformed linked worktree pointer")
+            pointer = Path(text[8:-1])
+            if not pointer.is_absolute():
+                pointer = (root / pointer).resolve()
+            if ".." in Path(text[8:-1]).parts or pointer.is_symlink() or not pointer.is_dir():
+                raise ValueError("unsafe linked worktree pointer")
+            common_guess = pointer.parent.parent
+            if pointer.parent.name != "worktrees" or common_guess.name != ".git":
+                raise ValueError("external linked worktree")
+            administrative = pointer
+            if (pointer / "commondir").read_text(encoding="utf-8") != "../..\n":
+                raise ValueError("invalid linked commondir")
+            backlink = (pointer / "gitdir").read_text(encoding="utf-8")
+            if backlink != str(git_entry) + "\n":
+                raise ValueError("invalid linked backlink")
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise _fail("IDENTITY_MISMATCH", "ambiguous linked Git administration") from exc
     env = _environment()
     try:
         result = subprocess.run(["git", "-C", str(root), "rev-parse", "--path-format=absolute",
@@ -133,9 +156,28 @@ def _verify_git_identity(root: Path) -> None:
     if result.returncode or result.stderr or len(values) != 5 or values[0] != str(root) or values[3:] != ["true", "false"]:
         raise _fail("IDENTITY_MISMATCH", "ambiguous Git administration")
     git_dir, common_dir = (Path(values[1]), Path(values[2]))
-    if (not git_dir.is_absolute() or not common_dir.is_absolute() or git_dir.is_symlink()
-            or common_dir.is_symlink() or not git_dir.is_dir() or not common_dir.is_dir()):
+    if (not git_dir.is_absolute() or not common_dir.is_absolute() or git_dir.resolve() != administrative.resolve()
+            or git_dir.is_symlink() or common_dir.is_symlink() or not git_dir.is_dir() or not common_dir.is_dir()):
         raise _fail("IDENTITY_MISMATCH", "ambiguous Git administration")
+    try:
+        listed = subprocess.run(["git", "-C", str(root), "worktree", "list", "--porcelain", "-z"],
+                                env=env, cwd=root, capture_output=True, check=False, timeout=10)
+        if listed.returncode or listed.stderr:
+            raise ValueError("worktree query failed")
+        locations = []
+        for block in listed.stdout.split(b"\0\0"):
+            if not block:
+                continue
+            fields = block.split(b"\0")
+            if any(field.startswith((b"bare", b"prunable")) for field in fields):
+                raise ValueError("ambiguous/prunable worktree")
+            if not fields or not fields[0].startswith(b"worktree "):
+                raise ValueError("malformed worktree registration")
+            locations.append(fields[0][9:].decode("utf-8"))
+        if len(locations) != len(set(locations)) or locations.count(str(root)) != 1 or locations.count(str(common_dir.parent)) != 1:
+            raise ValueError("ambiguous worktree registration")
+    except (OSError, UnicodeError, subprocess.TimeoutExpired, ValueError) as exc:
+        raise _fail("IDENTITY_MISMATCH", "ambiguous Git worktree registration") from exc
 
 
 def _git_head(root: Path) -> str:
@@ -152,13 +194,14 @@ def _git_head(root: Path) -> str:
 
 def _reject_dirty_checkout(root: Path, work_root: str) -> None:
     try:
-        result = subprocess.run(["git", "-C", str(root), "status", "--porcelain=v1", "-z", "--untracked-files=no"],
+        result = subprocess.run(["git", "-C", str(root), "status", "--porcelain=v1", "-z", "--untracked-files=all"],
                                 env=_environment(), cwd=root, capture_output=True, check=False, timeout=10)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise _fail("IDENTITY_MISMATCH", "Git dirtiness query unavailable") from exc
     if result.returncode or result.stderr:
         raise _fail("IDENTITY_MISMATCH", "Git dirtiness query failed")
-    excluded = {"AGENTS.md", "razr.yaml"}
+    # The only owned untracked/private output-cache area is the committed work_root.
+    # No other output/cache directory is permitted; source and config remain tracked.
     prefix = work_root.rstrip("/") + "/"
     for entry in result.stdout.split(b"\0"):
         if not entry:
@@ -168,8 +211,8 @@ def _reject_dirty_checkout(root: Path, work_root: str) -> None:
             path = raw_path.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise _fail("IDENTITY_MISMATCH", "Git returned an invalid dirty path") from exc
-        if path not in excluded and not path.startswith(prefix):
-            raise _fail("SOURCE_CHANGED", "tracked checkout is dirty", path=path)
+        if not path.startswith(prefix):
+            raise _fail("SOURCE_CHANGED", "checkout has dirty or untracked path", path=path)
 
 
 def _git_commit_exists(root: Path, commit: str) -> bool:
