@@ -72,6 +72,10 @@ def _identity(info: os.stat_result) -> tuple[int, int, int, int]:
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
 
 
+def _evidence_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size, info.st_mtime_ns
+
+
 def _fail(code: str, message: str, **details: object) -> ProtocolError:
     return ProtocolError(code, message, details=details)
 
@@ -84,7 +88,8 @@ def _repo_path(value: str) -> str:
     if not isinstance(value, str) or not value or "\\" in value:
         raise _fail("INVALID_REQUEST", "repository-relative POSIX path required")
     path = PurePosixPath(value)
-    if path.is_absolute() or ".." in path.parts or str(path) != value or value == ".":
+    if (path.is_absolute() or ".." in path.parts or str(path) != value or value == "."
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)):
         raise _fail("PATH_ESCAPE", "path is outside the repository")
     return value
 
@@ -163,7 +168,7 @@ class MemoryStore:
             raise _fail("UNSUPPORTED_CAPABILITY", "descriptor-safe storage is unavailable")
         self.root = root
         self.path = root / ".razr/memory.jsonl"
-        self.lock_path = root / ".razr/memory.jsonl.lock"
+        self.lock_path = root / ".razr-memory.lock"
         try:
             self._root_fd = os.open(root, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
             self._root_identity = _identity(_regular(self._root_fd, "repository", directory=True))
@@ -268,30 +273,35 @@ class MemoryStore:
 
     @contextmanager
     def _locked(self) -> Iterator[int]:
-        storage_fd = self._storage_dir()
+        self._verify_root()
         lock_fd = -1
+        storage_fd = -1
         try:
-            self._verify_storage(storage_fd)
-            lock_fd = os.open("memory.jsonl.lock", os.O_RDWR | os.O_CREAT | _O_NOFOLLOW, 0o644, dir_fd=storage_fd)
-            self._verify_entry(storage_fd, "memory.jsonl.lock", lock_fd, "memory lock")
+            lock_fd = os.open(".razr-memory.lock", os.O_RDWR | os.O_CREAT | _O_NOFOLLOW, 0o644, dir_fd=self._root_fd)
+            self._verify_entry(self._root_fd, ".razr-memory.lock", lock_fd, "memory lock")
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            self._verify_entry(storage_fd, "memory.jsonl.lock", lock_fd, "memory lock")
+            self._verify_root()
+            self._verify_entry(self._root_fd, ".razr-memory.lock", lock_fd, "memory lock")
+            storage_fd = self._storage_dir()
             self._verify_storage(storage_fd)
             yield storage_fd
+            self._verify_storage(storage_fd)
+            self._verify_entry(self._root_fd, ".razr-memory.lock", lock_fd, "memory lock")
         except ProtocolError:
             raise
         except (OSError, BlockingIOError) as exc:
             raise _fail("LOCK_UNAVAILABLE", "memory lock unavailable", retryable=True) from exc
         finally:
+            if storage_fd >= 0:
+                try:
+                    os.close(storage_fd)
+                except OSError:
+                    pass
             if lock_fd >= 0:
                 try:
                     os.close(lock_fd)
                 except OSError:
                     pass
-            try:
-                os.close(storage_fd)
-            except OSError:
-                pass
 
     def _read_locked(self, storage_fd: int) -> list[dict[str, object]]:
         self._verify_storage(storage_fd)
@@ -377,6 +387,7 @@ class MemoryStore:
                 raise fail("invalid evidence type")
             try:
                 _safe_text(item["ref"], "evidence reference", 512)
+                _repo_path(item["ref"])
                 _digest(item["digest"], item["digest_domain"])
             except ProtocolError as exc:
                 raise fail("invalid or restricted evidence reference") from exc
@@ -500,6 +511,9 @@ class MemoryStore:
                 after = _regular(fd, "evidence file")
                 if after.st_nlink != 1:
                     raise _fail("PATH_ESCAPE", "evidence hardlink changed")
+                pathname_after = os.stat(components[-1], dir_fd=current, follow_symlinks=False)
+                if _evidence_identity(after) != _evidence_identity(pathname_after):
+                    raise _fail("PATH_ESCAPE", "evidence pathname identity changed")
             except OSError as exc:
                 raise _fail("PATH_ESCAPE", "evidence file is linked or unavailable") from exc
             finally:
@@ -532,6 +546,7 @@ class MemoryStore:
             if not isinstance(item["type"], str) or item["type"] not in EVIDENCE_TYPES:
                 raise _fail("INVALID_REQUEST", "invalid evidence type")
             _safe_text(item["ref"], "evidence reference", 512)
+            _repo_path(item["ref"])
             _digest(item["digest"], item["digest_domain"])
             if item["type"] == "path":
                 if item["digest_domain"] != "raw_file":

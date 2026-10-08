@@ -160,25 +160,32 @@ class MemoryTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             self.store.inspect()
         (self.root / ".razr/memory.jsonl").unlink()
-        (self.root / ".razr/memory.jsonl.lock").unlink()
-        (self.root / ".razr/memory.jsonl.lock").symlink_to(self.root / "target.jsonl")
+        (self.root / ".razr-memory.lock").unlink()
+        (self.root / ".razr-memory.lock").symlink_to(self.root / "target.jsonl")
         with self.assertRaises(ProtocolError):
             self.store.inspect()
-        (self.root / ".razr/memory.jsonl.lock").unlink()
+        (self.root / ".razr-memory.lock").unlink()
         evidence = self.root / "identity.txt"
         evidence.write_text("one")
         digest = raw_file_digest(evidence.read_bytes())
-        original_identity = __import__("adapter.memory", fromlist=["_identity"])._identity
+        original_stat = __import__("os").stat
         calls = {"count": 0}
-        def changing_identity(info):
+        def pathname_swap(path, *args, **kwargs):
             calls["count"] += 1
-            value = original_identity(info)
-            return (value[0], value[1] + 1, value[2], value[3]) if calls["count"] == 3 else value
-        with patch("adapter.memory._identity", side_effect=changing_identity):
+            info = original_stat(path, *args, **kwargs)
+            if calls["count"] == 2:
+                values = list(info); values[1] += 1
+                return type(info)(values)
+            return info
+        with patch("adapter.memory.os.stat", side_effect=pathname_swap):
             with self.assertRaises(ProtocolError) as caught:
                 self.store.remember(kind="learning", summary="identity", repository=self.repo,
                     evidence=[{"type":"path", "ref":"identity.txt", "digest_domain":"raw_file", "digest":digest}])
         self.assertEqual(caught.exception.code, "PATH_ESCAPE")
+        with self.assertRaises(ProtocolError):
+            self.store.remember(kind="learning", summary="metadata", repository=self.repo,
+                evidence=[{"type":"external", "ref":"https://outside", "digest_domain":"raw_file",
+                           "digest":"sha256:" + "a" * 64}])
 
     def test_repeated_transitions_are_idempotent_or_conflicts(self):
         record = self.store.remember(kind="learning", summary="transition", repository=self.repo)
@@ -234,7 +241,7 @@ class MemoryTests(unittest.TestCase):
                 linked_store.inspect()
         external_ledger.unlink()
         external_lock = self.root / "lock-copy"
-        external_lock.hardlink_to(self.root / ".razr/memory.jsonl.lock")
+        external_lock.hardlink_to(self.root / ".razr-memory.lock")
         with MemoryStore(self.root) as linked_store:
             with self.assertRaises(ProtocolError):
                 linked_store.inspect()
