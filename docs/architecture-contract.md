@@ -15,11 +15,24 @@ All M02–M05 interfaces use UTF-8 JSON objects with no unknown top-level fields
 
 - `id` values are non-empty ASCII strings matching `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`.
 - Times are UTC RFC 3339 strings with `Z` and second or millisecond precision.
-- Digests are lowercase `sha256:<64 hex characters>` over canonical JSON: UTF-8, recursively sorted object keys, array order preserved, no insignificant whitespace, and no NaN/Infinity. The canonicalizer rejects duplicate keys, non-finite numbers, and ambiguous Unicode normalization; strings are retained as supplied.
 - Paths are UTF-8 relative POSIX paths beneath the declared repository/worktree root after resolution; absolute paths, symlinks, `..`, and path escapes are rejected. Machine paths and secret values are never serialized into public records.
 - Errors use one envelope: `{ "schema_version":1, "ok":false, "error": {"code": <enum>, "message": <string>, "retryable": <boolean>, "details": <object> } }`. Messages are diagnostic, not authority. A caller must not retry unless the operation explicitly says so.
 
 Successful responses use `{ "schema_version":1, "ok":true, "request_id": <id>, "result": <object> }`; `request_id` is echoed and must be unique per call. A response with a mismatched request ID, schema, digest, or identity is invalid and is retained as an observation rather than converted to success.
+
+### Separate digest domains
+
+These domains are not interchangeable, even when they use SHA-256:
+
+| Domain | Exact input and encoding | Representation and use |
+|---|---|---|
+| Raw-file digest | Exact bytes read from one file; no newline/BOM normalization | `sha256:<64 hex>`; used for evidence/file identity |
+| Canonical-JSON digest | Canonical JSON UTF-8: recursively sorted object keys, preserved array order, no insignificant whitespace, duplicate-key/non-finite-number rejection | `sha256:<64 hex>`; used for protocol packets, Memory/attempt records, and `record_digest` |
+| Core `source_digest` | Existing `razr.py::source_tree_digest`: bytes concatenating each `git ls-tree -r -z --full-tree <commit>` entry as `metadata + b"\\t" + raw_path + b"\\0"`, excluding `razr.yaml`, `AGENTS.md`, and the configured work-root prefix | `sha256:<64 hex>`; identifies the reviewed Git tree, not a file or JSON document |
+| Executable digest | Existing `razr.py::executable_digest`: `json.dumps(executable, sort_keys=True, separators=(",", ":")).encode("utf-8")` then SHA-256 | `sha256:<64 hex>`; identifies `executable.yaml`'s parsed JSON object under the core's existing serialization |
+| Git object ID | Existing Git commit object identity, resolved and verified by `git cat-file -e <id>^{commit}` | exactly 40 lowercase hexadecimal characters matching `FULL_SHA_RE`; never prefixed with `sha256:` |
+
+`candidate.commit` is therefore an existing full Git commit object ID such as `0123456789abcdef0123456789abcdef01234567`; `candidate.source_digest` is a separate `sha256:` tree digest. In provider requests, `candidate.repository`, `candidate.branch`, `candidate.commit`, and `candidate.source_digest` are all required. A candidate request is invalid if either domain is missing, malformed, or used in the other field.
 
 ## 3. Memory interface (M02)
 
@@ -31,11 +44,11 @@ Storage is exactly `.razr/memory.jsonl`, local-first and inspectable, with an op
   "summary":"...", "scope":{"repository":"sha256:...", "paths":["src/x.py"]},
   "confidence":"low|medium|high", "status":"active|stale|retired|superseded",
   "created_at":"...Z", "updated_at":"...Z", "evidence":[{"type":"path|test|commit|config|work_item|external","ref":"...","digest":"sha256:..."}],
-  "tags":["..."], "supersedes":null, "related_ids":[]
+  "tags":["..."], "prev_digest":"sha256:...", "record_digest":"sha256:..."
 }
 ```
 
-`supersedes` and `related_ids` are optional; omitted optional fields are not written as null. `summary`, tags, and evidence are bounded (M02 must reject oversized values). Secret-like content is rejected/redacted before append. A record becomes `stale` when its evidence digest no longer matches the current repository; stale Memory is shown as stale and cannot outrank source evidence. Retrieval returns `{records: [...], omitted_count, stale_ids, query_digest}` and is bounded by an explicit `limit` (default and maximum owned by M02).
+Memory record closure is normative: required fields are `schema_version`, `id`, `kind`, `summary`, `scope`, `confidence`, `status`, `created_at`, `updated_at`, and `evidence`; optional fields are `tags`, `supersedes`, and `related_ids`; no other fields are allowed. `scope.repository` and `scope.paths` are required. `evidence[].type`, `evidence[].ref`, and `evidence[].digest` are required. Optional fields are omitted when absent, never emitted as `null`; `null` is forbidden in records. `summary`, tags, and evidence are bounded (M02 must reject oversized values). Secret-like content is rejected/redacted before append. A record becomes `stale` when its evidence digest no longer matches the current repository; stale Memory is shown as stale and cannot outrank source evidence. Retrieval returns `{records: [...], omitted_count, stale_ids, query_digest}` and is bounded by an explicit `limit` (default and maximum owned by M02).
 
 Append integrity: M02 opens the file with create/exclusive mode as needed, takes an advisory exclusive `flock` on a sibling `.lock`, seeks to EOF, validates every prior line, writes exactly one complete JSON line with `O_APPEND`, calls `fsync`, and releases the lock. Each record has `prev_digest` and `record_digest`; `record_digest` covers the canonical record without `record_digest`, chaining from the fixed genesis digest `sha256:` plus 64 zeroes. Partial final lines, duplicate IDs, broken chains, invalid digests, and lock failures return `LEDGER_CORRUPT` or `LOCK_UNAVAILABLE` and never append. No compaction or in-place rewrite occurs in M02.
 
@@ -51,22 +64,24 @@ The canonical request is:
   "repository_root":".", "work_id":"optional-id", "paths":["src/x.py"],
   "include":{"workflow":true,"source":true,"tests":true,"config":true,"git":true,"memory":true},
   "limits":{"max_files":40,"max_bytes":200000,"max_memory_records":20},
-  "observed":{"commit":"sha256:...","source_digest":"sha256:..."}
+  "observed":{"commit":"0123456789abcdef0123456789abcdef01234567","source_digest":"sha256:..."}
 }
 ```
 
-`work_id`, `paths`, and `observed` are optional; `include` must contain only the six named booleans and `limits` must be positive bounded integers. The response is:
+`work_id`, `paths`, and `observed` are optional; `include` must contain only the six named booleans and `limits` must be positive bounded integers. The closed response is:
 
 ```json
 {
   "schema_version":1, "ok":true, "request_id":"ctx-...",
   "result":{"packet_digest":"sha256:...","authoritative_sources":[{"kind":"source|test|config|git|workflow|memory","ref":"...","digest":"sha256:...","reason":"..."}],
-  "items":[{"kind":"file|git_diff|git_history|workflow|memory","ref":"...","digest":"sha256:...","bytes":123,"reason":"...","authority":"repository|workflow|memory"}],
+  "items":[{"kind":"file|git_diff|git_history|workflow|memory","ref":"...","digest":"sha256:...","bytes":123,"reason":"...","authority":"repository|workflow|memory","content_utf8":"bounded text"}],
   "omitted":[{"ref":"...","reason":"limit|irrelevant|stale|unsafe"}],"stale_memory_ids":[]}
 }
 ```
 
-Items are ordered deterministically by `kind`, `ref`, then digest. The packet contains bounded excerpts or references, never the entire repository/store. Current repository evidence outranks Memory; stale or uncertain Memory is labeled and cannot override it. `INVALID_REQUEST`, `PATH_ESCAPE`, `SOURCE_CHANGED`, `WORKFLOW_UNAVAILABLE`, `MEMORY_UNAVAILABLE`, `LIMIT_EXCEEDED`, and `INTERNAL` are failure codes. `PATH_ESCAPE`, `SOURCE_CHANGED`, and digest mismatch are non-retryable; `MEMORY_UNAVAILABLE` is retryable only when Memory was explicitly included, and the response must identify the omission.
+Context request required fields are `schema_version`, `request_id`, `objective`, `repository_root`, `include`, and `limits`; optional fields are `work_id`, `paths`, and `observed`; no other fields are allowed. `observed.commit` is required if `observed` is present and is a 40-hex Git object ID; `observed.source_digest` is required if `observed` is present and is a core `sha256:` source digest. `null` is forbidden in all context requests and responses. Context response required fields are `schema_version`, `ok`, `request_id`, and `result`; result required fields are `packet_digest`, `authoritative_sources`, `items`, `omitted`, and `stale_memory_ids`; no other fields are allowed. Source entries require `kind`, `ref`, `digest`, and `reason`. Item entries require `kind`, `ref`, `digest`, `bytes`, `reason`, and `authority`, plus exactly one of `content_utf8` or `metadata`; `metadata` is an object with required `type` and `ref` and optional `note`, and means no content was included. Omission entries require `ref` and `reason`. Optional request objects/fields are omitted, never null; `null` is forbidden throughout the context protocol. Bounded content is actual UTF-8 text, and `bytes` is its UTF-8 byte length; metadata-only items use `bytes:0`.
+
+`packet_digest` is the canonical-JSON digest of exactly `{ "schema_version":1, "request_id":..., "authoritative_sources":..., "items":..., "omitted":..., "stale_memory_ids":... }` before adding `packet_digest`; it therefore covers every included content byte, every metadata reference, every source digest, and every omission/stale marker. Items are sorted deterministically by `kind`, `ref`, then digest. The packet contains bounded excerpts or explicit metadata-only references, never the entire repository/store. Current repository evidence outranks Memory; stale or uncertain Memory is labeled and cannot override it. `INVALID_REQUEST`, `PATH_ESCAPE`, `SOURCE_CHANGED`, `WORKFLOW_UNAVAILABLE`, `MEMORY_UNAVAILABLE`, `LIMIT_EXCEEDED`, and `INTERNAL` are failure codes. `PATH_ESCAPE`, `SOURCE_CHANGED`, and digest mismatch are non-retryable; `MEMORY_UNAVAILABLE` is retryable only when Memory was explicitly included, and the response must identify the omission.
 
 M03 owns assembly, selection, ordering, packet digest, and omission semantics. It reads M02 through its stable recall response and invokes the core read-only boundary below; it does not write workflow state, Memory, or attempts. M02 has no context dependency.
 
@@ -82,7 +97,13 @@ with the exact repository root as `cwd`, an allowlisted environment (`PATH`, loc
 
 Before any invocation, the adapter verifies the runtime provenance declaration and the six pinned core/template SHA-256 values in `runtime/provenance.json`, verifies the package helper pins and exact repository root, and records `core_identity` and `source_digest` in the operation result. A changed or missing provenance file returns `PROVENANCE_MISMATCH` before process launch. These checks establish byte identity, not execution or approval. The core remains the only validator: adapter checks are transport, path, provenance, and response-integrity checks, never contract or lifecycle reimplementation.
 
-## 6. Pi package and extension (M05)
+## 6. Shared adapter foundation and parallel gate
+
+The campaign integrator owns the shared adapter foundation before any M02–M05 consumer starts in parallel. Its exact planned files are `packages/razr-pi/adapter/protocol.py` (closed request/response/error dataclasses, canonical serialization, digest-domain validators, and enum constants) and `packages/razr-pi/adapter/core_subprocess.py` (allowlisted subprocess invocation, provenance preflight, bounded capture, status/read-back, and typed errors). It is one library with one public import surface; M02–M05 may not each define private protocol or subprocess helpers.
+
+The foundation is a hard prerequisite, not a parallel deliverable: its owner must land a focused test module covering closed-field rejection, omit-vs-null, canonical digest vectors, full-40-hex Git IDs, source/executable digest separation, timeout/nonzero/malformed-output/read-back failures, and provenance refusal. The campaign integrator freezes its API and test vectors in the prerequisite commit, then M02 owns only Memory implementation, M03 only context assembly, M04 only provider/ledger, and M05 only Pi registration. Changes after freeze require a new ADR revision and serialized migration; consumers cannot silently fork or broaden the protocol.
+
+## 7. Pi package and extension (M05)
 
 Decision: implement one TypeScript extension entrypoint, not a custom provider, MCP server, or second CLI. The exact future package shape is:
 
@@ -102,9 +123,9 @@ The manifest changes from the current skill-only declaration to:
 
 The extension exports the installed Pi API factory `export default function(pi: ExtensionAPI)`. It registers read/command surfaces with `pi.registerCommand(name, {description, handler: async (args, ctx) => ...})`; model-callable read operations use `pi.registerTool({name,label,description,parameters: Type.Object(...), outputSchema, annotations:{readOnlyHint:true}, execute(...)})` imported from `@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai`/`typebox` as shown by the installed `hello.ts` example. Commands/tools call the M02/M03/M04 adapters and core subprocess boundary; they do not mutate lifecycle state directly. Use `ctx.cwd`, `ctx.mode`, `ctx.ui.notify`, and `ctx.signal`; guard TUI-only behavior with `ctx.mode === "tui"`. Persistent session display metadata, if needed, uses `pi.appendEntry`, never `.razr` workflow files.
 
-Registered commands are exactly `/razr-status`, `/razr-context`, `/razr-remember`, `/razr-recall`, and `/razr-memory-inspect` in M05. Worker operations are not registered until M04's provider interface and M05's command review are complete. The extension is loaded by normal Pi package discovery; loading does not adopt, initialize, or write a project. M05 owns only the manifest, entrypoint, registration, argument parsing, and Pi smoke test. It does not own Memory/context/provider implementation.
+Registered command names (the strings passed to `pi.registerCommand`) are exactly `razr-status`, `razr-context`, `razr-remember`, `razr-recall`, and `razr-memory-inspect`; Pi user invocation displays them as `/razr-status`, `/razr-context`, `/razr-remember`, `/razr-recall`, and `/razr-memory-inspect`. Worker operations are not registered until M04's provider interface and M05's command review are complete. The extension is loaded by normal Pi package discovery; loading does not adopt, initialize, or write a project. M05 owns only the manifest, entrypoint, registration, argument parsing, and Pi smoke test. It does not own Memory/context/provider implementation.
 
-## 7. Herdr provider (M04)
+## 8. Herdr provider (M04)
 
 Runtime detection uses `HERDR_ENV=1`; when true, capture `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID`, and `HERDR_PANE_ID` only when present. Outside Herdr, operations return standalone mode and `FANOUT_UNAVAILABLE`; inside Herdr, the provider owns host transport and telemetry, not Razr authority.
 
@@ -114,7 +135,7 @@ The exact provider request is:
 {
   "schema_version":1,"request_id":"exec-...","attempt_id":"att-...","role":"technical|contract|worker",
   "work":{"work_id":"...","node_id":"...","generation":12,"ordinal":2},
-  "candidate":{"repository":"...","commit":"sha256:...","source_digest":"sha256:..."},
+  "candidate":{"repository":"owner/repository","branch":"feature/example","commit":"0123456789abcdef0123456789abcdef01234567","source_digest":"sha256:..."},
   "cwd":".","fresh_context":true,"neutral_input_digest":"sha256:...",
   "environment_policy_digest":"sha256:...","tool_policy_digest":"sha256:...",
   "required_capabilities":["fresh_context","working_directory","bounded_time","bounded_output","runtime_identity"],
@@ -137,9 +158,11 @@ Provider failure codes are exactly `INVALID_REQUEST`, `UNSUPPORTED_CAPABILITY`, 
 
 `inspect` is read-only. `collect` preserves partial artifacts. Missing identity, candidate/request digest mismatch, unsupported capability, fallback, retry, reused handle/output root, timeout, output clipping, pane loss, or cleanup uncertainty returns a non-success classification; `UNKNOWN` is never converted to failure or success automatically. `interrupt` is idempotent as a request and reports requested versus observed cleanup. `Herdr` status is never a Razr transition.
 
-## 8. Attempt ledger (M04)
+## 9. Attempt ledger (M04)
 
-M04 owns `.razr/attempts.jsonl` and `.razr/attempts.lock`, separate from `state.yaml`. Each line has exactly:
+M04 owns `.razr/attempts.jsonl` and `.razr/attempts.lock`, separate from `state.yaml`. Attempt records are closed. Required fields are `schema_version`, `attempt_id`, `work_id`, `node_id`, `observed_generation`, `observed_ordinal`, `worker_id`, `branch`, `worktree`, `allowance_id`, `provider_id`, `started_at`, `outcome`, `request_digest`, `prev_digest`, and `record_digest`. Optional fields are `herdr`, `finished_at`, and `evidence_refs`; no other fields are allowed. `herdr` requires all three IDs when present; `evidence_refs` entries require `digest` and `kind`. Optional fields are omitted until known, never emitted as `null`; `null` is forbidden. `finished_at` is required when `outcome` is terminal. `outcome` is exactly `SUCCEEDED|FAILED|INTERRUPTED|TIMED_OUT|UNKNOWN`.
+
+Each line has exactly:
 
 ```json
 {
@@ -153,9 +176,9 @@ M04 owns `.razr/attempts.jsonl` and `.razr/attempts.lock`, separate from `state.
 }
 ```
 
-`herdr`, `finished_at`, and `evidence_refs` are omitted until known; an attempt is immutable thereafter. Append uses the same sibling-lock `flock`, `O_APPEND`, one complete line, `fsync`, and hash-chain verification as Memory. A writer validates the full chain while holding the lock; duplicate `attempt_id`, reused allowance/session, broken `prev_digest`, partial line, or failed fsync returns `LEDGER_CORRUPT`, `DUPLICATE_ATTEMPT`, `ALLOWANCE_REUSED`, or `LOCK_UNAVAILABLE` and does not append. There is no in-place repair; recovery records `UNKNOWN` with a new attempt only under explicit authority. The ledger references core generation/state but cannot change it.
+`herdr`, `finished_at`, and `evidence_refs` are omitted until known; an attempt is immutable thereafter. `record_digest` is the canonical-JSON digest of the complete record with `record_digest` omitted, including `prev_digest`; it does not use raw-file, source-tree, executable, or Git-object serialization. Append uses the same sibling-lock `flock`, `O_APPEND`, one complete line, `fsync`, and hash-chain verification as Memory. A writer validates the full chain while holding the lock; duplicate `attempt_id`, reused allowance/session, broken `prev_digest`, partial line, or failed fsync returns `LEDGER_CORRUPT`, `DUPLICATE_ATTEMPT`, `ALLOWANCE_REUSED`, or `LOCK_UNAVAILABLE` and does not append. There is no in-place repair; recovery records `UNKNOWN` with a new attempt only under explicit authority. The ledger references core generation/state but cannot change it.
 
-## 9. Legacy classification and migration ownership
+## 10. Legacy classification and migration ownership
 
 - **Permanent:** `runtime/scripts/razr.py` and its canonical templates; `scripts/adopt.py` safe adoption; `scripts/primary.py` read-only inspection; Git/`gh` as history and delivery boundaries; the single `skills/razr/SKILL.md` instruction surface. These remain supported and are owned by the core/adoption compatibility owner.
 - **Temporary compatibility shims:** `scripts/contract-preflight.py` and `scripts/named-regressions.py`. Owner: M05/package maintainers. Removal gate: M02–M05 replacement callers, equivalent refusal/identity tests, documented migration notes, and one clean-source full-suite run on the replacement path; no removal before a separately reviewed campaign commit.
@@ -163,6 +186,6 @@ M04 owns `.razr/attempts.jsonl` and `.razr/attempts.lock`, separate from `state.
 
 M02 owns Memory only; M03 owns context only; M04 owns Herdr/provider and attempts only; M05 owns Pi packaging/registration only. Shared JSON rules above are frozen for these missions. Interface changes require an ADR revision and serialized review before parallel implementation.
 
-## 10. Non-goals
+## 11. Non-goals
 
 This M01 contract does not implement Memory, context, Herdr fanout, the extension, a scheduler, deployment, npm publication, credential management, vector search, background summarization, automatic retries, independent critique, human approval, clean-clone acceptance, or GitHub delivery automation. It does not replace the Razr workflow state machine.
