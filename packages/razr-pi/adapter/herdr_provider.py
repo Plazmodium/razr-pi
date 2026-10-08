@@ -1081,7 +1081,6 @@ class HerdrProvider:
             self._cleanup_record(value, "uncertain", reason="attempt is not settled")
             raise _fail("CLEANUP_UNKNOWN", "cleanup requires a settled attempt")
         status = self._inspect_handle(value)["result"]["status"]
-        if status not in {"SETTLED", "TERMINATED"} and value["attempt_id"] not in self._settled: raise _fail("CLEANUP_UNKNOWN", "refusing cleanup of active handle")
         try:
             worktree_root = _canonical_dir(str(self._attempt_paths[value["attempt_id"]]), "worktree")
             self._exec([self.herdr, "worktree", "remove", "--workspace", value["host"]["workspace_id"], "--force"], timeout_ms=120_000)
@@ -1091,7 +1090,7 @@ class HerdrProvider:
             for workspace in workspace_result["workspaces"]:
                 if not isinstance(workspace, dict) or not isinstance(workspace.get("workspace_id"), str): raise _fail("CLEANUP_UNKNOWN", "workspace identity is malformed")
                 if workspace["workspace_id"] == value["host"]["workspace_id"]: raise _fail("CLEANUP_UNKNOWN", "workspace remains after cleanup")
-            worktree_response = _envelope(self._exec([self.herdr, "worktree", "list", "--cwd", str(worktree_root)], timeout_ms=10_000), "worktree list")
+            worktree_response = _envelope(self._exec([self.herdr, "worktree", "list"], timeout_ms=10_000), "worktree list")
             worktree_result = worktree_response["result"]
             if not isinstance(worktree_result, dict) or worktree_result.get("type") != "worktree_list" or not isinstance(worktree_result.get("worktrees"), list): raise _fail("CLEANUP_UNKNOWN", "worktree list is malformed")
             root_text = str(worktree_root)

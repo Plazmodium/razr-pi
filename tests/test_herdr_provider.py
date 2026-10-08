@@ -169,7 +169,7 @@ class HerdrProviderTests(unittest.TestCase):
                 if argv[:3] == ["herdr", "agent", "read"]:
                     return subprocess.CompletedProcess(argv, 0, b"observed output", b"")
                 if argv[:3] == ["herdr", "pane", "close"] or argv[:3] == ["herdr", "worktree", "remove"]:
-                    return subprocess.CompletedProcess(argv, 0, b"", b"")
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "worktree:remove", "result": {"type": "worktree_removed", "workspace_id": "w", "removed": True}}).encode(), b"")
                 if argv[:3] == ["herdr", "worktree", "list"]:
                     return subprocess.CompletedProcess(argv, 0, b"[]", b"")
                 if argv[:3] == ["git", "-C", str(worktree)] and argv[3] == "symbolic-ref":
@@ -199,7 +199,8 @@ class HerdrProviderTests(unittest.TestCase):
             self.assertEqual(len(settled["evidence_refs"][:2]), 2)
             self.assertTrue(all(ref["ref"].startswith(".razr/evidence/") and not ref["ref"].startswith("private/") for ref in settled["evidence_refs"][:2]))
             self.assertTrue(all(set(ref) == {"ref", "kind", "digest_domain", "digest"} for ref in settled["evidence_refs"][:2]))
-            self.assertEqual(collected.cleanup(handle)["cleanup"], "confirmed")
+            cleanup_result = collected.cleanup(handle)
+            self.assertEqual(cleanup_result["cleanup"], "confirmed"); self.assertEqual(cleanup_result["status"], "ACTIVE")
             with self.assertRaises(ProtocolError): collected._handle({**handle, "request_digest": "sha256:" + "d" * 64})
             self.assertEqual(len(ledger.path.read_text().splitlines()), 2)
 
