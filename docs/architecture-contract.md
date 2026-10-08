@@ -43,12 +43,12 @@ Storage is exactly `.razr/memory.jsonl`, local-first and inspectable, with an op
   "schema_version":1, "id":"mem-...", "kind":"observation|rationale|learning|workaround|failure_pattern|environment_quirk|navigation_hint|preference|unresolved_question",
   "summary":"...", "scope":{"repository":"sha256:...", "paths":["src/x.py"]},
   "confidence":"low|medium|high", "status":"active|stale|retired|superseded",
-  "created_at":"...Z", "updated_at":"...Z", "evidence":[{"type":"path|test|commit|config|work_item|external","ref":"...","digest":"sha256:..."}],
+  "created_at":"...Z", "updated_at":"...Z", "evidence":[{"type":"path|test|commit|config|work_item|external","ref":"...","digest_domain":"raw_file","digest":"sha256:..."}],
   "tags":["..."], "prev_digest":"sha256:...", "record_digest":"sha256:..."
 }
 ```
 
-Memory record closure is normative: required fields are `schema_version`, `id`, `kind`, `summary`, `scope`, `confidence`, `status`, `created_at`, `updated_at`, and `evidence`; optional fields are `tags`, `supersedes`, and `related_ids`; no other fields are allowed. `scope.repository` and `scope.paths` are required. `evidence[].type`, `evidence[].ref`, and `evidence[].digest` are required. Optional fields are omitted when absent, never emitted as `null`; `null` is forbidden in records. `summary`, tags, and evidence are bounded (M02 must reject oversized values). Secret-like content is rejected/redacted before append. A record becomes `stale` when its evidence digest no longer matches the current repository; stale Memory is shown as stale and cannot outrank source evidence. Retrieval returns `{records: [...], omitted_count, stale_ids, query_digest}` and is bounded by an explicit `limit` (default and maximum owned by M02).
+Memory record closure is normative: required fields are `schema_version`, `id`, `kind`, `summary`, `scope`, `confidence`, `status`, `created_at`, `updated_at`, `evidence`, `prev_digest`, and `record_digest`; optional fields are `tags`, `supersedes`, and `related_ids`; no other fields are allowed. `scope.repository` and `scope.paths` are required. `evidence[].type`, `evidence[].ref`, `evidence[].digest_domain`, and `evidence[].digest` are required; `digest_domain` must match the digest-domain table and `git_object` values are 40-hex IDs rather than `sha256:` strings. Optional fields are omitted when absent, never emitted as `null`; `null` is forbidden in records. `summary`, tags, and evidence are bounded (M02 must reject oversized values). Secret-like content is rejected/redacted before append. A record becomes `stale` when its evidence digest no longer matches the current repository; stale Memory is shown as stale and cannot outrank source evidence. Retrieval returns `{records: [...], omitted_count, stale_ids, query_digest}` and is bounded by an explicit `limit` (default and maximum owned by M02).
 
 Append integrity: M02 opens the file with create/exclusive mode as needed, takes an advisory exclusive `flock` on a sibling `.lock`, seeks to EOF, validates every prior line, writes exactly one complete JSON line with `O_APPEND`, calls `fsync`, and releases the lock. Each record has `prev_digest` and `record_digest`; `record_digest` covers the canonical record without `record_digest`, chaining from the fixed genesis digest `sha256:` plus 64 zeroes. Partial final lines, duplicate IDs, broken chains, invalid digests, and lock failures return `LEDGER_CORRUPT` or `LOCK_UNAVAILABLE` and never append. No compaction or in-place rewrite occurs in M02.
 
@@ -73,13 +73,13 @@ The canonical request is:
 ```json
 {
   "schema_version":1, "ok":true, "request_id":"ctx-...",
-  "result":{"packet_digest":"sha256:...","authoritative_sources":[{"kind":"source|test|config|git|workflow|memory","ref":"...","digest":"sha256:...","reason":"..."}],
-  "items":[{"kind":"file|git_diff|git_history|workflow|memory","ref":"...","digest":"sha256:...","bytes":123,"reason":"...","authority":"repository|workflow|memory","content_utf8":"bounded text"}],
+  "result":{"packet_digest":"sha256:...","authoritative_sources":[{"kind":"source|test|config|git|workflow|memory","ref":"...","digest_domain":"raw_file|canonical_json|core_source|executable|git_object","digest":"sha256:...","reason":"..."}],
+  "items":[{"kind":"file|git_diff|git_history|workflow|memory","ref":"...","digest_domain":"raw_file|canonical_json|core_source|executable|git_object","digest":"sha256:...","bytes":123,"reason":"...","authority":"repository|workflow|memory","content_utf8":"bounded text"}],
   "omitted":[{"ref":"...","reason":"limit|irrelevant|stale|unsafe"}],"stale_memory_ids":[]}
 }
 ```
 
-Context request required fields are `schema_version`, `request_id`, `objective`, `repository_root`, `include`, and `limits`; optional fields are `work_id`, `paths`, and `observed`; no other fields are allowed. `observed.commit` is required if `observed` is present and is a 40-hex Git object ID; `observed.source_digest` is required if `observed` is present and is a core `sha256:` source digest. `null` is forbidden in all context requests and responses. Context response required fields are `schema_version`, `ok`, `request_id`, and `result`; result required fields are `packet_digest`, `authoritative_sources`, `items`, `omitted`, and `stale_memory_ids`; no other fields are allowed. Source entries require `kind`, `ref`, `digest`, and `reason`. Item entries require `kind`, `ref`, `digest`, `bytes`, `reason`, and `authority`, plus exactly one of `content_utf8` or `metadata`; `metadata` is an object with required `type` and `ref` and optional `note`, and means no content was included. Omission entries require `ref` and `reason`. Optional request objects/fields are omitted, never null; `null` is forbidden throughout the context protocol. Bounded content is actual UTF-8 text, and `bytes` is its UTF-8 byte length; metadata-only items use `bytes:0`.
+Context request required fields are `schema_version`, `request_id`, `objective`, `repository_root`, `include`, and `limits`; optional fields are `work_id`, `paths`, and `observed`; no other fields are allowed. `observed.commit` is required if `observed` is present and is a 40-hex Git object ID; `observed.source_digest` is required if `observed` is present and is a core `sha256:` source digest. `null` is forbidden in all context requests and responses. Context response required fields are `schema_version`, `ok`, `request_id`, and `result`; result required fields are `packet_digest`, `authoritative_sources`, `items`, `omitted`, and `stale_memory_ids`; no other fields are allowed. Source entries require `kind`, `ref`, `digest_domain`, `digest`, and `reason`. Item entries require `kind`, `ref`, `digest_domain`, `digest`, `bytes`, `reason`, and `authority`, plus exactly one of `content_utf8` or `metadata`; `metadata` is an object with required `type` and `ref` and optional `note`, and means no content was included. Omission entries require `ref` and `reason`. Optional request objects/fields are omitted, never null; `null` is forbidden throughout the context protocol. Bounded content is actual UTF-8 text, and `bytes` is its UTF-8 byte length; metadata-only items use `bytes:0`.
 
 `packet_digest` is the canonical-JSON digest of exactly `{ "schema_version":1, "request_id":..., "authoritative_sources":..., "items":..., "omitted":..., "stale_memory_ids":... }` before adding `packet_digest`; it therefore covers every included content byte, every metadata reference, every source digest, and every omission/stale marker. Items are sorted deterministically by `kind`, `ref`, then digest. The packet contains bounded excerpts or explicit metadata-only references, never the entire repository/store. Current repository evidence outranks Memory; stale or uncertain Memory is labeled and cannot override it. `INVALID_REQUEST`, `PATH_ESCAPE`, `SOURCE_CHANGED`, `WORKFLOW_UNAVAILABLE`, `MEMORY_UNAVAILABLE`, `LIMIT_EXCEEDED`, and `INTERNAL` are failure codes. `PATH_ESCAPE`, `SOURCE_CHANGED`, and digest mismatch are non-retryable; `MEMORY_UNAVAILABLE` is retryable only when Memory was explicitly included, and the response must identify the omission.
 
@@ -101,7 +101,34 @@ Before any invocation, the adapter verifies the runtime provenance declaration a
 
 The campaign integrator owns the shared adapter foundation before any M02–M05 consumer starts in parallel. Its exact planned files are `packages/razr-pi/adapter/protocol.py` (closed request/response/error dataclasses, canonical serialization, digest-domain validators, and enum constants) and `packages/razr-pi/adapter/core_subprocess.py` (allowlisted subprocess invocation, provenance preflight, bounded capture, status/read-back, and typed errors). It is one library with one public import surface; M02–M05 may not each define private protocol or subprocess helpers.
 
-The foundation is a hard prerequisite, not a parallel deliverable: its owner must land a focused test module covering closed-field rejection, omit-vs-null, canonical digest vectors, full-40-hex Git IDs, source/executable digest separation, timeout/nonzero/malformed-output/read-back failures, and provenance refusal. The campaign integrator freezes its API and test vectors in the prerequisite commit, then M02 owns only Memory implementation, M03 only context assembly, M04 only provider/ledger, and M05 only Pi registration. Changes after freeze require a new ADR revision and serialized migration; consumers cannot silently fork or broaden the protocol.
+The foundation is a hard prerequisite, not a parallel deliverable. Its frozen typed Python API is:
+
+```python
+class ProtocolError(Exception):
+    code: ErrorCode
+    retryable: bool
+    details: dict[str, object]
+
+ErrorCode = Literal[
+    "INVALID_REQUEST", "OUTPUT_LIMIT", "TIMEOUT", "INTERRUPTED", "CORE_EXIT",
+    "MALFORMED_RESPONSE", "READBACK_FAILED", "PROVENANCE_MISMATCH",
+    "LOCK_UNAVAILABLE", "LEDGER_CORRUPT", "DUPLICATE_ATTEMPT", "INVALID_ORDER",
+    "ALLOWANCE_REUSED", "PATH_ESCAPE", "SOURCE_CHANGED", "INTERNAL"
+]
+
+def canonical_json(value: JsonValue) -> bytes: ...
+def raw_file_digest(data: bytes) -> str: ...
+def validate_git_object_id(value: str) -> str: ...
+def validate_source_digest(value: str) -> str: ...
+def validate_executable_digest(value: str) -> str: ...
+def invoke_core(request: CoreRequest, *, timeout_ms: int = 120_000) -> CoreResponse: ...
+```
+
+`CoreRequest` is a closed typed object containing `argv: tuple[str, ...]`, `cwd: Path`, `expected_source_digest: str`, `expected_core_identity: str`, and `timeout_ms: int`; `CoreResponse` is a closed typed object containing `returncode: int`, `stdout: bytes`, `stderr: bytes`, `elapsed_ms: int`, and `readback: Mapping[str, object]`. `invoke_core` uses `MAX_STDOUT_BYTES = 1_048_576`, `MAX_STDERR_BYTES = 262_144`, a default timeout of 120,000 ms, and a 5,000 ms process-group termination grace period. Exceeding either output limit maps to `OUTPUT_LIMIT`; timeout maps to `TIMEOUT`; signal termination maps to `INTERRUPTED`; nonzero exit maps to `CORE_EXIT`; malformed expected JSON maps to `MALFORMED_RESPONSE`; failed expected-file read-back maps to `READBACK_FAILED`; provenance mismatch maps to `PROVENANCE_MISMATCH`; path/environment rejection maps to `INVALID_REQUEST`; and lock failures map to `LOCK_UNAVAILABLE`. These mappings are closed and do not infer workflow outcomes.
+
+The subprocess environment is exactly the generated allowlist `PATH`, `HOME`, `TMPDIR`, `LANG`, `LC_ALL`, `LC_CTYPE`, `PYTHONIOENCODING`, `GIT_CONFIG_NOSYSTEM`, `GIT_CONFIG_GLOBAL`, `GIT_OPTIONAL_LOCKS`, and `GIT_TERMINAL_PROMPT`; values are supplied by the caller or fixed to `UTF-8`, `1`, `/dev/null`, `0`, and `0` as applicable. `PI_*`, provider credentials, ambient Git overrides, `PYTHONPATH`, `NODE_OPTIONS`, and all other inherited names are removed. stdin is closed, shell execution is disabled, and stdout/stderr are captured as bytes before UTF-8 decoding for diagnostics.
+
+Its owner must land a focused test module covering closed-field rejection, omit-vs-null, canonical digest vectors, full-40-hex Git IDs, source/executable digest separation, the concrete limits/defaults/error mappings, timeout/nonzero/malformed-output/read-back failures, environment stripping, and provenance refusal. The campaign integrator freezes this API, constants, and test vectors in the prerequisite commit, then M02 owns only Memory implementation, M03 only context assembly, M04 only provider/ledger, and M05 only Pi registration. Changes after freeze require a new ADR revision and serialized migration; consumers cannot silently fork or broaden the protocol.
 
 ## 7. Pi package and extension (M05)
 
@@ -144,13 +171,21 @@ The exact provider request is:
 }
 ```
 
-The provider response schemas are:
+The provider response schemas are closed. Launch and collect are:
 
 ```json
 {"schema_version":1,"ok":true,"request_id":"exec-...","result":{"handle":{"provider_id":"herdr","handle_id":"...","request_digest":"sha256:...","attempt_id":"att-..."},"capability_report_digest":"sha256:..."}}
-{"schema_version":1,"ok":true,"request_id":"exec-...","result":{"status":"STARTING|ACTIVE|SETTLED|STOPPING|TERMINATED|UNKNOWN","observed_at":"...Z","source":"herdr|pi|process","workspace_id":"...","pane_id":"..."}}
-{"schema_version":1,"ok":true,"request_id":"exec-...","result":{"attempt_id":"att-...","termination":"SUCCEEDED|FAILED|INTERRUPTED|TIMED_OUT|UNKNOWN","runtime_identity":"...","artifact_refs":[{"kind":"stdout|stderr|session|event","digest":"sha256:...","bytes":123}],"exit_code":0,"cleanup":"confirmed|uncertain|not_applicable"}}
+{"schema_version":1,"ok":true,"request_id":"exec-...","result":{"attempt_id":"att-...","termination":"SUCCEEDED|FAILED|INTERRUPTED|TIMED_OUT|UNKNOWN","runtime_identity":"...","artifact_refs":[{"kind":"stdout|stderr|session|event","digest_domain":"raw_file","digest":"sha256:...","bytes":123}],"exit_code":0,"cleanup":"confirmed|uncertain|not_applicable"}}
 ```
+
+A status response has exactly one of these variants, with no null fields:
+
+```json
+{"schema_version":1,"ok":true,"request_id":"exec-...","result":{"status":"STARTING|ACTIVE|SETTLED|STOPPING|TERMINATED|UNKNOWN","observed_at":"...Z","source":"pi|process"}}
+{"schema_version":1,"ok":true,"request_id":"exec-...","result":{"status":"STARTING|ACTIVE|SETTLED|STOPPING|TERMINATED|UNKNOWN","observed_at":"...Z","source":"herdr","workspace_id":"...","tab_id":"...","pane_id":"..."}}
+```
+
+The first is the closed standalone variant and forbids all Herdr identity fields. The second is the closed Herdr variant and requires all three identities. `workspace_id`, `tab_id`, and `pane_id` are never emitted as null.
 
 The provider operation schemas are also fixed. `probe` accepts `{schema_version, request_id, required_capabilities, runtime}` and returns `{schema_version, ok:true, request_id, result:{provider_id, runtime_identity, capabilities:[<capability enum>], report_digest}}`; `capabilities` may contain only `fresh_context`, `saved_session`, `neutral_instructions`, `working_directory`, `environment_policy`, `bounded_time`, `bounded_output`, `stream_capture`, `interrupt`, `tool_policy_observation`, and `runtime_identity`. `launch` accepts the request above and returns the handle response above. `inspect` accepts `{schema_version, request_id, handle}` and returns the status response above. `collect` accepts `{schema_version, request_id, handle}` and returns the result response above. `interrupt` accepts `{schema_version, request_id, handle, reason:"cancel|timeout|policy_violation"}` and returns `{schema_version:1,ok:true,request_id,result:{attempt_id,requested:true,observed:"SETTLED|STOPPING|TERMINATED|UNKNOWN",cleanup:"confirmed|uncertain|not_applicable"}}`.
 
@@ -160,23 +195,20 @@ Provider failure codes are exactly `INVALID_REQUEST`, `UNSUPPORTED_CAPABILITY`, 
 
 ## 9. Attempt ledger (M04)
 
-M04 owns `.razr/attempts.jsonl` and `.razr/attempts.lock`, separate from `state.yaml`. Attempt records are closed. Required fields are `schema_version`, `attempt_id`, `work_id`, `node_id`, `observed_generation`, `observed_ordinal`, `worker_id`, `branch`, `worktree`, `allowance_id`, `provider_id`, `started_at`, `outcome`, `request_digest`, `prev_digest`, and `record_digest`. Optional fields are `herdr`, `finished_at`, and `evidence_refs`; no other fields are allowed. `herdr` requires all three IDs when present; `evidence_refs` entries require `digest` and `kind`. Optional fields are omitted until known, never emitted as `null`; `null` is forbidden. `finished_at` is required when `outcome` is terminal. `outcome` is exactly `SUCCEEDED|FAILED|INTERRUPTED|TIMED_OUT|UNKNOWN`.
+M04 chooses an append-only event ledger, not a mutable record and not a terminal-only record. `.razr/attempts.jsonl` contains exactly two closed event variants: one `STARTED` event and one `SETTLED` event per `attempt_id`.
 
-Each line has exactly:
+A STARTED event requires `schema_version`, `event`, `attempt_id`, `work_id`, `node_id`, `observed_generation`, `observed_ordinal`, `worker_id`, `branch`, `worktree`, `allowance_id`, `provider_id`, `started_at`, `request_digest`, `prev_digest`, and `record_digest`. It optionally has `herdr`; when present, `herdr` requires `workspace_id`, `tab_id`, and `pane_id`. No other fields are allowed, and optional `herdr` is omitted rather than null.
+
+A SETTLED event requires `schema_version`, `event`, `attempt_id`, `work_id`, `node_id`, `observed_generation`, `observed_ordinal`, `provider_id`, `settled_at`, `outcome`, `request_digest`, `evidence_refs`, `prev_digest`, and `record_digest`. It optionally has `herdr`, `exit_code`, and `cleanup`; when present, `herdr` requires all three IDs, `exit_code` is an integer, and `cleanup` is `confirmed|uncertain|not_applicable`. `evidence_refs` is an array whose entries require `digest_domain`, `digest`, and `kind`; provider artifacts use `raw_file` and request/report identities use `canonical_json`. No other fields are allowed, and absent optional fields are omitted rather than null. `event` is exactly `STARTED|SETTLED`; `outcome` is exactly `SUCCEEDED|FAILED|INTERRUPTED|TIMED_OUT|UNKNOWN`.
+
+Each event has exactly this shape, with the event-specific required fields above:
 
 ```json
-{
-  "schema_version":1,"attempt_id":"att-...","work_id":"...","node_id":"...",
-  "observed_generation":12,"observed_ordinal":2,"worker_id":"...",
-  "herdr":{"workspace_id":"...","tab_id":"...","pane_id":"..."},
-  "branch":"...","worktree":"...","allowance_id":"...","provider_id":"herdr",
-  "started_at":"...Z","finished_at":"...Z","outcome":"SUCCEEDED|FAILED|INTERRUPTED|TIMED_OUT|UNKNOWN",
-  "request_digest":"sha256:...","evidence_refs":[{"digest":"sha256:...","kind":"..."}],
-  "prev_digest":"sha256:...","record_digest":"sha256:..."
-}
+{"schema_version":1,"event":"STARTED","attempt_id":"att-...","work_id":"...","node_id":"...","observed_generation":12,"observed_ordinal":2,"worker_id":"...","branch":"...","worktree":"...","allowance_id":"...","provider_id":"herdr","started_at":"...Z","request_digest":"sha256:...","herdr":{"workspace_id":"...","tab_id":"...","pane_id":"..."},"prev_digest":"sha256:...","record_digest":"sha256:..."}
+{"schema_version":1,"event":"SETTLED","attempt_id":"att-...","work_id":"...","node_id":"...","observed_generation":12,"observed_ordinal":2,"provider_id":"herdr","settled_at":"...Z","outcome":"SUCCEEDED|FAILED|INTERRUPTED|TIMED_OUT|UNKNOWN","request_digest":"sha256:...","evidence_refs":[{"digest_domain":"raw_file","digest":"sha256:...","kind":"..."}],"cleanup":"confirmed","prev_digest":"sha256:...","record_digest":"sha256:..."}
 ```
 
-`herdr`, `finished_at`, and `evidence_refs` are omitted until known; an attempt is immutable thereafter. `record_digest` is the canonical-JSON digest of the complete record with `record_digest` omitted, including `prev_digest`; it does not use raw-file, source-tree, executable, or Git-object serialization. Append uses the same sibling-lock `flock`, `O_APPEND`, one complete line, `fsync`, and hash-chain verification as Memory. A writer validates the full chain while holding the lock; duplicate `attempt_id`, reused allowance/session, broken `prev_digest`, partial line, or failed fsync returns `LEDGER_CORRUPT`, `DUPLICATE_ATTEMPT`, `ALLOWANCE_REUSED`, or `LOCK_UNAVAILABLE` and does not append. There is no in-place repair; recovery records `UNKNOWN` with a new attempt only under explicit authority. The ledger references core generation/state but cannot change it.
+Events are ordered by append position and form one global hash chain. A STARTED event must be the first event for its attempt; exactly one SETTLED event must follow it; no event may follow SETTLED; `SETTLED.request_digest`, work/node identity, observed generation/ordinal, and provider must equal STARTED; and a SETTLED event is not written until the provider result is collected. `record_digest` is the canonical-JSON digest of the complete event with `record_digest` omitted, including `prev_digest`; it does not use raw-file, source-tree, executable, or Git-object serialization. Append takes the sibling exclusive `flock`, validates the full chain and per-attempt ordering while holding the lock, writes one complete line with `O_APPEND`, calls `fsync`, then releases the lock. Broken chains, partial lines, duplicate STARTED/SETTLED events, settlement without STARTED, reused allowance/session, or failed fsync return `LEDGER_CORRUPT`, `DUPLICATE_ATTEMPT`, `INVALID_ORDER`, `ALLOWANCE_REUSED`, or `LOCK_UNAVAILABLE` and do not append. There is no in-place repair; an interrupted dispatch is settled as `UNKNOWN` only from retained evidence under explicit authority, and a retry uses a new attempt ID and STARTED event.
 
 ## 10. Legacy classification and migration ownership
 
@@ -184,7 +216,7 @@ Each line has exactly:
 - **Temporary compatibility shims:** `scripts/contract-preflight.py` and `scripts/named-regressions.py`. Owner: M05/package maintainers. Removal gate: M02–M05 replacement callers, equivalent refusal/identity tests, documented migration notes, and one clean-source full-suite run on the replacement path; no removal before a separately reviewed campaign commit.
 - **Excluded/retired:** historical workshop/lab helpers, critic launchers, recovery dispatchers, scheduler/fleet code, PR factory, Project Brain/Obsidian integrations, and any direct lifecycle-state writer. They are not imported, packaged, or compatibility targets.
 
-M02 owns Memory only; M03 owns context only; M04 owns Herdr/provider and attempts only; M05 owns Pi packaging/registration only. Shared JSON rules above are frozen for these missions. Interface changes require an ADR revision and serialized review before parallel implementation.
+The dependency graph is `foundation (campaign integrator) -> M02 Memory`, `foundation -> M04 Herdr/provider+attempts`, `foundation -> M05 Pi registration`, and `M02 -> M03 context`; M05 also consumes the frozen M02/M03/M04 public interfaces. No M02–M05 implementation may start in parallel before the foundation prerequisite commit and tests are reviewed; M03 cannot start before M02, and M05 cannot register consumers before their interface owners freeze them. M02 owns Memory only; M03 owns context only; M04 owns Herdr/provider and attempts only; M05 owns Pi packaging/registration only. Shared JSON rules above are frozen for these missions. Interface changes require an ADR revision and serialized review before parallel implementation.
 
 ## 11. Non-goals
 
