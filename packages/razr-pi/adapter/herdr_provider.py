@@ -419,22 +419,32 @@ class HerdrProvider:
         report["report_digest"] = raw_file_digest(canonical_json(report))
         return {"schema_version": 1, "ok": True, "request_id": request_id, "result": report}
 
+    def _parse_worktree_response(self, response: Mapping[str, object], expected_path: Path | None) -> dict[str, object]:
+        result = _closed(response["result"], {"root_pane", "tab", "type", "workspace", "worktree"}, "worktree result")
+        root_pane = _closed(result["root_pane"], {"agent_status", "cwd", "focused", "foreground_cwd", "pane_id", "revision", "scroll", "tab_id", "terminal_id", "workspace_id"}, "root pane")
+        _closed(root_pane["scroll"], {"max_offset_from_bottom", "offset_from_bottom", "viewport_rows"}, "pane scroll")
+        tab = _closed(result["tab"], {"agent_status", "focused", "label", "number", "pane_count", "tab_id", "workspace_id"}, "worktree tab")
+        workspace = _closed(result["workspace"], {"active_tab_id", "agent_status", "focused", "label", "number", "pane_count", "tab_count", "workspace_id", "worktree"}, "workspace")
+        workspace_worktree = _closed(workspace["worktree"], {"checkout_path", "is_linked_worktree", "repo_key", "repo_name", "repo_root"}, "workspace worktree")
+        worktree = _closed(result["worktree"], {"branch", "is_bare", "is_detached", "is_linked_worktree", "is_prunable", "label", "open_workspace_id", "path"}, "worktree")
+        for name, item in (("root workspace", root_pane["workspace_id"]), ("tab workspace", tab["workspace_id"]), ("workspace", workspace["workspace_id"]), ("worktree workspace", worktree["open_workspace_id"])): _id(item, name)
+        for name, item in (("tab_id", root_pane["tab_id"]), ("pane_id", root_pane["pane_id"]), ("active_tab_id", workspace["active_tab_id"]), ("tab tab_id", tab["tab_id"])): _id(item, name)
+        if not (root_pane["workspace_id"] == tab["workspace_id"] == workspace["workspace_id"] == worktree["open_workspace_id"]): raise _fail("IDENTITY_MISMATCH", "nested workspace identities conflict")
+        if root_pane["tab_id"] != tab["tab_id"] or workspace["active_tab_id"] != tab["tab_id"]: raise _fail("IDENTITY_MISMATCH", "nested tab identities conflict")
+        path = _canonical_dir(worktree["path"], "worktree path")
+        if expected_path is not None and path != expected_path: raise _fail("IDENTITY_MISMATCH", "worktree path differs")
+        return {"workspace_id": workspace["workspace_id"], "tab_id": root_pane["tab_id"], "pane_id": root_pane["pane_id"], "path": str(path)}
+
     def worktree_create(self, *, cwd: str, branch: str, base: str, label: str) -> dict[str, object]:
         root = _canonical_dir(cwd, "cwd"); _branch(branch, "branch"); _branch(base, "base"); _id(label, "label")
         response = _envelope(self._exec([self.herdr, "worktree", "create", "--cwd", str(root), "--branch", branch, "--base", base, "--label", label, "--no-focus"], timeout_ms=120_000), "worktree")
-        result = response["result"]
-        if not isinstance(result, dict) or not all(key in result for key in ("workspace_id", "tab_id", "pane_id", "path")): raise _fail("HERDR_IDENTITY_INCOMPLETE", "worktree response lacks workspace identity")
-        _id(result["workspace_id"], "workspace_id"); _id(result["tab_id"], "tab_id"); _id(result["pane_id"], "pane_id"); _canonical_dir(result["path"], "worktree path")
-        return response
+        normalized = self._parse_worktree_response(response, None)
+        return {**response, "result": normalized}
 
     def worktree_open(self, *, path: str) -> dict[str, object]:
         root = _canonical_dir(path, "worktree")
         response = _envelope(self._exec([self.herdr, "worktree", "open", "--path", str(root), "--no-focus"], timeout_ms=120_000), "worktree")
-        result = response["result"]
-        if not isinstance(result, dict) or not all(key in result for key in ("workspace_id", "tab_id", "pane_id", "path")): raise _fail("HERDR_IDENTITY_INCOMPLETE", "open response lacks workspace identity")
-        if _canonical_dir(result["path"], "worktree path") != root: raise _fail("IDENTITY_MISMATCH", "opened path differs")
-        for key in ("workspace_id", "tab_id", "pane_id"): _id(result[key], key)
-        return response
+        return {**response, "result": self._parse_worktree_response(response, root)}
 
     def _verify_candidate(self, request: ProviderRequest) -> None:
         value = request.value

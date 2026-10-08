@@ -30,6 +30,21 @@ class HerdrProviderTests(unittest.TestCase):
                 HerdrProvider().probe({"schema_version": 1, "request_id": "probe-1", "required_capabilities": [], "runtime": {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "thinking": "medium"}})
         self.assertEqual(caught.exception.code, "FANOUT_UNAVAILABLE")
 
+    def test_nested_worktree_create_open_shape_and_identity_conflicts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve(); checkout = root / "checkout"; checkout.mkdir()
+            fixture = {"id": "cli:worktree:create", "result": {"root_pane": {"agent_status": "unknown", "cwd": str(checkout), "focused": False, "foreground_cwd": str(checkout), "pane_id": "wP:p1", "revision": 0, "scroll": {"max_offset_from_bottom": 0, "offset_from_bottom": 0, "viewport_rows": 29}, "tab_id": "wP:t1", "terminal_id": "term_1", "workspace_id": "wP"}, "tab": {"agent_status": "unknown", "focused": False, "label": "1", "number": 1, "pane_count": 1, "tab_id": "wP:t1", "workspace_id": "wP"}, "type": "worktree_created", "workspace": {"active_tab_id": "wP:t1", "agent_status": "unknown", "focused": False, "label": "shape-test", "number": 1, "pane_count": 1, "tab_count": 1, "workspace_id": "wP", "worktree": {"checkout_path": str(checkout), "is_linked_worktree": True, "repo_key": str(root / ".git"), "repo_name": "repo", "repo_root": str(root)}}, "worktree": {"branch": "shape-test", "is_bare": False, "is_detached": False, "is_linked_worktree": True, "is_prunable": False, "label": "repo", "open_workspace_id": "wP", "path": str(checkout)}}}
+            provider = HerdrProvider()
+            with patch.object(provider, "_exec", return_value=json.dumps(fixture).encode()):
+                normalized = provider.worktree_create(cwd=str(root), branch="shape-test", base="main", label="shape-test")["result"]
+                opened = provider.worktree_open(path=str(checkout))["result"]
+            self.assertEqual(normalized, {"workspace_id": "wP", "tab_id": "wP:t1", "pane_id": "wP:p1", "path": str(checkout)})
+            self.assertEqual(opened, normalized)
+            conflict = json.loads(json.dumps(fixture)); conflict["result"]["workspace"]["workspace_id"] = "other"
+            with patch.object(provider, "_exec", return_value=json.dumps(conflict).encode()):
+                with self.assertRaises(ProtocolError) as caught: provider.worktree_open(path=str(checkout))
+            self.assertEqual(caught.exception.code, "IDENTITY_MISMATCH")
+
     def test_model_probe_requires_unambiguous_structured_table(self):
         cases = [
             b"openai-codex gpt-5.6-luna\n",
@@ -113,7 +128,7 @@ class HerdrProviderTests(unittest.TestCase):
                     result = {"status": "SETTLED", "workspace_id": "w", "tab_id": "t", "pane_id": "p", "observed_at": "2026-01-01T00:00:00Z", "source": "herdr"}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "get", "result": result}).encode(), b"")
                 if argv[:3] == ["herdr", "worktree", "open"]:
-                    result = {"workspace_id": "w", "tab_id": "t", "pane_id": "p", "path": str(worktree)}
+                    result = {"root_pane": {"agent_status": "unknown", "cwd": str(worktree), "focused": False, "foreground_cwd": str(worktree), "pane_id": "p", "revision": 0, "scroll": {"max_offset_from_bottom": 0, "offset_from_bottom": 0, "viewport_rows": 29}, "tab_id": "t", "terminal_id": "term", "workspace_id": "w"}, "tab": {"agent_status": "unknown", "focused": False, "label": "1", "number": 1, "pane_count": 1, "tab_id": "t", "workspace_id": "w"}, "type": "worktree_opened", "workspace": {"active_tab_id": "t", "agent_status": "unknown", "focused": False, "label": "worktree", "number": 1, "pane_count": 1, "tab_count": 1, "workspace_id": "w", "worktree": {"checkout_path": str(worktree), "is_linked_worktree": False, "repo_key": str(worktree / ".git"), "repo_name": "repo", "repo_root": str(worktree)}}, "worktree": {"branch": "feature/x", "is_bare": False, "is_detached": False, "is_linked_worktree": False, "is_prunable": False, "label": "worktree", "open_workspace_id": "w", "path": str(worktree)}}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "open", "result": result}).encode(), b"")
                 if argv[:3] == ["herdr", "pane", "get"]:
                     result = {"cwd": str(worktree), "agent_id": "agent-1"}
