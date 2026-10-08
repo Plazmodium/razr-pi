@@ -230,7 +230,7 @@ def check(root):
                 for node in ast.walk(tree):
                     imports = ([alias.name for alias in node.names] if isinstance(node, ast.Import)
                                else [node.module or ''] if isinstance(node, ast.ImportFrom) else [])
-                    require(all(module.startswith('.') or module == 'protocol' or module.split('.')[0] in sys.stdlib_module_names for module in imports),
+                    require(all(module.startswith('.') or module in {'protocol', 'core_subprocess'} or module.split('.')[0] in sys.stdlib_module_names for module in imports),
                             'non-standard static package import: ' + name)
         elif name.endswith('.json'):
             json.loads(text)

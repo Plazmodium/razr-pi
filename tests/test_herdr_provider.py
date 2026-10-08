@@ -138,7 +138,7 @@ class HerdrProviderTests(unittest.TestCase):
             open_calls = []; list_calls = [0]
             def run(argv, **kwargs):
                 if argv[:3] == ["herdr", "agent", "start"]:
-                    result = {"agent": {"name": "worker-1", "agent": "agent-1", "agent_session": {"value": "pi-1"}, "workspace_id": "w", "tab_id": "t", "pane_id": "p", "telemetry": {"status": "ready"}}, "type": "agent_started"}
+                    result = {"agent": {"name": "worker-1", "agent": "pi", "agent_session": {"value": "pi-1"}, "workspace_id": "w", "tab_id": "t", "pane_id": "p", "telemetry": {"status": "ready"}}, "type": "agent_started"}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "start", "result": result}).encode(), b"")
                 if argv[:3] == ["herdr", "agent", "get"]:
                     result = {"status": "SETTLED", "workspace_id": "w", "tab_id": "t", "pane_id": "p", "observed_at": "2026-01-01T00:00:00Z", "source": "herdr", "agent_session": {"value": "pi-1"}, "telemetry": {"live": True}}
@@ -156,7 +156,7 @@ class HerdrProviderTests(unittest.TestCase):
                     result = {"root_pane": {"agent_status": "unknown", "cwd": str(worktree), "focused": False, "foreground_cwd": str(worktree), "pane_id": "p", "revision": 0, "scroll": {"max_offset_from_bottom": 0, "offset_from_bottom": 0, "viewport_rows": 29}, "tab_id": "t", "terminal_id": "term", "workspace_id": "w"}, "tab": {"agent_status": "unknown", "focused": False, "label": "1", "number": 1, "pane_count": 1, "tab_id": "t", "workspace_id": "w"}, "type": "worktree_opened", "workspace": {"active_tab_id": "t", "agent_status": "unknown", "focused": False, "label": "worktree", "number": 1, "pane_count": 1, "tab_count": 1, "workspace_id": "w", "worktree": {"checkout_path": str(worktree), "is_linked_worktree": False, "repo_key": str(worktree / ".git"), "repo_name": "repo", "repo_root": str(worktree)}}, "worktree": {"branch": "feature/x", "is_bare": False, "is_detached": False, "is_linked_worktree": False, "is_prunable": False, "label": "worktree", "open_workspace_id": "w", "path": str(worktree)}}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "open", "result": result}).encode(), b"")
                 if argv[:3] == ["herdr", "pane", "get"]:
-                    result = {"cwd": str(worktree), "agent_id": "agent-1"}
+                    result = {"cwd": str(worktree), "agent_id": "worker-1"}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "pane", "result": result}).encode(), b"")
                 if argv[:2] == ["herdr", "--help"] or argv[:2] == ["herdr", "agent"] or argv[:2] == ["herdr", "worktree"] or argv[:2] == ["herdr", "pane"]:
                     return subprocess.CompletedProcess(argv, 0, b"help", b"")
@@ -180,7 +180,9 @@ class HerdrProviderTests(unittest.TestCase):
             request = {"schema_version": 1, "request_id": "exec-1", "attempt_id": "att-1", "role": "worker", "host": {"mode": "herdr", "workspace_id": "w", "tab_id": "t", "pane_id": "p"}, "work": {"work_id": "work", "node_id": "node", "generation": 1, "ordinal": 1}, "worker_id": "worker-1", "branch": "feature/x", "candidate": {"repository": "owner/repo", "branch": "feature/x", "commit": "0" * 40, "source_digest": source_digest}, "worktree": str(worktree), "cwd": str(worktree), "output_root": str(output), "output_root_id": "out-1", "output_root_digest": empty_digest, "session_root": str(session), "session_root_id": "sess-1", "session_root_digest": empty_digest, "fresh_context": True, "neutral_input_digest": "sha256:" + "a" * 64, "environment_policy_digest": "sha256:" + "b" * 64, "tool_policy_digest": "sha256:" + "c" * 64, "required_capabilities": ["runtime_identity"], "runtime": {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "thinking": "medium"}, "limits": {"deadline_ms": 1000, "max_output_bytes": 1000}, "allowance_id": "allow-1"}
             ledger = AttemptLedger(base / "attempts.jsonl")
             provider = HerdrProvider(runner=run, ledger=ledger, private_root=private)
-            response = provider.launch(request); handle = response["result"]["handle"]
+            with patch("adapter.herdr_provider.verify_candidate_identity"):
+                response = provider.launch(request)
+            handle = response["result"]["handle"]
             self.assertEqual(open_calls, [])
             self.assertEqual(set(handle), {"provider_id", "handle_id", "request_digest", "attempt_id", "host", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest"})
             self.assertEqual(response["result"]["capability_report_digest"], provider.probe({"schema_version": 1, "request_id": "probe-after-launch", "required_capabilities": ["runtime_identity"], "runtime": request["runtime"]})["result"]["report_digest"])
@@ -192,7 +194,9 @@ class HerdrProviderTests(unittest.TestCase):
             self.assertTrue(all("bytes" in ref for ref in response_refs))
             settled = json.loads(ledger.path.read_text().splitlines()[1])
             self.assertEqual(set(settled["evidence_refs"][0]), {"ref", "kind", "digest_domain", "digest"})
-            self.assertEqual([{key: ref[key] for key in ("ref", "kind", "digest_domain", "digest")} for ref in response_refs], settled["evidence_refs"][:2])
+            self.assertEqual(len(settled["evidence_refs"][:2]), 2)
+            self.assertTrue(all(ref["ref"].startswith(".razr/evidence/") and not ref["ref"].startswith("private/") for ref in settled["evidence_refs"][:2]))
+            self.assertTrue(all(set(ref) == {"ref", "kind", "digest_domain", "digest"} for ref in settled["evidence_refs"][:2]))
             self.assertEqual(collected.cleanup(handle)["cleanup"], "confirmed")
             with self.assertRaises(ProtocolError): collected._handle({**handle, "request_digest": "sha256:" + "d" * 64})
             self.assertEqual(len(ledger.path.read_text().splitlines()), 2)

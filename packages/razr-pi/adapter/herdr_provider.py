@@ -9,7 +9,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
-import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -19,6 +18,7 @@ import shutil
 from typing import Callable, Mapping, Sequence
 
 from .protocol import ERROR_CODES, ProtocolError, canonical_json, raw_file_digest
+from .core_subprocess import verify_candidate_identity
 
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
@@ -240,7 +240,10 @@ class AttemptLedger:
 
     def append(self, event: Mapping[str, object]) -> dict[str, object]:
         import copy
-        event = self._replay_validate(copy.deepcopy(dict(event)))
+        event = copy.deepcopy(dict(event))
+        if not isinstance(event, dict) or event.get("schema_version") != 1 or event.get("event") not in {"STARTED", "SETTLED"}:
+            raise _fail("LEDGER_CORRUPT", "invalid attempt event")
+        event.pop("prev_digest", None); event.pop("record_digest", None)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a+", encoding="utf-8") as stream:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
@@ -251,9 +254,11 @@ class AttemptLedger:
                 except json.JSONDecodeError as exc: raise _fail("LEDGER_CORRUPT", "malformed ledger JSON") from exc
                 records.append(self._replay_validate(row))
             previous = records[-1]["record_digest"] if records else "sha256:" + "0" * 64
+            event["prev_digest"] = previous
+            event["record_digest"] = raw_file_digest(canonical_json(event))
+            event = self._replay_validate(event)
             same = [row for row in records if row["attempt_id"] == event["attempt_id"]]
             if event["event"] == "STARTED" and same: raise _fail("DUPLICATE_ATTEMPT", "duplicate STARTED")
-            if event["prev_digest"] != previous: raise _fail("LEDGER_CORRUPT", "broken global digest chain")
             if event["event"] == "SETTLED" and (len(same) != 1 or same[0]["event"] != "STARTED"):
                 raise _fail("INVALID_ORDER", "SETTLED requires one prior STARTED")
             if event["event"] == "SETTLED":
@@ -491,21 +496,7 @@ class HerdrProvider:
         if any(opened[key] != value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")):
             raise _fail("IDENTITY_MISMATCH", "dedicated worktree workspace differs from request host")
         root = _canonical_dir(value["worktree"], "worktree")
-        branch = self._exec(["git", "-C", str(root), "symbolic-ref", "--quiet", "--short", "HEAD"], timeout_ms=10_000).decode().strip()
-        head = self._exec(["git", "-C", str(root), "rev-parse", "HEAD"], timeout_ms=10_000).decode().strip()
-        if branch != value["candidate"]["branch"] or head != value["candidate"]["commit"]:
-            raise _fail("CANDIDATE_CHANGED", "worktree branch or HEAD differs from candidate")
-        work_prefix = b".razr/work/"
-        try:
-            config = json.loads((root / "razr.yaml").read_text(encoding="utf-8"))
-            configured = config.get("work_root", ".razr/work") if isinstance(config, dict) else ".razr/work"
-            if isinstance(configured, str): work_prefix = configured.rstrip("/").encode() + b"/"
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            pass
-        listing = self._exec(["git", "-C", str(root), "ls-tree", "-r", "-z", "--full-tree", "HEAD"], timeout_ms=10_000)
-        digest_input = b"".join(row + b"\0" for row in listing.split(b"\0") if row and b"\t" in row and row.split(b"\t", 1)[1] not in {b"razr.yaml", b"AGENTS.md"} and not row.split(b"\t", 1)[1].startswith(work_prefix))
-        if "sha256:" + hashlib.sha256(digest_input).hexdigest() != value["candidate"]["source_digest"]:
-            raise _fail("CANDIDATE_CHANGED", "worktree source digest differs from candidate")
+        verify_candidate_identity(root, branch=value["candidate"]["branch"], commit=value["candidate"]["commit"], source_digest=value["candidate"]["source_digest"])
 
     def _claim_roots(self, request: ProviderRequest, capability_report_digest: str) -> None:
         values = request.value
@@ -539,6 +530,14 @@ class HerdrProvider:
         return {"candidate": {"ref": str(candidate_path.relative_to(_canonical_dir(values["worktree"], "worktree"))), "digest_domain": "canonical_json", "digest": raw_file_digest(candidate_bytes)},
                 "packet": {"ref": str(packet_path.relative_to(_canonical_dir(values["worktree"], "worktree"))), "digest_domain": "canonical_json", "digest": raw_file_digest(packet_bytes)}, "request_digest": packet["request_digest"], "capability_report_digest": capability_report_digest}
 
+    def _release_unlaunched_claims(self, value: Mapping[str, object]) -> None:
+        for root_key, id_key in (("output_root", "output_root_id"), ("session_root", "session_root_id")):
+            try:
+                root = _canonical_dir(value[root_key], root_key); marker = root / ".razr-herdr-root.json"
+                if marker.is_file() and json.loads(marker.read_text(encoding="utf-8")).get("root_id") == value[id_key]: marker.unlink()
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ProtocolError):
+                continue
+
     def launch(self, request: Mapping[str, object]) -> dict[str, object]:
         parsed = ProviderRequest(request)
         probe_report = self.probe({"schema_version": 1, "request_id": request["request_id"], "required_capabilities": request["required_capabilities"], "runtime": request["runtime"]})
@@ -555,10 +554,11 @@ class HerdrProvider:
         # The ledger computes no authority: this is a durable observation only.
         # Its predecessor is supplied by the ledger caller/chain; STARTED must
         # be appended before the provider launch below.
-        records = self.ledger.path.read_text(encoding="utf-8").splitlines() if self.ledger.path.exists() else []
-        if records:
-            started["prev_digest"] = json.loads(records[-1])["record_digest"]
-        started["record_digest"] = raw_file_digest(canonical_json(started)); self.ledger.append(started)
+        try:
+            started = self.ledger.append(started)
+        except ProtocolError:
+            self._release_unlaunched_claims(value)
+            raise
         self._attempt_paths[value["attempt_id"]] = _canonical_dir(value["worktree"], "worktree")
         self._attempt_sessions[value["attempt_id"]] = _canonical_dir(value["session_root"], "session_root")
         self._attempt_roots[value["attempt_id"]] = (_canonical_dir(value["output_root"], "output_root"), _canonical_dir(value["session_root"], "session_root"))
@@ -570,7 +570,7 @@ class HerdrProvider:
             fd = os.open(failure, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as stream: stream.write(data); stream.write(b"\n"); stream.flush(); os.fsync(stream.fileno())
             settled = {key: started[key] for key in ("schema_version", "attempt_id", "work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "worktree_ref", "branch", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest", "herdr")}
-            settled.update({"event": "SETTLED", "settled_at": _now(), "outcome": "FAILED", "evidence_refs": [{"ref": str(failure.relative_to(_canonical_dir(value["worktree"], "worktree"))), "digest_domain": "raw_file", "digest": raw_file_digest(data + b"\n"), "kind": "launch_failure", "error_code": exc.code}], "prev_digest": started["record_digest"], "cleanup": "not_applicable"})
+            settled.update({"event": "SETTLED", "settled_at": _now(), "outcome": "UNKNOWN" if exc.code == "TIMEOUT" else "FAILED", "evidence_refs": [{"ref": str(failure.relative_to(_canonical_dir(value["worktree"], "worktree"))), "digest_domain": "raw_file", "digest": raw_file_digest(data + b"\n"), "kind": "launch_failure", "error_code": exc.code}], "prev_digest": started["record_digest"], "cleanup": "not_applicable"})
             settled["record_digest"] = raw_file_digest(canonical_json(settled)); self.ledger.append(settled)
             raise
         try:
@@ -583,7 +583,7 @@ class HerdrProvider:
                 raise _fail("IDENTITY_MISMATCH", "agent name is missing")
             for key in ("workspace_id", "tab_id", "pane_id"):
                 if not isinstance(agent.get(key), str) or agent[key] != value["host"][key]: raise _fail("IDENTITY_MISMATCH", "agent host identity differs")
-            agent_id = agent.get("agent_id", agent.get("agent", value["worker_id"]))
+            agent_id = agent["name"] if "name" in agent else agent["agent"]
             _id(agent_id, "agent_id")
             session_value = agent.get("agent_session", result.get("agent_session"))
             if isinstance(session_value, dict): session_value = session_value.get("value")
@@ -621,6 +621,15 @@ class HerdrProvider:
         except ProtocolError as exc:
             self._settle({"attempt_id": value["attempt_id"]}, "UNKNOWN", cleanup="uncertain", reason=str(exc))
             raise
+
+    def _public_evidence(self, attempt_id: str, name: str, summary: Mapping[str, object]) -> dict[str, object]:
+        root = self._attempt_paths[attempt_id]; directory = root / ".razr" / "evidence"; directory.mkdir(parents=True, exist_ok=True)
+        data = canonical_json({"schema_version": 1, "attempt_id": attempt_id, "summary": dict(summary)})
+        if len(data) > 65_536: raise _fail("OUTPUT_LIMIT", "sanitized evidence exceeds bound")
+        path = directory / (name + "-" + attempt_id + ".json")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream: stream.write(data); stream.flush(); os.fsync(stream.fileno())
+        return {"ref": str(path.relative_to(root)), "kind": str(summary["kind"]), "digest_domain": "raw_file", "digest": raw_file_digest(data)}
 
     def _settle(self, handle: Mapping[str, object], outcome: str, *, cleanup: str = "not_applicable", reason: str = "", evidence_refs: Sequence[Mapping[str, object]] = (), synthetic: bool = True) -> None:
         if handle["attempt_id"] in self._settled: return
@@ -804,7 +813,7 @@ class HerdrProvider:
             interruption_bytes = canonical_json(interrupt_record)
             fd = os.open(interrupt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as stream: stream.write(interruption_bytes); stream.flush(); os.fsync(stream.fileno())
-            interruption_ref = {"ref": "private/attempt-" + value["attempt_id"] + "/session/interrupt-" + value["attempt_id"] + ".json", "kind": "event", "digest_domain": "raw_file", "digest": raw_file_digest(interruption_bytes)}
+            interruption_ref = self._public_evidence(value["attempt_id"], "interrupt", {"kind": "event", "private_ref": "private/attempt-" + value["attempt_id"] + "/session/interrupt-" + value["attempt_id"] + ".json", "private_digest": raw_file_digest(interruption_bytes)})
             self._settle(value, "INTERRUPTED" if cleanup == "confirmed" else "UNKNOWN", cleanup=cleanup, reason=reason, evidence_refs=[interruption_ref])
             return response
         except ProtocolError as exc:
@@ -812,7 +821,7 @@ class HerdrProvider:
             try:
                 error_bytes = canonical_json(error_record); fd = os.open(interrupt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 with os.fdopen(fd, "wb") as stream: stream.write(error_bytes); stream.flush(); os.fsync(stream.fileno())
-                error_ref = {"ref": "private/attempt-" + value["attempt_id"] + "/session/" + interrupt_path.name, "kind": "event", "digest_domain": "raw_file", "digest": raw_file_digest(error_bytes)}
+                error_ref = self._public_evidence(value["attempt_id"], "interrupt-error", {"kind": "event", "private_ref": "private/attempt-" + value["attempt_id"] + "/session/" + interrupt_path.name, "private_digest": raw_file_digest(error_bytes)})
                 self._settle(value, "UNKNOWN", cleanup="uncertain", reason="interrupt failed", evidence_refs=[error_ref])
             except ProtocolError as settle_exc:
                 if settle_exc.code == "LEDGER_CORRUPT": raise _fail("LEDGER_CORRUPT", "interrupt failure cannot settle") from settle_exc
@@ -842,7 +851,7 @@ class HerdrProvider:
             # termination. Preserve that uncertainty; never consume worker
             # metadata or invent an exit code.
             response_refs = [{"ref": "private/attempt-" + value["attempt_id"] + "/output/" + output_artifact.name, "kind": "stdout", "digest_domain": "raw_file", "digest": raw_file_digest(data), "bytes": len(data)}, {"ref": "private/attempt-" + value["attempt_id"] + "/session/" + status_artifact.name, "kind": "session", "digest_domain": "raw_file", "digest": raw_file_digest(status_bytes), "bytes": len(status_bytes)}]
-            ledger_refs = [{key: ref[key] for key in ("ref", "kind", "digest_domain", "digest")} for ref in response_refs]
+            ledger_refs = [self._public_evidence(value["attempt_id"], "collect-" + ref["kind"], {"kind": ref["kind"], "private_ref": ref["ref"], "private_digest": ref["digest"], "bytes": ref["bytes"]}) for ref in response_refs]
             self._settle(value, "UNKNOWN", reason="Herdr status/read observed; termination UNKNOWN", evidence_refs=ledger_refs)
             return {"schema_version": 1, "ok": True, "request_id": "collect", "result": {"attempt_id": value["attempt_id"], "termination": "UNKNOWN", "runtime_identity": _MODEL + ":medium", "host": value["host"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"], "artifact_refs": response_refs, "cleanup": "not_applicable"}}
         except OSError as exc:
