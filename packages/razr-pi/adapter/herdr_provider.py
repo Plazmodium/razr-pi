@@ -15,6 +15,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import subprocess
+import shutil
 from typing import Callable, Mapping, Sequence
 
 from .protocol import ProtocolError, canonical_json, raw_file_digest
@@ -149,7 +150,7 @@ class AttemptLedger:
                "output_root_id", "output_root_digest", "session_root_id", "session_root_digest",
                "request_digest", "prev_digest", "record_digest"}
     SETTLED = {"schema_version", "event", "attempt_id", "work_id", "node_id", "observed_generation",
-               "observed_ordinal", "provider_id", "worktree_ref", "branch", "settled_at", "candidate",
+               "observed_ordinal", "worker_id", "allowance_id", "provider_id", "worktree_ref", "branch", "settled_at", "candidate",
                "candidate_evidence", "request_packet", "output_root_id", "output_root_digest",
                "session_root_id", "session_root_digest", "outcome", "request_digest", "evidence_refs",
                "prev_digest", "record_digest"}
@@ -239,7 +240,7 @@ class AttemptLedger:
                 raise _fail("INVALID_ORDER", "SETTLED requires one prior STARTED")
             if event["event"] == "SETTLED":
                 started = same[0]
-                for key in ("work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "branch", "worktree_ref", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest"):
+                for key in ("work_id", "node_id", "observed_generation", "observed_ordinal", "worker_id", "allowance_id", "provider_id", "branch", "worktree_ref", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest"):
                     if event.get(key) != started.get(key): raise _fail("IDENTITY_MISMATCH", f"settlement {key} differs")
                 for key in ("herdr", "agent_id", "pi_session_id", "core_identity", "core_state_digest"):
                     if event.get(key) != started.get(key): raise _fail("IDENTITY_MISMATCH", f"settlement {key} differs")
@@ -271,7 +272,8 @@ class ProviderRequest:
         cwd = _canonical_dir(self.value["cwd"], "cwd"); worktree = _canonical_dir(self.value["worktree"], "worktree")
         if cwd != worktree: raise _fail("INVALID_REQUEST", "cwd and worktree must be equal")
         output = _canonical_dir(self.value["output_root"], "output_root"); session = _canonical_dir(self.value["session_root"], "session_root")
-        if output == session: raise _fail("RESOURCE_REUSED", "roots must differ")
+        if output == session or output in session.parents or session in output.parents:
+            raise _fail("RESOURCE_REUSED", "roots must be disjoint and not nested")
         for key in ("output_root_digest", "session_root_digest", "neutral_input_digest", "environment_policy_digest", "tool_policy_digest"): _digest(self.value[key], key)
         caps = self.value["required_capabilities"]
         if not isinstance(caps, list) or any(cap not in _CAPABILITIES for cap in caps): raise _fail("UNSUPPORTED_CAPABILITY", "unsupported capability")
@@ -289,7 +291,12 @@ class HerdrProvider:
     provider_id = "herdr"
 
     def __init__(self, *, runner: Callable[..., subprocess.CompletedProcess[bytes]] | None = None, herdr: str = "herdr", pi: str = "pi", ledger: AttemptLedger | None = None) -> None:
-        self.herdr, self.pi, self._runner, self.ledger = herdr, pi, runner or subprocess.run, ledger
+        self._runner = runner or subprocess.run
+        self.herdr, self.pi = herdr, pi
+        self._resolved = runner is not None
+        self.ledger = ledger
+        self._settled: set[str] = set()
+        self._attempt_paths: dict[str, Path] = {}
 
     def _env(self) -> dict[str, str]:
         allowed = {"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "HERDR_CONFIG_PATH"}
@@ -303,6 +310,14 @@ class HerdrProvider:
     def _exec(self, argv: Sequence[str], *, timeout_ms: int, cwd: Path | None = None, max_output: int = 1_048_576) -> bytes:
         if not argv or any(not isinstance(arg, str) or not arg or "\x00" in arg for arg in argv): raise _fail("INVALID_REQUEST", "invalid argv")
         if timeout_ms <= 0 or max_output <= 0: raise _fail("INVALID_REQUEST", "bounds must be positive")
+        if not self._resolved:
+            try:
+                herdr_path = Path(shutil.which(self.herdr) or "").resolve(strict=True)
+                pi_path = Path(shutil.which(self.pi) or "").resolve(strict=True)
+            except OSError as exc:
+                raise _fail("PROVIDER_UNAVAILABLE", "Herdr/Pi executable unavailable") from exc
+            if herdr_path.is_symlink() or not herdr_path.is_file() or pi_path.is_symlink() or not pi_path.is_file(): raise _fail("PROVIDER_UNAVAILABLE", "Herdr/Pi executable is not canonical")
+            self.herdr, self.pi, self._resolved = str(herdr_path), str(pi_path), True
         try:
             result = self._runner(list(argv), cwd=str(cwd) if cwd else None, env=self._env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False, timeout=timeout_ms / 1000)
         except subprocess.TimeoutExpired as exc: raise _fail("TIMEOUT", "bounded Herdr command timed out") from exc
@@ -318,11 +333,14 @@ class HerdrProvider:
 
     def probe(self, required_capabilities: Sequence[str] = ()) -> dict[str, object]:
         _host()
-        if any(cap not in _CAPABILITIES for cap in required_capabilities): raise _fail("UNSUPPORTED_CAPABILITY", "unsupported capability")
+        if any(cap not in _CAPABILITIES for cap in required_capabilities): raise _fail("UNSUPPORTED_CAPABILITY", "unknown capability")
+        if any(cap != "runtime_identity" for cap in required_capabilities): raise _fail("UNSUPPORTED_CAPABILITY", "capability is not directly evidenced by probe")
         self._exec([self.herdr, "--help"], timeout_ms=10_000, max_output=262_144)
         self._exec([self.herdr, "agent", "--help"], timeout_ms=10_000, max_output=262_144)
         self._model()
-        report = {"provider_id": self.provider_id, "runtime_identity": _MODEL + ":medium", "capabilities": list(sorted(_CAPABILITIES))}
+        # Help output and exact model listing directly evidence only runtime
+        # identity; host operations evidence their own capabilities later.
+        report = {"provider_id": self.provider_id, "runtime_identity": _MODEL + ":medium", "capabilities": ["runtime_identity"]}
         report["report_digest"] = raw_file_digest(canonical_json(report))
         return {"schema_version": 1, "ok": True, "request_id": "probe", "result": report}
 
@@ -343,6 +361,28 @@ class HerdrProvider:
         for key in ("workspace_id", "tab_id", "pane_id"): _id(result[key], key)
         return response
 
+    def _verify_candidate(self, request: ProviderRequest) -> None:
+        value = request.value
+        opened = self.worktree_open(path=value["worktree"])["result"]
+        if any(opened[key] != value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")):
+            raise _fail("IDENTITY_MISMATCH", "dedicated worktree workspace differs from request host")
+        root = _canonical_dir(value["worktree"], "worktree")
+        branch = self._exec(["git", "-C", str(root), "symbolic-ref", "--quiet", "--short", "HEAD"], timeout_ms=10_000).decode().strip()
+        head = self._exec(["git", "-C", str(root), "rev-parse", "HEAD"], timeout_ms=10_000).decode().strip()
+        if branch != value["candidate"]["branch"] or head != value["candidate"]["commit"]:
+            raise _fail("CANDIDATE_CHANGED", "worktree branch or HEAD differs from candidate")
+        work_prefix = b".razr/work/"
+        try:
+            config = json.loads((root / "razr.yaml").read_text(encoding="utf-8"))
+            configured = config.get("work_root", ".razr/work") if isinstance(config, dict) else ".razr/work"
+            if isinstance(configured, str): work_prefix = configured.rstrip("/").encode() + b"/"
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            pass
+        listing = self._exec(["git", "-C", str(root), "ls-tree", "-r", "-z", "--full-tree", "HEAD"], timeout_ms=10_000)
+        digest_input = b"".join(row + b"\0" for row in listing.split(b"\0") if row and b"\t" in row and row.split(b"\t", 1)[1] not in {b"razr.yaml", b"AGENTS.md"} and not row.split(b"\t", 1)[1].startswith(work_prefix))
+        if "sha256:" + hashlib.sha256(digest_input).hexdigest() != value["candidate"]["source_digest"]:
+            raise _fail("CANDIDATE_CHANGED", "worktree source digest differs from candidate")
+
     def _claim_roots(self, request: ProviderRequest) -> None:
         values = request.value
         for root_key, id_key in (("output_root", "output_root_id"), ("session_root", "session_root_id")):
@@ -361,7 +401,7 @@ class HerdrProvider:
             packet_bytes = canonical_json(packet)
             for path, data in ((candidate_path, candidate_bytes), (packet_path, packet_bytes)):
                 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                with os.fdopen(fd, "wb") as stream: stream.write(data); stream.write(b"\n"); stream.flush(); os.fsync(stream.fileno())
+                with os.fdopen(fd, "wb") as stream: stream.write(data); stream.flush(); os.fsync(stream.fileno())
         except FileExistsError as exc: raise _fail("RESOURCE_REUSED", "attempt evidence already exists") from exc
         return {"candidate": {"ref": str(candidate_path.relative_to(_canonical_dir(values["worktree"], "worktree"))), "digest_domain": "canonical_json", "digest": raw_file_digest(candidate_bytes)},
                 "packet": {"ref": str(packet_path.relative_to(_canonical_dir(values["worktree"], "worktree"))), "digest_domain": "canonical_json", "digest": raw_file_digest(packet_bytes)}}
@@ -370,6 +410,7 @@ class HerdrProvider:
         parsed = ProviderRequest(request); self.probe(request["required_capabilities"])
         if self.ledger is None: raise _fail("INVALID_REQUEST", "append-only attempt ledger is required")
         evidence = self._claim_roots(parsed)
+        self._verify_candidate(parsed)
         value = parsed.value; deadline = value["limits"]["deadline_ms"]
         started = {"schema_version": 1, "event": "STARTED", "attempt_id": value["attempt_id"], "work_id": value["work"]["work_id"], "node_id": value["work"]["node_id"], "observed_generation": value["work"]["generation"], "observed_ordinal": value["work"]["ordinal"], "worker_id": value["worker_id"], "branch": value["branch"], "worktree_ref": ".", "allowance_id": value["allowance_id"], "provider_id": self.provider_id, "started_at": _now(), "started_at_source": "adapter_observed", "candidate": value["candidate"], "candidate_evidence": evidence["candidate"], "request_packet": evidence["packet"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"], "request_digest": parsed.digest, "herdr": value["host"], "prev_digest": "sha256:" + "0" * 64}
         # The ledger computes no authority: this is a durable observation only.
@@ -379,6 +420,7 @@ class HerdrProvider:
         if records:
             started["prev_digest"] = json.loads(records[-1])["record_digest"]
         started["record_digest"] = raw_file_digest(canonical_json(started)); self.ledger.append(started)
+        self._attempt_paths[value["attempt_id"]] = _canonical_dir(value["worktree"], "worktree")
         try:
             response = self._exec([self.herdr, "agent", "start", value["worker_id"], "--kind", "pi", "--pane", value["host"]["pane_id"], "--timeout", str(min(deadline, 300_000)), "--", "--model", _MODEL, "--thinking", "medium", "--session-dir", value["session_root"], "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files"], timeout_ms=min(deadline, 300_000), cwd=_canonical_dir(value["cwd"], "cwd"), max_output=value["limits"]["max_output_bytes"])
         except ProtocolError as exc:
@@ -386,16 +428,43 @@ class HerdrProvider:
             data = canonical_json({"error_code": exc.code, "message": str(exc)[:500]})
             fd = os.open(failure, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as stream: stream.write(data); stream.write(b"\n"); stream.flush(); os.fsync(stream.fileno())
-            settled = {key: started[key] for key in ("schema_version", "attempt_id", "work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "worktree_ref", "branch", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest", "herdr")}
+            settled = {key: started[key] for key in ("schema_version", "attempt_id", "work_id", "node_id", "observed_generation", "observed_ordinal", "worker_id", "allowance_id", "provider_id", "worktree_ref", "branch", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest", "herdr")}
             settled.update({"event": "SETTLED", "settled_at": _now(), "outcome": "FAILED", "evidence_refs": [{"ref": str(failure.relative_to(_canonical_dir(value["worktree"], "worktree"))), "digest_domain": "raw_file", "digest": raw_file_digest(data + b"\\n"), "kind": "launch_failure", "error_code": exc.code}], "prev_digest": started["record_digest"], "cleanup": "not_applicable"})
             settled["record_digest"] = raw_file_digest(canonical_json(settled)); self.ledger.append(settled)
             raise
-        envelope = _envelope(response, "agent start"); result = envelope["result"]
-        if not isinstance(result, dict) or set(result) != {"agent_id", "workspace_id", "tab_id", "pane_id", "pi_session_id"}: raise _fail("HERDR_IDENTITY_INCOMPLETE", "agent response is not closed")
-        for key in ("agent_id", "workspace_id", "tab_id", "pane_id", "pi_session_id"): _id(result[key], key)
-        if any(result[key] != value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")): raise _fail("IDENTITY_MISMATCH", "agent host identity differs")
-        handle = {"provider_id": "herdr", "handle_id": result["agent_id"], "request_digest": parsed.digest, "attempt_id": value["attempt_id"], "host": value["host"], "agent_id": result["agent_id"], "pi_session_id": result["pi_session_id"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"]}
-        return {"schema_version": 1, "ok": True, "request_id": value["request_id"], "result": {"handle": handle, "capability_report_digest": raw_file_digest(canonical_json({"runtime": _MODEL + ":medium", "request_digest": parsed.digest}))}}
+        try:
+            envelope = _envelope(response, "agent start"); result = envelope["result"]
+            if not isinstance(result, dict) or set(result) != {"agent_id", "workspace_id", "tab_id", "pane_id", "pi_session_id"}: raise _fail("HERDR_IDENTITY_INCOMPLETE", "agent response is not closed")
+            for key in ("agent_id", "workspace_id", "tab_id", "pane_id", "pi_session_id"): _id(result[key], key)
+            if any(result[key] != value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")): raise _fail("IDENTITY_MISMATCH", "agent host identity differs")
+            pane = _envelope(self._exec([self.herdr, "pane", "get", value["host"]["pane_id"]], timeout_ms=10_000), "pane")
+            pane_result = pane["result"]
+            if not isinstance(pane_result, dict) or "cwd" not in pane_result or "agent_id" not in pane_result: raise _fail("IDENTITY_MISMATCH", "pane response lacks actual agent cwd")
+            if _canonical_dir(pane_result["cwd"], "agent cwd") != _canonical_dir(value["worktree"], "worktree") or pane_result["agent_id"] != result["agent_id"]:
+                raise _fail("IDENTITY_MISMATCH", "agent cwd/worktree differs")
+            handle = {"provider_id": "herdr", "handle_id": result["agent_id"], "request_digest": parsed.digest, "attempt_id": value["attempt_id"], "host": value["host"], "agent_id": result["agent_id"], "pi_session_id": result["pi_session_id"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"]}
+            return {"schema_version": 1, "ok": True, "request_id": value["request_id"], "result": {"handle": handle, "capability_report_digest": raw_file_digest(canonical_json({"runtime": _MODEL + ":medium", "request_digest": parsed.digest}))}}
+        except ProtocolError as exc:
+            self._settle({"attempt_id": value["attempt_id"]}, "UNKNOWN", cleanup="uncertain", reason=str(exc))
+            raise
+
+    def _settle(self, handle: Mapping[str, object], outcome: str, *, cleanup: str = "not_applicable", reason: str = "") -> None:
+        if handle["attempt_id"] in self._settled: return
+        if self.ledger is None: raise _fail("LEDGER_CORRUPT", "settlement ledger is unavailable")
+        root = self._attempt_paths.get(handle["attempt_id"])
+        if root is None: raise _fail("ARTIFACT_UNAVAILABLE", "attempt worktree is not retained")
+        evidence_dir = root / ".razr" / "evidence"; evidence_dir.mkdir(parents=True, exist_ok=True)
+        artifact = evidence_dir / ("settled-" + handle["attempt_id"] + ".json")
+        data = canonical_json({"attempt_id": handle["attempt_id"], "outcome": outcome, "reason": reason[:500]})
+        if not artifact.exists():
+            fd = os.open(artifact, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as stream: stream.write(data); stream.flush(); os.fsync(stream.fileno())
+        lines = self.ledger.path.read_text(encoding="utf-8").splitlines()
+        started = next((json.loads(line) for line in lines if json.loads(line).get("attempt_id") == handle["attempt_id"] and json.loads(line).get("event") == "STARTED"), None)
+        if started is None: raise _fail("INVALID_ORDER", "settlement has no STARTED event")
+        settled = {key: started[key] for key in ("schema_version", "attempt_id", "work_id", "node_id", "observed_generation", "observed_ordinal", "worker_id", "allowance_id", "provider_id", "worktree_ref", "branch", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest", "herdr")}
+        settled.update({"event": "SETTLED", "settled_at": _now(), "outcome": outcome, "evidence_refs": [{"ref": str(artifact.relative_to(root)), "digest_domain": "canonical_json", "digest": raw_file_digest(data), "kind": "result"}], "prev_digest": started["record_digest"], "cleanup": cleanup})
+        settled["record_digest"] = raw_file_digest(canonical_json(settled)); self.ledger.append(settled); self._settled.add(handle["attempt_id"])
 
     def _handle(self, handle: Mapping[str, object]) -> dict[str, object]:
         fields = {"provider_id", "handle_id", "request_digest", "attempt_id", "host", "agent_id", "pi_session_id", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest"}
@@ -430,20 +499,43 @@ class HerdrProvider:
     def interrupt(self, handle: Mapping[str, object], reason: str = "cancel") -> dict[str, object]:
         value = self._handle(handle)
         if reason not in _REASONS: raise _fail("INVALID_REQUEST", "invalid interrupt reason")
-        self._exec([self.herdr, "agent", "send-keys", value["handle_id"], "ctrl-c"], timeout_ms=10_000)
-        observed = self.inspect(value)["result"]["status"]
-        return {"schema_version": 1, "ok": True, "request_id": "interrupt", "result": {"attempt_id": value["attempt_id"], "host": value["host"], "requested": True, "observed": observed, "cleanup": "confirmed" if observed in {"SETTLED", "TERMINATED"} else "uncertain"}}
+        try:
+            self._exec([self.herdr, "agent", "send-keys", value["handle_id"], "ctrl-c"], timeout_ms=10_000)
+            observed = self.inspect(value)["result"]["status"]
+            cleanup = "confirmed" if observed in {"SETTLED", "TERMINATED"} else "uncertain"
+            self._settle(value, "INTERRUPTED" if cleanup == "confirmed" else "UNKNOWN", cleanup=cleanup, reason=reason)
+            return {"schema_version": 1, "ok": True, "request_id": "interrupt", "result": {"attempt_id": value["attempt_id"], "host": value["host"], "requested": True, "observed": observed, "cleanup": cleanup}}
+        except ProtocolError as exc:
+            self._settle(value, "UNKNOWN", cleanup="uncertain", reason=str(exc))
+            raise
 
     def collect(self, handle: Mapping[str, object]) -> dict[str, object]:
-        value = self._handle(handle); status = self.inspect(value)["result"]["status"]; data = self.read(value)
-        termination = "UNKNOWN" if status not in {"SETTLED", "TERMINATED"} else "UNKNOWN"
-        return {"schema_version": 1, "ok": True, "request_id": "collect", "result": {"attempt_id": value["attempt_id"], "termination": termination, "runtime_identity": _MODEL + ":medium", "host": value["host"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"], "artifact_refs": [{"kind": "event", "digest_domain": "raw_file", "digest": raw_file_digest(data), "bytes": len(data)}], "cleanup": "not_applicable"}}
+        value = self._handle(handle)
+        try:
+            status_response = self.inspect(value); status = status_response["result"]["status"]
+            if status not in {"SETTLED", "TERMINATED"}: raise _fail("ARTIFACT_UNAVAILABLE", "collect requires an observed terminal status")
+            data = self.read(value)
+            artifact = _canonical_dir(self._attempt_paths[value["attempt_id"]], "worktree") / ".razr" / "evidence" / ("terminal-" + value["attempt_id"] + ".bin")
+            fd = os.open(artifact, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as stream: stream.write(data); stream.flush(); os.fsync(stream.fileno())
+            self._settle(value, "UNKNOWN", reason="terminal status observed; semantic termination unavailable")
+            return {"schema_version": 1, "ok": True, "request_id": "collect", "result": {"attempt_id": value["attempt_id"], "termination": "UNKNOWN", "runtime_identity": _MODEL + ":medium", "host": value["host"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"], "artifact_refs": [{"kind": "event", "digest_domain": "raw_file", "digest": raw_file_digest(data), "bytes": len(data)}], "cleanup": "not_applicable"}}
+        except ProtocolError as exc:
+            self._settle(value, "UNKNOWN", cleanup="uncertain", reason=str(exc)); raise
 
     def cleanup(self, handle: Mapping[str, object]) -> dict[str, object]:
-        value = self._handle(handle); status = self.inspect(value)["result"]["status"]
-        if status not in {"SETTLED", "TERMINATED", "STOPPING"}: raise _fail("CLEANUP_UNKNOWN", "refusing cleanup of active/foreign handle")
-        self._exec([self.herdr, "pane", "close", value["host"]["pane_id"]], timeout_ms=10_000)
-        return {"attempt_id": value["attempt_id"], "cleanup": "confirmed", "status": status}
+        value = self._handle(handle)
+        if value["attempt_id"] not in self._settled: raise _fail("CLEANUP_UNKNOWN", "cleanup requires a settled attempt")
+        status = self.inspect(value)["result"]["status"]
+        if status not in {"SETTLED", "TERMINATED"}: raise _fail("CLEANUP_UNKNOWN", "refusing cleanup of active handle")
+        try:
+            self._exec([self.herdr, "pane", "close", value["host"]["pane_id"]], timeout_ms=10_000)
+            self._exec([self.herdr, "worktree", "remove", "--workspace", value["host"]["workspace_id"], "--force"], timeout_ms=120_000)
+            listed = self._exec([self.herdr, "worktree", "list"], timeout_ms=10_000)
+            if value["host"]["workspace_id"].encode() in listed: raise _fail("CLEANUP_UNKNOWN", "workspace remains after cleanup")
+            return {"attempt_id": value["attempt_id"], "cleanup": "confirmed", "status": status}
+        except ProtocolError as exc:
+            raise _fail("CLEANUP_UNKNOWN", str(exc)) from exc
 
 
 __all__ = ["AttemptLedger", "HerdrProvider", "ProviderRequest", "ProtocolError"]
