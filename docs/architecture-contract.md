@@ -15,7 +15,7 @@ All M02–M05 interfaces use UTF-8 JSON objects with no unknown top-level fields
 
 - `id` values are non-empty ASCII strings matching `[A-Za-z0-9][A-Za-z0-9._:-]{0,127}`.
 - Times are UTC RFC 3339 strings with `Z` and second or millisecond precision.
-- Paths are UTF-8 relative POSIX paths beneath the declared repository/worktree root after resolution; absolute paths, symlinks, `..`, and path escapes are rejected. Machine paths and secret values are never serialized into public records.
+- Persistent records (Memory, context packet contents/refs, and attempt ledger) contain only UTF-8 repo-relative POSIX refs beneath the declared repository root; absolute paths, symlinks, `..`, and path escapes are rejected. Ephemeral operational requests may contain canonical absolute paths for `cwd`, `worktree`, package/runtime files, and private output/session roots; these paths are never persisted in Memory/ledger records, request packets, public responses, or evidence refs. Machine paths and secret values are never serialized into public records.
 - Errors use one envelope: `{ "schema_version":1, "ok":false, "error": {"code": <enum>, "message": <string>, "retryable": <boolean>, "details": <object> } }`. Messages are diagnostic, not authority. A caller must not retry unless the operation explicitly says so.
 
 Successful responses use `{ "schema_version":1, "ok":true, "request_id": <id>, "result": <object> }`; `request_id` is echoed and must be unique per call. A response with a mismatched request ID, schema, digest, or identity is invalid and is retained as an observation rather than converted to success.
@@ -109,6 +109,53 @@ class ProtocolError(Exception):
     retryable: bool
     details: dict[str, object]
 
+@dataclass(frozen=True)
+class ProvenancePin:
+    path: Literal["scripts/razr.py", "templates/evidence.md", "templates/executable.yaml", "templates/razr.yaml", "templates/spec.md", "templates/state.yaml"]
+    sha256: str  # lowercase 64 hex, raw-file domain
+
+@dataclass(frozen=True)
+class ReadbackSpec:
+    path: str  # repo-relative, never absolute
+    required: bool
+    max_bytes: int
+    parse_as: Literal["bytes", "json"]
+
+@dataclass(frozen=True)
+class CoreRequest:
+    argv: tuple[str, ...]
+    cwd: Path  # canonical absolute, ephemeral only
+    package_root: Path  # canonical absolute, ephemeral only
+    python_executable: Path  # canonical absolute, ephemeral only
+    runtime_script: Path  # canonical absolute, ephemeral only
+    expected_source_digest: str  # core source-tree sha256
+    expected_core_identity: str  # sha256 of exact provenance.json bytes
+    expected_provenance: tuple[ProvenancePin, ...]
+    expected_readback: tuple[ReadbackSpec, ...]
+    timeout_ms: int
+    termination_grace_ms: int
+    max_stdout_bytes: int
+    max_stderr_bytes: int
+
+@dataclass(frozen=True)
+class ReadbackResult:
+    path: str  # repo-relative
+    digest_domain: Literal["raw_file", "canonical_json"]
+    digest: str
+    bytes: int
+    parsed: object | None
+
+@dataclass(frozen=True)
+class CoreResponse:
+    returncode: int
+    stdout: bytes
+    stderr: bytes
+    elapsed_ms: int
+    core_identity: str  # exact provenance.json raw-file sha256
+    provenance: tuple[ProvenancePin, ...]
+    source_digest: str  # core source-tree sha256
+    readback: tuple[ReadbackResult, ...]
+
 ErrorCode = Literal[
     "INVALID_REQUEST", "OUTPUT_LIMIT", "TIMEOUT", "INTERRUPTED", "CORE_EXIT",
     "MALFORMED_RESPONSE", "READBACK_FAILED", "PROVENANCE_MISMATCH",
@@ -126,10 +173,10 @@ def raw_file_digest(data: bytes) -> str: ...
 def validate_git_object_id(value: str) -> str: ...
 def validate_source_digest(value: str) -> str: ...
 def validate_executable_digest(value: str) -> str: ...
-def invoke_core(request: CoreRequest, *, timeout_ms: int = 120_000) -> CoreResponse: ...
+def invoke_core(request: CoreRequest) -> CoreResponse: ...
 ```
 
-`CoreRequest` is a closed typed object containing `argv: tuple[str, ...]`, `cwd: Path`, `expected_source_digest: str`, `expected_core_identity: str`, and `timeout_ms: int`; `CoreResponse` is a closed typed object containing `returncode: int`, `stdout: bytes`, `stderr: bytes`, `elapsed_ms: int`, and `readback: Mapping[str, object]`. `invoke_core` uses `MAX_STDOUT_BYTES = 1_048_576`, `MAX_STDERR_BYTES = 262_144`, a default timeout of 120,000 ms, and a 5,000 ms process-group termination grace period. Exceeding either output limit maps to `OUTPUT_LIMIT`; timeout maps to `TIMEOUT`; signal termination maps to `INTERRUPTED`; nonzero exit maps to `CORE_EXIT`; malformed expected JSON maps to `MALFORMED_RESPONSE`; failed expected-file read-back maps to `READBACK_FAILED`; provenance mismatch maps to `PROVENANCE_MISMATCH`; path/environment rejection maps to `INVALID_REQUEST`; and lock failures map to `LOCK_UNAVAILABLE`. These mappings are closed and do not infer workflow outcomes.
+`CoreRequest` and `CoreResponse` are closed to the fields shown above. `expected_core_identity` is the raw-file `sha256:<64 hex>` of the exact `runtime/provenance.json` bytes; each `ProvenancePin` is a raw-file SHA-256 for one of the six pinned paths. `source_digest` in the response is the core tree digest defined in the digest-domain table, never the provenance digest. `expected_readback` is closed to repo-relative paths with positive byte limits; `readback` returns every required result and any optional result that was present, with raw-file or canonical-JSON digest as declared. `invoke_core` uses `MAX_STDOUT_BYTES = 1_048_576`, `MAX_STDERR_BYTES = 262_144`, a default `timeout_ms = 120_000`, and a default `termination_grace_ms = 5_000`; request values may lower limits but may not raise these maxima. Exceeding either output limit maps to `OUTPUT_LIMIT`; timeout maps to `TIMEOUT`; signal termination maps to `INTERRUPTED`; nonzero exit maps to `CORE_EXIT`; malformed expected JSON maps to `MALFORMED_RESPONSE`; failed expected-file read-back maps to `READBACK_FAILED`; provenance mismatch maps to `PROVENANCE_MISMATCH`; path/environment rejection maps to `INVALID_REQUEST`; and lock failures map to `LOCK_UNAVAILABLE`. These mappings are closed and do not infer workflow outcomes.
 
 Every operation uses the same complete `ErrorCode` enum above; an operation may emit only its documented subset, but no operation invents a code outside it. Context may emit `INVALID_REQUEST`, `PATH_ESCAPE`, `SOURCE_CHANGED`, `WORKFLOW_UNAVAILABLE`, `MEMORY_UNAVAILABLE`, `LIMIT_EXCEEDED`, or `INTERNAL`. Provider may emit `INVALID_REQUEST`, `UNSUPPORTED_CAPABILITY`, `IDENTITY_MISMATCH`, `DIGEST_MISMATCH`, `STALE_GENERATION`, `CANDIDATE_CHANGED`, `RESOURCE_REUSED`, `ALLOWANCE_REUSED`, `FRESH_CONTEXT_UNAVAILABLE`, `LAUNCH_FAILED`, `TIMEOUT`, `OUTPUT_LIMIT`, `INTERRUPT_FAILED`, `ARTIFACT_UNAVAILABLE`, `CLEANUP_UNKNOWN`, `PROVIDER_UNAVAILABLE`, `FANOUT_UNAVAILABLE`, `HERDR_IDENTITY_INCOMPLETE`, or `INTERNAL`. Memory/ledger may emit `INVALID_REQUEST`, `LOCK_UNAVAILABLE`, `LEDGER_CORRUPT`, `DUPLICATE_ATTEMPT`, `INVALID_ORDER`, `ALLOWANCE_REUSED`, or `INTERNAL`. Core subprocess may emit the mappings specified below. This is the complete shared enum and includes every later code list.
 
@@ -168,6 +215,7 @@ The exact provider request is:
 ```json
 {
   "schema_version":1,"request_id":"exec-...","attempt_id":"att-...","role":"technical|contract|worker",
+  "host":{"mode":"herdr","workspace_id":"...","tab_id":"...","pane_id":"..."},
   "work":{"work_id":"...","node_id":"...","generation":12,"ordinal":2},
   "worker_id":"worker-...","branch":"feature/example",
   "candidate":{"repository":"owner/repository","branch":"feature/example","commit":"0123456789abcdef0123456789abcdef01234567","source_digest":"sha256:..."},
@@ -182,13 +230,13 @@ The exact provider request is:
 }
 ```
 
-`worker_id`, `branch`, `worktree`, `cwd`, both root IDs, both root paths, and all four root digests are required request fields. `worktree` and `cwd` are canonical absolute paths and must be byte-for-byte equal after canonicalization; this makes the STARTED ledger fields derivable and validation deterministic. `output_root` and `session_root` must be distinct, owned, empty directories under the provider-approved private root. Their IDs are unique opaque identities; their digests are canonical-JSON digests of a sorted directory manifest (relative path, type, size, and raw-file digest for each entry). A provider refuses `RESOURCE_REUSED` when either ID or digest was used by any prior attempt, the directory is non-empty/reused, or a returned handle/result does not preserve the exact request values. No root is reused after timeout, interruption, cleanup uncertainty, or settlement.
+The request is a closed standalone or Herdr variant: standalone is exactly `{"mode":"standalone"}` and omits all workspace/tab/pane fields; Herdr is exactly `{"mode":"herdr","workspace_id":"...","tab_id":"...","pane_id":"..."}` and requires all three IDs. `worker_id`, `branch`, `worktree`, `cwd`, both root IDs, both root paths, and all four root digests are required request fields. `worktree` and `cwd` are canonical absolute paths and must be byte-for-byte equal after canonicalization; this makes the STARTED ledger fields derivable and validation deterministic. `output_root` and `session_root` must be distinct, owned, empty directories under the provider-approved private root. Their IDs are unique opaque identities; their digests are canonical-JSON digests of a sorted directory manifest (relative path, type, size, and raw-file digest for each entry). These absolute request paths are ephemeral and are not written to the ledger. A provider refuses `RESOURCE_REUSED` when either ID or digest was used by any prior attempt, the directory is non-empty/reused, or a returned handle/result does not preserve the exact request values. No root is reused after timeout, interruption, cleanup uncertainty, or settlement.
 
 The provider response schemas are closed. Launch and collect are:
 
 ```json
-{"schema_version":1,"ok":true,"request_id":"exec-...","result":{"handle":{"provider_id":"herdr","handle_id":"...","request_digest":"sha256:...","attempt_id":"att-...","output_root_id":"out-...","output_root_digest":"sha256:...","session_root_id":"sess-...","session_root_digest":"sha256:..."},"capability_report_digest":"sha256:..."}}
-{"schema_version":1,"ok":true,"request_id":"exec-...","result":{"attempt_id":"att-...","termination":"SUCCEEDED|FAILED|INTERRUPTED|TIMED_OUT|UNKNOWN","runtime_identity":"...","output_root_id":"out-...","output_root_digest":"sha256:...","session_root_id":"sess-...","session_root_digest":"sha256:...","artifact_refs":[{"kind":"stdout|stderr|session|event","digest_domain":"raw_file","digest":"sha256:...","bytes":123}],"exit_code":0,"cleanup":"confirmed|uncertain|not_applicable"}}
+{"schema_version":1,"ok":true,"request_id":"exec-...","result":{"handle":{"provider_id":"herdr","handle_id":"...","request_digest":"sha256:...","attempt_id":"att-...","host":{"mode":"herdr","workspace_id":"...","tab_id":"...","pane_id":"..."},"output_root_id":"out-...","output_root_digest":"sha256:...","session_root_id":"sess-...","session_root_digest":"sha256:..."},"capability_report_digest":"sha256:..."}}
+{"schema_version":1,"ok":true,"request_id":"exec-...","result":{"attempt_id":"att-...","termination":"SUCCEEDED|FAILED|INTERRUPTED|TIMED_OUT|UNKNOWN","runtime_identity":"...","host":{"mode":"herdr","workspace_id":"...","tab_id":"...","pane_id":"..."},"output_root_id":"out-...","output_root_digest":"sha256:...","session_root_id":"sess-...","session_root_digest":"sha256:...","artifact_refs":[{"kind":"stdout|stderr|session|event","digest_domain":"raw_file","digest":"sha256:...","bytes":123}],"exit_code":0,"cleanup":"confirmed|uncertain|not_applicable"}}
 ```
 
 A status response has exactly one of these variants, with no null fields:
@@ -198,7 +246,7 @@ A status response has exactly one of these variants, with no null fields:
 {"schema_version":1,"ok":true,"request_id":"exec-...","result":{"status":"STARTING|ACTIVE|SETTLED|STOPPING|TERMINATED|UNKNOWN","observed_at":"...Z","source":"herdr","workspace_id":"...","tab_id":"...","pane_id":"..."}}
 ```
 
-The first is the closed standalone variant and forbids all Herdr identity fields. The second is the closed Herdr variant and requires all three identities. `workspace_id`, `tab_id`, and `pane_id` are never emitted as null.
+The first is the closed standalone variant and forbids all Herdr identity fields. The second is the closed Herdr variant and requires all three identities. `workspace_id`, `tab_id`, and `pane_id` are never emitted as null. Launch handles and collect results use the same closed host variant: standalone requests return standalone handles/results that omit all three fields; Herdr requests return Herdr handles/results that require and preserve all three exact IDs from the launch request. A host variant mismatch is `IDENTITY_MISMATCH`.
 
 The provider operation schemas are also fixed. `probe` accepts `{schema_version, request_id, required_capabilities, runtime}` and returns `{schema_version, ok:true, request_id, result:{provider_id, runtime_identity, capabilities:[<capability enum>], report_digest}}`; `capabilities` may contain only `fresh_context`, `saved_session`, `neutral_instructions`, `working_directory`, `environment_policy`, `bounded_time`, `bounded_output`, `stream_capture`, `interrupt`, `tool_policy_observation`, and `runtime_identity`. `launch` accepts the request above and returns the handle response above. `inspect` accepts `{schema_version, request_id, handle}` and returns the status response above. `collect` accepts `{schema_version, request_id, handle}` and returns the result response above. `interrupt` accepts `{schema_version, request_id, handle, reason:"cancel|timeout|policy_violation"}` and returns `{schema_version:1,ok:true,request_id,result:{attempt_id,requested:true,observed:"SETTLED|STOPPING|TERMINATED|UNKNOWN",cleanup:"confirmed|uncertain|not_applicable"}}`.
 
@@ -210,18 +258,18 @@ Provider emits only the provider subset of the complete shared `ErrorCode` enum 
 
 M04 chooses an append-only event ledger, not a mutable record and not a terminal-only record. `.razr/attempts.jsonl` contains exactly two closed event variants: one `STARTED` event and one `SETTLED` event per `attempt_id`.
 
-A STARTED event requires `schema_version`, `event`, `attempt_id`, `work_id`, `node_id`, `observed_generation`, `observed_ordinal`, `worker_id`, `branch`, `worktree`, `cwd`, `allowance_id`, `provider_id`, `started_at`, `output_root_id`, `output_root_digest`, `session_root_id`, `session_root_digest`, `request_digest`, `prev_digest`, and `record_digest`. It optionally has `herdr`; when present, `herdr` requires `workspace_id`, `tab_id`, and `pane_id`. No other fields are allowed, and optional `herdr` is omitted rather than null.
+A STARTED event requires `schema_version`, `event`, `attempt_id`, `work_id`, `node_id`, `observed_generation`, `observed_ordinal`, `worker_id`, `branch`, repo-relative `worktree_ref`, `allowance_id`, `provider_id`, `started_at`, `started_at_source`, `candidate`, `candidate_evidence`, `request_packet`, `output_root_id`, `output_root_digest`, `session_root_id`, `session_root_digest`, `request_digest`, `prev_digest`, and `record_digest`. `candidate` requires the 40-hex `commit` and `sha256:` `source_digest`; `candidate_evidence` and `request_packet` require repo-relative `ref`, `digest_domain`, and `digest`, with `request_packet.digest_domain` fixed to `canonical_json`. It optionally has `herdr`; when present, `herdr` requires `workspace_id`, `tab_id`, and `pane_id`. No other fields are allowed, and optional `herdr` is omitted rather than null.
 
-A SETTLED event requires `schema_version`, `event`, `attempt_id`, `work_id`, `node_id`, `observed_generation`, `observed_ordinal`, `provider_id`, `settled_at`, `output_root_id`, `output_root_digest`, `session_root_id`, `session_root_digest`, `outcome`, `request_digest`, `evidence_refs`, `prev_digest`, and `record_digest`. It optionally has `herdr`, `exit_code`, and `cleanup`; when present, `herdr` requires all three IDs, `exit_code` is an integer, and `cleanup` is `confirmed|uncertain|not_applicable`. `evidence_refs` is an array whose entries require `digest_domain`, `digest`, and `kind`; provider artifacts use `raw_file` and request/report identities use `canonical_json`. No other fields are allowed, and absent optional fields are omitted rather than null. `event` is exactly `STARTED|SETTLED`; `outcome` is exactly `SUCCEEDED|FAILED|INTERRUPTED|TIMED_OUT|UNKNOWN`.
+A SETTLED event requires `schema_version`, `event`, `attempt_id`, `work_id`, `node_id`, `observed_generation`, `observed_ordinal`, `provider_id`, `worktree_ref`, `branch`, `settled_at`, `candidate`, `candidate_evidence`, `request_packet`, `output_root_id`, `output_root_digest`, `session_root_id`, `session_root_digest`, `outcome`, `request_digest`, `evidence_refs`, `prev_digest`, and `record_digest`. It optionally has `herdr`, `exit_code`, and `cleanup`; when present, `herdr` requires all three IDs, `exit_code` is an integer, and `cleanup` is `confirmed|uncertain|not_applicable`. `evidence_refs` is an array whose entries require `digest_domain`, `digest`, and `kind`; provider artifacts use `raw_file` and request/report identities use `canonical_json`. No other fields are allowed, and absent optional fields are omitted rather than null. `event` is exactly `STARTED|SETTLED`; `started_at_source` is exactly `adapter_observed`; `outcome` is exactly `SUCCEEDED|FAILED|INTERRUPTED|TIMED_OUT|UNKNOWN`.
 
-Each event has exactly this shape, with the event-specific required fields above:
+Each event has exactly this shape, with the event-specific required fields above. The foundation reads the candidate commit/source digest and generation from the core read-back and writes `candidate_evidence`; it creates the redacted, repo-relative request packet and writes `request_packet` before launch. The provider observes `provider_id`, validates `worker_id`, branch, canonical absolute worktree/cwd, root IDs/digests, and Herdr IDs, and returns the handle. The adapter records `started_at` at receipt of a successful launch response with `started_at_source:"adapter_observed"`, copies the validated Herdr identity when present, and appends STARTED. The persistent request packet contains no absolute operational path: it stores repo-relative `worktree_ref`, branch, worker ID, root IDs/digests, candidate identity, limits, and the canonical request digest. The later collector appends SETTLED and links collected artifacts through `evidence_refs`; it cannot alter STARTED fields.
 
 ```json
-{"schema_version":1,"event":"STARTED","attempt_id":"att-...","work_id":"...","node_id":"...","observed_generation":12,"observed_ordinal":2,"worker_id":"...","branch":"...","worktree":"/absolute/canonical/worktree","cwd":"/absolute/canonical/worktree","allowance_id":"...","provider_id":"herdr","started_at":"...Z","output_root_id":"out-...","output_root_digest":"sha256:...","session_root_id":"sess-...","session_root_digest":"sha256:...","request_digest":"sha256:...","herdr":{"workspace_id":"...","tab_id":"...","pane_id":"..."},"prev_digest":"sha256:...","record_digest":"sha256:..."}
-{"schema_version":1,"event":"SETTLED","attempt_id":"att-...","work_id":"...","node_id":"...","observed_generation":12,"observed_ordinal":2,"provider_id":"herdr","settled_at":"...Z","output_root_id":"out-...","output_root_digest":"sha256:...","session_root_id":"sess-...","session_root_digest":"sha256:...","outcome":"SUCCEEDED|FAILED|INTERRUPTED|TIMED_OUT|UNKNOWN","request_digest":"sha256:...","evidence_refs":[{"digest_domain":"raw_file","digest":"sha256:...","kind":"..."}],"cleanup":"confirmed","prev_digest":"sha256:...","record_digest":"sha256:..."}
+{"schema_version":1,"event":"STARTED","attempt_id":"att-...","work_id":"...","node_id":"...","observed_generation":12,"observed_ordinal":2,"worker_id":"...","branch":"...","worktree_ref":"worktrees/worker","allowance_id":"...","provider_id":"herdr","started_at":"...Z","started_at_source":"adapter_observed","candidate":{"commit":"0123456789abcdef0123456789abcdef01234567","source_digest":"sha256:..."},"candidate_evidence":{"ref":".razr/evidence/candidate.json","digest_domain":"canonical_json","digest":"sha256:..."},"request_packet":{"ref":".razr/evidence/attempt-att.json","digest_domain":"canonical_json","digest":"sha256:..."},"output_root_id":"out-...","output_root_digest":"sha256:...","session_root_id":"sess-...","session_root_digest":"sha256:...","request_digest":"sha256:...","herdr":{"workspace_id":"...","tab_id":"...","pane_id":"..."},"prev_digest":"sha256:...","record_digest":"sha256:..."}
+{"schema_version":1,"event":"SETTLED","attempt_id":"att-...","work_id":"...","node_id":"...","observed_generation":12,"observed_ordinal":2,"provider_id":"herdr","worktree_ref":"worktrees/worker","branch":"...","settled_at":"...Z","candidate":{"commit":"0123456789abcdef0123456789abcdef01234567","source_digest":"sha256:..."},"candidate_evidence":{"ref":".razr/evidence/candidate.json","digest_domain":"canonical_json","digest":"sha256:..."},"request_packet":{"ref":".razr/evidence/attempt-att.json","digest_domain":"canonical_json","digest":"sha256:..."},"output_root_id":"out-...","output_root_digest":"sha256:...","session_root_id":"sess-...","session_root_digest":"sha256:...","outcome":"SUCCEEDED|FAILED|INTERRUPTED|TIMED_OUT|UNKNOWN","request_digest":"sha256:...","evidence_refs":[{"digest_domain":"raw_file","digest":"sha256:...","kind":"..."}],"cleanup":"confirmed","prev_digest":"sha256:...","record_digest":"sha256:..."}
 ```
 
-Events are ordered by append position and form one global hash chain. A STARTED event must be the first event for its attempt; exactly one SETTLED event must follow it; no event may follow SETTLED; `SETTLED.request_digest`, work/node identity, observed generation/ordinal, provider, output-root identity/digest, and session-root identity/digest must equal STARTED; and a SETTLED event is not written until the provider result is collected. `record_digest` is the canonical-JSON digest of the complete event with `record_digest` omitted, including `prev_digest`; it does not use raw-file, source-tree, executable, or Git-object serialization. Append takes the sibling exclusive `flock`, validates the full chain and per-attempt ordering while holding the lock, writes one complete line with `O_APPEND`, calls `fsync`, then releases the lock. Broken chains, partial lines, duplicate STARTED/SETTLED events, settlement without STARTED, reused allowance/session, or failed fsync return `LEDGER_CORRUPT`, `DUPLICATE_ATTEMPT`, `INVALID_ORDER`, `ALLOWANCE_REUSED`, or `LOCK_UNAVAILABLE` and do not append. There is no in-place repair; an interrupted dispatch is settled as `UNKNOWN` only from retained evidence under explicit authority, and a retry uses a new attempt ID and STARTED event.
+Events are ordered by append position and form one global hash chain. A STARTED event must be the first event for its attempt; exactly one SETTLED event must follow it; no event may follow SETTLED; `SETTLED.request_digest`, work/node identity, observed generation/ordinal, provider, branch, worktree_ref, candidate, candidate_evidence, request_packet, output-root identity/digest, session-root identity/digest, and Herdr identity must equal STARTED; and a SETTLED event is not written until the provider result is collected. `record_digest` is the canonical-JSON digest of the complete event with `record_digest` omitted, including `prev_digest`; it does not use raw-file, source-tree, executable, or Git-object serialization. Append takes the sibling exclusive `flock`, validates the full chain and per-attempt ordering while holding the lock, writes one complete line with `O_APPEND`, calls `fsync`, then releases the lock. Broken chains, partial lines, duplicate STARTED/SETTLED events, settlement without STARTED, reused allowance/session, or failed fsync return `LEDGER_CORRUPT`, `DUPLICATE_ATTEMPT`, `INVALID_ORDER`, `ALLOWANCE_REUSED`, or `LOCK_UNAVAILABLE` and do not append. There is no in-place repair; an interrupted dispatch is settled as `UNKNOWN` only from retained evidence under explicit authority, and a retry uses a new attempt ID and STARTED event.
 
 ## 10. Legacy classification and migration ownership
 
