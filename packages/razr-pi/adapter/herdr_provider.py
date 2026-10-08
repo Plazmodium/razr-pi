@@ -520,6 +520,23 @@ class HerdrProvider:
         # Provider-side re-verification confirms the checkout; candidate read-back remains foundation caller authority.
         verify_candidate_identity(root, branch=value["candidate"]["branch"], commit=value["candidate"]["commit"], source_digest=value["candidate"]["source_digest"])
 
+    def _claim_root_identity(self, root: Path, root_id: str, attempt_id: str, request_digest: str) -> None:
+        if self.private_root is None: raise _fail("INVALID_REQUEST", "private root unavailable")
+        claims = _canonical_dir(str(self.private_root), "private_root") / "root-claims.jsonl"
+        claims.parent.mkdir(mode=0o700, exist_ok=True)
+        with claims.open("a+", encoding="utf-8") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX); stream.seek(0); rows = []
+            for line in stream:
+                if not line.endswith("\n"): raise _fail("LEDGER_CORRUPT", "partial root claims record")
+                try: row = json.loads(line)
+                except json.JSONDecodeError as exc: raise _fail("LEDGER_CORRUPT", "malformed root claims record") from exc
+                if not isinstance(row, dict) or set(row) != {"schema_version", "root_id", "path", "attempt_id", "request_digest", "claimed_at", "record_digest"} or row["record_digest"] != raw_file_digest(canonical_json({key: row[key] for key in row if key != "record_digest"})):
+                    raise _fail("LEDGER_CORRUPT", "corrupt root claims record")
+                rows.append(row)
+            if any(row["root_id"] == root_id or row["path"] == str(root) for row in rows): raise _fail("RESOURCE_REUSED", "root identity or canonical path was previously claimed")
+            row = {"schema_version": 1, "root_id": root_id, "path": str(root), "attempt_id": attempt_id, "request_digest": request_digest, "claimed_at": _now()}
+            row["record_digest"] = raw_file_digest(canonical_json(row)); stream.seek(0, 2); stream.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"); stream.flush(); os.fsync(stream.fileno()); fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
     def _claim_roots(self, request: ProviderRequest, capability_report_digest: str) -> None:
         values = request.value
         markers = []
@@ -554,7 +571,8 @@ class HerdrProvider:
                 raise _fail("RESOURCE_REUSED", f"{root_key} identity was previously used")
             digest, entries = _manifest(root)
             if digest != values[root_key + "_digest"] or entries: raise _fail("RESOURCE_REUSED", f"{root_key} manifest differs or is non-empty")
-            _marker(root, _id(values[id_key], id_key), digest, create=True)
+            root_id = _id(values[id_key], id_key); self._claim_root_identity(root, root_id, values["attempt_id"], raw_file_digest(canonical_json(values)))
+            _marker(root, root_id, digest, create=True)
         packet = {key: values[key] for key in ("schema_version", "request_id", "attempt_id", "role", "work", "worker_id", "branch", "candidate", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "fresh_context", "neutral_input_digest", "environment_policy_digest", "tool_policy_digest", "required_capabilities", "runtime", "limits", "allowance_id")}
         _digest(capability_report_digest, "capability_report_digest")
         packet["capability_report_digest"] = capability_report_digest
@@ -899,14 +917,30 @@ class HerdrProvider:
         self._settle({"attempt_id": request["attempt_id"]}, "UNKNOWN", cleanup="uncertain", reason="explicit recovery", evidence_refs=evidence)
         return {"schema_version": 1, "ok": True, "request_id": request_id, "result": {"attempt_id": request["attempt_id"], "outcome": "UNKNOWN", "recovered": True}}
 
+    def _prompt_snapshot(self, target: str) -> dict[str, object]:
+        raw = _envelope(self._exec([self.herdr, "agent", "get", target], timeout_ms=_CLI_TIMEOUT_MS), "prompt status")["result"]
+        agent = raw.get("agent") if isinstance(raw, dict) else None
+        if not isinstance(agent, dict) or agent.get("name") != target or not isinstance(agent.get("agent_status"), str) or not isinstance(agent.get("completion_seq"), int) or isinstance(agent["completion_seq"], bool): raise _fail("ARTIFACT_UNAVAILABLE", "prompt agent identity/completion telemetry is malformed")
+        return agent
+
     def prompt(self, target: str, text: str, *, timeout_ms: int) -> object:
         _id(target, "target")
         if not isinstance(text, str) or not text or timeout_ms <= 0: raise _fail("INVALID_REQUEST", "invalid prompt/bound")
-        return _envelope(self._exec([self.herdr, "agent", "prompt", target, text, "--wait", "--timeout", str(timeout_ms)], timeout_ms=timeout_ms), "prompt")
+        private = self._private_handles.get(target); pre = self._prompt_snapshot(target) if private is not None else None
+        try:
+            response = _envelope(self._exec([self.herdr, "agent", "prompt", target, text, "--wait", "--timeout", str(timeout_ms)], timeout_ms=timeout_ms), "prompt")
+        except ProtocolError as exc:
+            stderr = exc.details.get("stderr") if isinstance(exc.details, dict) else None
+            stalled = exc.code == "LAUNCH_FAILED" and isinstance(stderr, str) and "agent_prompt_stalled" in stderr
+            if not stalled or pre is None: raise
+            post = self._prompt_snapshot(target)
+            if post["agent_status"] not in {"idle", "done"} or post["completion_seq"] <= pre["completion_seq"]: raise
+            response = {"schema_version": 1, "ok": True, "request_id": "prompt", "result": {"status": "ACTIVE", "completion_seq": post["completion_seq"], "source": "herdr"}}
+        if private is not None: self._bind_session_if_available(private["handle"])
+        return response
 
     def _inspect_handle(self, handle: Mapping[str, object]) -> object:
         value = self._handle(handle); raw = _envelope(self._exec([self.herdr, "agent", "get", value["handle_id"]], timeout_ms=10_000), "inspect"); result = raw["result"]
-        self._bind_session_if_available(value)
         if not isinstance(result, dict) or not isinstance(result.get("agent"), dict): raise _fail("ARTIFACT_UNAVAILABLE", "agent status lacks nested agent")
         agent = result["agent"]
         if not isinstance(agent.get("name"), str) or agent["name"] != value["handle_id"]: raise _fail("IDENTITY_MISMATCH", "agent status name differs")
