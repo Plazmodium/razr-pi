@@ -371,6 +371,8 @@ class AttemptLedger:
                 except OSError as exc: unlock_error = exc
             try: stream.close()
             except OSError as exc:
+                try: os.close(stream.fileno())
+                except OSError: pass
                 if unlock_error is None: unlock_error = exc
             try: os.close(dirfd)
             except OSError as exc:
