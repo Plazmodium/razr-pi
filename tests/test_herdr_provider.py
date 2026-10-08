@@ -158,6 +158,20 @@ class HerdrProviderTests(unittest.TestCase):
                 with self.assertRaises(ProtocolError) as caught: provider._interrupt_handle(value, "timeout", "interrupt-repeat")
                 self.assertEqual(caught.exception.code, "IDENTITY_MISMATCH")
 
+    def test_successful_interrupt_uses_real_settlement_without_response_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); session = root / "session"; session.mkdir(); evidence = root / ".razr" / "evidence"; evidence.mkdir(parents=True)
+            packet = root / ".razr" / "request.json"; packet.write_bytes(b"{}")
+            candidate_file = evidence / "candidate.json"; candidate_file.write_bytes(b"{}")
+            digest = "sha256:" + "a" * 64; ref = {"ref": ".razr/evidence/candidate.json", "digest_domain": "canonical_json", "digest": raw_file_digest(b"{}")}; packet_ref = {"ref": ".razr/request.json", "digest_domain": "canonical_json", "digest": raw_file_digest(b"{}")}
+            started = {"schema_version": 1, "event": "STARTED", "attempt_id": "att-real-int", "work_id": "work", "node_id": "node", "worker_id": "worker", "observed_generation": 1, "observed_ordinal": 0, "provider_id": "herdr", "worktree_ref": ".", "branch": "feature/x", "allowance_id": "allow", "started_at": "2026-01-01T00:00:00Z", "started_at_source": "adapter_observed", "candidate": {"commit": "0" * 40, "source_digest": digest}, "candidate_evidence": ref, "request_packet": packet_ref, "output_root_id": "out", "output_root_digest": digest, "session_root_id": "sess", "session_root_digest": digest, "request_digest": digest, "herdr": {"workspace_id": "w", "tab_id": "t", "pane_id": "p"}, "prev_digest": "sha256:" + "0" * 64}
+            started["record_digest"] = raw_file_digest(canonical_json(started)); ledger = AttemptLedger(root / "attempts.jsonl"); ledger.append(started)
+            value = {"attempt_id": "att-real-int", "handle_id": "agent-real", "request_digest": digest, "host": {"mode": "herdr", "workspace_id": "w", "tab_id": "t", "pane_id": "p"}, "output_root_id": "out", "output_root_digest": digest, "session_root_id": "sess", "session_root_digest": digest}
+            provider = HerdrProvider(ledger=ledger, runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, b"", b"")); provider._attempt_paths[value["attempt_id"]] = root; provider._attempt_sessions[value["attempt_id"]] = session
+            with patch.object(provider, "_handle", return_value=value), patch.object(provider, "_inspect_handle", return_value={"result": {"status": "TERMINATED"}}):
+                result = provider._interrupt_handle(value, "cancel", "interrupt-real")
+            self.assertTrue(result["ok"]); settled = json.loads(ledger.path.read_text().splitlines()[1]); self.assertEqual(set(settled["evidence_refs"][0]), {"ref", "kind", "digest_domain", "digest"})
+
     def test_failing_interrupt_replays_same_protocol_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); session = root / "session"; session.mkdir()
