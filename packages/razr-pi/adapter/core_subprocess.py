@@ -100,13 +100,13 @@ def _validate_request(request: CoreRequest) -> tuple[Path, Path, Path]:
         if set(rows) != required:
             raise _fail("PROVENANCE_MISMATCH", "invalid provenance paths")
         for relative, pin in pins.items():
+            if rows.get(relative) != pin.sha256:
+                raise _fail("PROVENANCE_MISMATCH", "provenance declaration differs", path=relative)
             path = package / "runtime" / relative
             if not path.is_file() or path.is_symlink() or raw_file_digest(path.read_bytes()) != "sha256:" + pin.sha256:
                 raise _fail("PROVENANCE_MISMATCH", "pinned runtime file differs", path=relative)
         if raw_file_digest(runtime.read_bytes()) != "sha256:" + pins["scripts/razr.py"].sha256:
             raise _fail("PROVENANCE_MISMATCH", "runtime entrypoint bytes differ")
-            if rows.get(relative) != pin.sha256:
-                raise _fail("PROVENANCE_MISMATCH", "provenance declaration differs", path=relative)
     except ProtocolError:
         raise
     except (OSError, UnicodeDecodeError, UnicodeError, json.JSONDecodeError, TypeError, KeyError, ValueError) as exc:

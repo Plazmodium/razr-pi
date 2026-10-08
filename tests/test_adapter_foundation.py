@@ -224,6 +224,11 @@ class AdapterFoundationTests(unittest.TestCase):
                 with self.assertRaises(ProtocolError) as caught:
                     invoke_core(duplicate)
                 self.assertEqual(caught.exception.code, "PROVENANCE_MISMATCH")
+                bad_pin = dataclasses.replace(pins[0], sha256="0" * 64)
+                mismatch = dataclasses.replace(request("malformed"), expected_provenance=(bad_pin,) + pins[1:])
+                with self.assertRaises(ProtocolError) as caught:
+                    invoke_core(mismatch)
+                self.assertEqual(caught.exception.code, "PROVENANCE_MISMATCH")
             finally:
                 os.environ.update(forbidden)
 
