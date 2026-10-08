@@ -279,15 +279,22 @@ class AttemptLedger:
         if not isinstance(event, dict) or event.get("schema_version") != 1 or event.get("event") not in {"STARTED", "SETTLED"}:
             raise _fail("LEDGER_CORRUPT", "invalid attempt event")
         event.pop("prev_digest", None); event.pop("record_digest", None)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a+", encoding="utf-8") as stream:
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-            stream.seek(0); records: list[dict[str, object]] = []
-            for line in stream:
-                if not line.endswith("\n"): raise _fail("LEDGER_CORRUPT", "partial ledger line")
-                try: row = json.loads(line)
-                except json.JSONDecodeError as exc: raise _fail("LEDGER_CORRUPT", "malformed ledger JSON") from exc
-                records.append(self._replay_validate(row))
+        try: self.path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc: raise _fail("LOCK_UNAVAILABLE", "attempt ledger cannot create its parent") from exc
+        try: stream = self.path.open("a+", encoding="utf-8")
+        except OSError as exc: raise _fail("LOCK_UNAVAILABLE", "attempt ledger cannot be opened") from exc
+        locked = False; original_length = 0
+        try:
+            try: fcntl.flock(stream.fileno(), fcntl.LOCK_EX); locked = True
+            except OSError as exc: raise _fail("LOCK_UNAVAILABLE", "attempt ledger cannot be locked") from exc
+            try:
+                stream.seek(0, 2); original_length = stream.tell(); stream.seek(0); records: list[dict[str, object]] = []
+                for line in stream:
+                    if not line.endswith("\n"): raise _fail("LEDGER_CORRUPT", "partial ledger line")
+                    try: row = json.loads(line)
+                    except json.JSONDecodeError as exc: raise _fail("LEDGER_CORRUPT", "malformed ledger JSON") from exc
+                    records.append(self._replay_validate(row))
+            except OSError as exc: raise _fail("LOCK_UNAVAILABLE", "attempt ledger cannot be read") from exc
             self._replay_chain(records)
             previous = records[-1]["record_digest"] if records else "sha256:" + "0" * 64
             event["prev_digest"] = previous
@@ -304,8 +311,23 @@ class AttemptLedger:
                 for key in ("work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "branch", "worktree_ref", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest"):
                     if event.get(key) != started.get(key): raise _fail("IDENTITY_MISMATCH", f"settlement {key} differs")
                 if event.get("herdr") != started.get("herdr"): raise _fail("IDENTITY_MISMATCH", "settlement Herdr identity differs")
-            stream.seek(0, 2); stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"); stream.flush(); os.fsync(stream.fileno())
-            fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            try:
+                stream.seek(0, 2); stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"); stream.flush(); os.fsync(stream.fileno())
+            except OSError as exc:
+                try:
+                    stream.seek(original_length); stream.truncate(); stream.flush(); os.fsync(stream.fileno())
+                except OSError as rollback_exc:
+                    raise _fail("LEDGER_CORRUPT", "attempt ledger append rollback could not be established") from rollback_exc
+                raise _fail("LOCK_UNAVAILABLE", "attempt ledger append could not be durably completed") from exc
+        finally:
+            unlock_error = None
+            if locked:
+                try: fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                except OSError as exc: unlock_error = exc
+            try: stream.close()
+            except OSError as exc:
+                if unlock_error is None: unlock_error = exc
+            if unlock_error is not None: raise _fail("LOCK_UNAVAILABLE", "attempt ledger lock could not be released") from unlock_error
         return event
 
 

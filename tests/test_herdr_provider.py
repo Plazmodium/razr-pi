@@ -132,6 +132,16 @@ class HerdrProviderTests(unittest.TestCase):
             with self.assertRaises(ProtocolError) as caught: ledger.append(started)
             self.assertEqual(caught.exception.code, "DUPLICATE_ATTEMPT")
             self.assertEqual(len(path.read_text().splitlines()), 2)
+            with patch("adapter.herdr_provider.fcntl.flock", side_effect=OSError("lock")):
+                with self.assertRaises(ProtocolError) as lock_error: ledger.append({**started, "attempt_id": "lock-fail", "allowance_id": "lock-allow"})
+            self.assertEqual(lock_error.exception.code, "LOCK_UNAVAILABLE")
+            original_bytes = path.read_bytes()
+            with patch("adapter.herdr_provider.os.fsync", side_effect=[OSError("disk"), None]):
+                with self.assertRaises(ProtocolError) as write_error: ledger.append({**started, "attempt_id": "write-fail", "allowance_id": "write-allow"})
+            self.assertEqual(write_error.exception.code, "LOCK_UNAVAILABLE"); self.assertEqual(path.read_bytes(), original_bytes)
+            with patch("adapter.herdr_provider.os.fsync", side_effect=[OSError("disk"), OSError("rollback"), OSError("close")]):
+                with self.assertRaises(ProtocolError) as rollback_error: ledger.append({**started, "attempt_id": "rollback-fail", "allowance_id": "rollback-allow"})
+            self.assertEqual(rollback_error.exception.code, "LEDGER_CORRUPT")
 
     def test_evidence_error_code_is_closed_by_kind_and_launch_scope(self):
         digest = "sha256:" + "a" * 64
