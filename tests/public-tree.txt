@@ -10,6 +10,7 @@ docs/CURRENT.md
 docs/architecture.md
 docs/audits/evidence-storage.md
 docs/audits/task-attempt-lifecycle.md
+docs/campaigns/razr-pi-next.md
 docs/capabilities.md
 docs/design/execution-provider.md
 docs/testing.md
