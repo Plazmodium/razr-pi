@@ -138,10 +138,10 @@ class HerdrProviderTests(unittest.TestCase):
             open_calls = []; list_calls = [0]
             def run(argv, **kwargs):
                 if argv[:3] == ["herdr", "agent", "start"]:
-                    result = {"agent": {"name": "worker-1", "agent": "pi", "agent_session": {"value": str(session / "pi-session.json")}, "workspace_id": "w", "tab_id": "t", "pane_id": "p", "telemetry": {"status": "ready"}}, "type": "agent_started"}
+                    result = {"agent": {"name": "worker-1", "agent": "pi", "agent_session": {"kind": "provisional", "agent": "pi", "value": "herdr:pi"}, "workspace_id": "w", "tab_id": "t", "pane_id": "p", "telemetry": {"status": "ready"}}, "type": "agent_started"}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "start", "result": result}).encode(), b"")
                 if argv[:3] == ["herdr", "agent", "get"]:
-                    result = {"status": "SETTLED", "workspace_id": "w", "tab_id": "t", "pane_id": "p", "observed_at": "2026-01-01T00:00:00Z", "source": "herdr", "agent_session": {"value": str(session / "pi-session.json")},  "telemetry": {"live": True}}
+                    result = {"status": "SETTLED", "workspace_id": "w", "tab_id": "t", "pane_id": "p", "observed_at": "2026-01-01T00:00:00Z", "source": "herdr", "agent_session": {"kind": "path", "agent": "pi", "value": str(session / "pi-session.json")},  "telemetry": {"live": True}}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "get", "result": result}).encode(), b"")
                 if argv[:3] == ["herdr", "worktree", "list"]:
                     list_calls[0] += 1
