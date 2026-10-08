@@ -1,25 +1,28 @@
-"""Deterministic, bounded repository context assembly for M03.
-
-This module is deliberately read-only.  The repository is authoritative; Memory is
-an explicitly labelled, lower-priority source of experience.
-"""
+"""Deterministic, bounded, read-only repository context assembly (M03)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import subprocess
 from typing import Any, Callable, Mapping
 
-from .protocol import ProtocolError, canonical_json, raw_file_digest, validate_git_object_id, validate_source_digest
+from .core_subprocess import _git_head, _source_digest, read_workflow_context
+from .protocol import (CoreRequest, ProtocolError, WorkflowRead, canonical_json,
+                       raw_file_digest, validate_git_object_id, validate_source_digest)
 
 KINDS = ("source", "tests", "config", "git", "workflow", "memory")
-_DOMAINS = {"raw_file", "canonical_json", "core_source", "executable", "git_object"}
-_LIMIT = {"max_files": 200, "max_bytes": 2_000_000, "max_memory_records": 100}
+_LIMITS = {"max_files": 200, "max_bytes": 2_000_000, "max_memory_records": 100}
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_TEXT_SUFFIXES = {".py", ".ts", ".tsx", ".js", ".jsx", ".md", ".yaml", ".yml", ".json", ".toml", ".ini"}
+_CONFIG_NAMES = {"razr.yaml", "package.json", "pyproject.toml", "tsconfig.json"}
+_PRIVATE_DIRS = {".git", ".razr", ".hg", ".svn", ".venv", "venv", "node_modules", "dist", "build", "target", "vendor", "__pycache__"}
+_MAX_DISCOVERED = 4096
+_MAX_DIR_ENTRIES = 512
+_MAX_HISTORY_BYTES = 64 * 1024
 
 
 def _error(code: str, message: str, **details: object) -> ProtocolError:
@@ -29,8 +32,8 @@ def _error(code: str, message: str, **details: object) -> ProtocolError:
 def _ref(value: str) -> str:
     if not isinstance(value, str) or not value or "\\" in value:
         raise _error("PATH_ESCAPE", "repository-relative POSIX path required")
-    p = PurePosixPath(value)
-    if p.is_absolute() or ".." in p.parts or str(p) != value or value == ".":
+    path = PurePosixPath(value)
+    if path.is_absolute() or ".." in path.parts or str(path) != value or value == ".":
         raise _error("PATH_ESCAPE", "path escapes repository")
     return value
 
@@ -56,32 +59,34 @@ class ContextRequest:
 
     @classmethod
     def from_dict(cls, value: Mapping[str, object]) -> "ContextRequest":
-        if not isinstance(value, Mapping) or set(value) - {"schema_version", "request_id", "objective", "repository_root", "work_id", "paths", "include", "limits", "observed"}:
+        fields = {"schema_version", "request_id", "objective", "repository_root", "work_id", "paths", "include", "limits", "observed"}
+        if not isinstance(value, Mapping) or set(value) - fields:
             raise _error("INVALID_REQUEST", "unknown context request field")
         required = ("schema_version", "request_id", "objective", "repository_root", "include", "limits")
         if any(key not in value or value[key] is None for key in required):
             raise _error("INVALID_REQUEST", "missing context request field")
+        if type(value["schema_version"]) is not int or value["schema_version"] != 1:
+            raise _error("INVALID_REQUEST", "schema_version must be integer 1")
         if any(key in value and value[key] is None for key in ("work_id", "paths", "observed")):
             raise _error("INVALID_REQUEST", "null is not permitted; omit optional fields")
         include = value["include"]
-        limits = value["limits"]
         if not isinstance(include, dict) or set(include) != set(KINDS) or any(type(v) is not bool for v in include.values()):
-            raise _error("INVALID_REQUEST", "include must contain the six context sources")
-        if not isinstance(limits, dict) or set(limits) - set(_LIMIT) or set(limits) != set(_LIMIT):
-            raise _error("INVALID_REQUEST", "limits must contain max_files, max_bytes and max_memory_records")
-        checked_limits = {}
-        for key, maximum in _LIMIT.items():
+            raise _error("INVALID_REQUEST", "include is not a closed boolean object")
+        limits = value["limits"]
+        if not isinstance(limits, dict) or set(limits) != set(_LIMITS):
+            raise _error("INVALID_REQUEST", "limits is not a closed object")
+        checked_limits: dict[str, int] = {}
+        for key, maximum in _LIMITS.items():
             number = limits[key]
             if type(number) is not int or not 0 < number <= maximum:
                 raise _error("LIMIT_EXCEEDED", "context limit is outside the bounded range", limit=key)
             checked_limits[key] = number
-        objective, repository = value["objective"], value["repository_root"]
-        request_id = value["request_id"]
+        request_id, objective, repository = value["request_id"], value["objective"], value["repository_root"]
         if not isinstance(request_id, str) or not _ID.fullmatch(request_id) or not isinstance(objective, str) or not objective or len(objective) > 4000 or not isinstance(repository, str):
             raise _error("INVALID_REQUEST", "invalid context identity or objective")
         paths = value.get("paths", [])
-        if not isinstance(paths, list) or any(not isinstance(p, str) for p in paths):
-            raise _error("INVALID_REQUEST", "paths must be a list")
+        if not isinstance(paths, list) or len(paths) > 256 or any(not isinstance(p, str) for p in paths):
+            raise _error("INVALID_REQUEST", "paths is not a bounded list")
         for path in paths:
             _ref(path)
         work_id = value.get("work_id")
@@ -90,120 +95,272 @@ class ContextRequest:
         observed = value.get("observed")
         if observed is not None:
             if not isinstance(observed, dict) or set(observed) != {"commit", "source_digest"}:
-                raise _error("INVALID_REQUEST", "observed identity is closed")
-            validate_git_object_id(observed["commit"]); validate_source_digest(observed["source_digest"])
+                raise _error("INVALID_REQUEST", "observed identity is not closed")
+            if type(observed["commit"]) is not str or type(observed["source_digest"]) is not str:
+                raise _error("INVALID_REQUEST", "observed identity values must be strings")
+            validate_git_object_id(observed["commit"])
+            validate_source_digest(observed["source_digest"])
         return cls(1, request_id, objective, repository, dict(include), checked_limits, work_id, tuple(paths), observed)
 
     def as_dict(self) -> dict[str, object]:
         result: dict[str, object] = {"schema_version": 1, "request_id": self.request_id, "objective": self.objective,
-            "repository_root": self.repository_root, "include": dict(self.include), "limits": dict(self.limits)}
+                                    "repository_root": self.repository_root, "include": dict(self.include), "limits": dict(self.limits)}
         if self.work_id is not None: result["work_id"] = self.work_id
         if self.paths: result["paths"] = list(self.paths)
         if self.observed is not None: result["observed"] = dict(self.observed)
         return result
 
 
+def _safe_components(root: Path, ref: str) -> Path:
+    target = root.joinpath(*PurePosixPath(ref).parts)
+    current = root
+    for part in PurePosixPath(ref).parts:
+        current = current / part
+        if current.is_symlink():
+            raise _error("PATH_ESCAPE", "linked repository path refused", ref=ref)
+    if not target.resolve().is_relative_to(root):
+        raise _error("PATH_ESCAPE", "path escapes repository", ref=ref)
+    return target
+
+
+def _read_bounded(root: Path, ref: str, max_content: int) -> tuple[bytes, str, int] | None:
+    """Read at most max_content bytes while streaming the complete file digest."""
+    target = _safe_components(root, _ref(ref))
+    if not target.is_file() or target.is_symlink() or max_content <= 0:
+        return None
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(target, flags)
+    except OSError as exc:
+        raise _error("PATH_ESCAPE", "file cannot be opened safely", ref=ref) from exc
+    digest = hashlib.sha256(); content = bytearray(); total = 0
+    try:
+        info = os.fstat(fd)
+        if not os.path.isfile(target) or not (info.st_mode & 0o170000) == 0o100000:
+            return None
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk: break
+            digest.update(chunk); total += len(chunk)
+            if len(content) < max_content:
+                content.extend(chunk[:max_content - len(content)])
+    except OSError as exc:
+        raise _error("INTERNAL", "bounded file read failed", ref=ref) from exc
+    finally:
+        os.close(fd)
+    return bytes(content), "sha256:" + digest.hexdigest(), total
+
+
+def _git_env(git: Path) -> dict[str, str]:
+    return {"PATH": str(git.parent), "HOME": os.devnull, "LANG": "C", "LC_ALL": "C",
+            "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0", "GIT_PAGER": "cat"}
+
+
+def _git_history(root: Path) -> list[dict[str, str]]:
+    found = shutil.which("git")
+    if not found:
+        raise _error("INTERNAL", "Git executable unavailable")
+    git = Path(found).resolve(strict=True)
+    if not git.is_file() or git.is_symlink():
+        raise _error("INTERNAL", "Git executable is not canonical")
+    argv = [str(git), "-C", str(root), "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+            "log", "-8", "--format=%H%x09%.500s"]
+    try:
+        result = subprocess.run(argv, cwd=root, env=_git_env(git), stdin=subprocess.DEVNULL,
+                                capture_output=True, timeout=10, check=True)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise _error("INTERNAL", "bounded Git history read failed") from exc
+    if len(result.stdout) > _MAX_HISTORY_BYTES or result.stderr:
+        raise _error("LIMIT_EXCEEDED", "Git history output exceeded bound")
+    try:
+        rows = []
+        for line in result.stdout.decode("utf-8").splitlines():
+            commit, separator, subject = line.partition("\t")
+            if not separator: raise ValueError("missing history separator")
+            validate_git_object_id(commit); rows.append({"commit": commit, "subject": subject})
+        return rows
+    except (UnicodeDecodeError, ValueError, ProtocolError) as exc:
+        raise _error("INTERNAL", "Git history response malformed") from exc
+
+
 class ContextEngine:
-    """Select bounded context using repository files, core readback, Git, and M02 Memory."""
+    """Select bounded context; repository and typed core readback outrank Memory."""
     def __init__(self, repository_root: Path | str, *, memory: Any = None,
-                 workflow: Callable[[ContextRequest], object] | None = None):
+                 core_request: CoreRequest | None = None,
+                 workflow: Callable[[ContextRequest], WorkflowRead] | None = None):
         self.root = _root(repository_root)
         self.memory = memory
+        self.core_request = core_request
         self.workflow = workflow
 
-    def _candidate_files(self, request: ContextRequest) -> list[str]:
+    def _candidate_files(self, request: ContextRequest) -> tuple[list[str], list[dict[str, str]]]:
         objective = set(re.findall(r"[a-z0-9][a-z0-9_.-]{2,}", request.objective.lower()))
-        explicit = list(request.paths)
-        names = []
-        for path in self.root.rglob("*"):
-            if not path.is_file() or path.is_symlink(): continue
-            ref = path.relative_to(self.root).as_posix()
-            if ref.startswith(".git/") or ref.startswith(".razr/"): continue
-            if ref in explicit: continue
-            if path.suffix.lower() in {".py", ".ts", ".js", ".md", ".yaml", ".yml", ".json", ".toml", ".ini"}:
-                names.append(ref)
+        refs = list(request.paths); omitted: list[dict[str, str]] = []
+        seen = set(refs); queue = [self.root]; discovered = 0
+        while queue and discovered < _MAX_DISCOVERED:
+            directory = queue.pop(0)
+            try: entries = sorted(os.scandir(directory), key=lambda e: e.name)
+            except OSError: continue
+            if len(entries) > _MAX_DIR_ENTRIES:
+                omitted.append({"ref": directory.relative_to(self.root).as_posix() or ".", "reason": "directory-entry-limit"})
+                entries = entries[:_MAX_DIR_ENTRIES]
+            for entry in entries:
+                ref = entry.path if False else Path(entry.path).relative_to(self.root).as_posix()
+                if entry.name in _PRIVATE_DIRS or ref.startswith(tuple(p + "/" for p in _PRIVATE_DIRS)): continue
+                try: info = entry.stat(follow_symlinks=False)
+                except OSError: omitted.append({"ref": ref, "reason": "unsafe"}); continue
+                if entry.is_dir() and not entry.is_symlink(): queue.append(Path(entry.path)); continue
+                if not entry.is_file() or entry.is_symlink() or Path(entry.name).suffix.lower() not in _TEXT_SUFFIXES: continue
+                discovered += 1
+                if ref not in seen:
+                    refs.append(ref); seen.add(ref)
+        if discovered >= _MAX_DISCOVERED:
+            omitted.append({"ref": ".", "reason": "discovery-limit"})
         def score(ref: str) -> tuple[int, str]:
-            low = ref.lower(); base = Path(ref).name.lower()
-            rank = 0
+            low, base = ref.lower(), Path(ref).name.lower(); rank = 0
             if any(token in low for token in objective): rank -= 30
             if base in {"readme.md", "razr.yaml", "pyproject.toml", "package.json"}: rank -= 20
             if "/test" in low or base.startswith("test_"): rank -= 10
             return rank, ref
-        return sorted(explicit + sorted(names, key=score), key=score)
+        return sorted(refs, key=score), omitted
 
-    def _item_file(self, ref: str, remaining: int, authority: str = "repository") -> dict[str, object] | None:
-        _ref(ref); target = self.root / ref
-        if target.is_symlink() or not target.resolve().is_relative_to(self.root) or not target.is_file(): return None
-        data = target.read_bytes()
-        if not remaining: return None
-        content = data[:remaining]
+    def _item_file(self, ref: str, remaining: int) -> dict[str, object] | None:
+        target = _safe_components(self.root, _ref(ref))
+        try:
+            if target.stat(follow_symlinks=False).st_size > remaining:
+                return None
+        except OSError:
+            return None
+        value = _read_bounded(self.root, ref, remaining)
+        if value is None: return None
+        content, digest, total = value
         try: text = content.decode("utf-8")
-        except UnicodeDecodeError: return {"kind":"file", "ref":ref, "digest_domain":"raw_file", "digest":raw_file_digest(data), "bytes":0, "reason":"binary metadata", "authority":authority, "metadata":{"type":"binary","ref":ref}}
-        return {"kind":"file", "ref":ref, "digest_domain":"raw_file", "digest":raw_file_digest(data), "bytes":len(content), "reason":"selected by objective and repository priority", "authority":authority, "content_utf8":text}
+        except UnicodeDecodeError:
+            return {"kind": "file", "ref": ref, "digest_domain": "raw_file", "digest": digest, "bytes": 0,
+                    "reason": "binary metadata", "authority": "repository", "metadata": {"type": "binary", "ref": ref}}
+        return {"kind": "file", "ref": ref, "digest_domain": "raw_file", "digest": digest, "bytes": len(content),
+                "reason": "selected bounded repository evidence", "authority": "repository", "content_utf8": text}
+
+    @staticmethod
+    def _workflow_value(read: WorkflowRead) -> dict[str, object]:
+        candidate = {"repository": read.candidate_repository, "branch": read.candidate_branch,
+                     "commit": read.candidate_commit, "source_digest": read.candidate_source_digest}
+        return {"work_id": read.work_id, "stage": read.stage, "status": read.status, "generation": read.generation,
+                "node_id": read.node_id, "node_status": read.node_status, "node_attempt": read.node_attempt,
+                "node_result_ref": read.node_result_ref, "candidate": candidate, "status_row": read.status_row,
+                "raw_state_digest": read.raw_state_digest, "raw_state_bytes": read.raw_state_bytes,
+                "core_identity": read.raw_state_core_identity, "source_digest": read.raw_state_source_digest}
+
+    def _read_workflow(self, request: ContextRequest) -> WorkflowRead:
+        if not request.work_id: raise _error("INVALID_REQUEST", "work_id is required for workflow context")
+        if self.core_request is not None:
+            # The shared boundary owns status -> validate -> raw state and provenance checks.
+            try: return read_workflow_context(self.core_request, request.work_id)
+            except ProtocolError as exc:
+                if exc.code in {"SOURCE_CHANGED", "IDENTITY_MISMATCH", "DIGEST_MISMATCH"}:
+                    raise
+                raise _error("WORKFLOW_UNAVAILABLE", "typed core workflow readback failed", cause=exc.code) from exc
+        if self.workflow is None:
+            raise _error("WORKFLOW_UNAVAILABLE", "typed core workflow readback boundary unavailable")
+        try: read = self.workflow(request)
+        except ProtocolError: raise
+        except Exception as exc: raise _error("WORKFLOW_UNAVAILABLE", "workflow readback failed") from exc
+        if not isinstance(read, WorkflowRead):
+            raise _error("WORKFLOW_UNAVAILABLE", "workflow seam did not return WorkflowRead")
+        return read
+
+    def _verify_workflow_candidate(self, read: WorkflowRead) -> None:
+        try:
+            actual_commit = _git_head(self.root)
+            actual_source = _source_digest(self.root, actual_commit)
+        except ProtocolError as exc:
+            raise _error("SOURCE_CHANGED", "workflow candidate identity could not be verified", cause=exc.code) from exc
+        if ((read.candidate_commit is not None and read.candidate_commit != actual_commit)
+                or (read.candidate_source_digest is not None and read.candidate_source_digest != actual_source)):
+            raise _error("IDENTITY_MISMATCH", "core workflow candidate differs from verified checkout")
+
+    def _verify_observed(self, observed: dict[str, str], read: WorkflowRead | None = None) -> None:
+        try:
+            actual_commit = _git_head(self.root)
+            actual_source = _source_digest(self.root, actual_commit)
+        except ProtocolError as exc:
+            raise _error("SOURCE_CHANGED", "candidate identity could not be verified", cause=exc.code) from exc
+        if observed["commit"] != actual_commit or observed["source_digest"] != actual_source:
+            raise _error("SOURCE_CHANGED", "observed candidate identity is stale", expected=observed,
+                         actual={"commit": actual_commit, "source_digest": actual_source})
+        if read is not None and (read.candidate_commit not in (None, actual_commit) or read.candidate_source_digest not in (None, actual_source)):
+            raise _error("IDENTITY_MISMATCH", "core candidate differs from verified checkout")
 
     def build(self, request: ContextRequest | Mapping[str, object]) -> dict[str, object]:
-        if not isinstance(request, ContextRequest): request = ContextRequest.from_dict(request)
-        if request.repository_root != "." and Path(request.repository_root).is_absolute() and Path(request.repository_root).resolve() != self.root:
+        parsed = request if isinstance(request, ContextRequest) else ContextRequest.from_dict(request)
+        if parsed.repository_root != "." and Path(parsed.repository_root).is_absolute() and Path(parsed.repository_root).resolve() != self.root:
             raise _error("INVALID_REQUEST", "request root differs from engine root")
-        items: list[dict[str, object]] = []; omitted: list[dict[str, str]] = []; used = 0
-        if request.include["workflow"] and self.workflow is not None:
-            try:
-                value = self.workflow(request)
-                items.append({"kind":"workflow", "ref":request.work_id or "current", "digest_domain":"canonical_json", "digest":raw_file_digest(canonical_json(value)), "bytes":0, "reason":"core read-only readback", "authority":"workflow", "metadata":{"type":"core_readback","ref":request.work_id or "current"}})
-            except ProtocolError: raise
-            except Exception as exc: raise _error("WORKFLOW_UNAVAILABLE", "core workflow readback unavailable") from exc
-        elif request.include["workflow"]:
-            raise _error("WORKFLOW_UNAVAILABLE", "workflow readback boundary unavailable")
-        kinds = ["source", "test", "config"]
-        if any(request.include[k] for k in kinds):
-            for ref in self._candidate_files(request):
-                is_test = "/test" in ref.lower() or Path(ref).name.startswith("test_")
-                is_config = Path(ref).name in {"razr.yaml", "package.json", "pyproject.toml", "tsconfig.json"} or Path(ref).suffix in {".toml", ".ini"}
-                kind = "test" if is_test and request.include["tests"] else "config" if is_config and request.include["config"] else "source" if request.include["source"] else None
-                if kind is None: continue
-                if len(items) >= request.limits["max_files"] or used >= request.limits["max_bytes"]:
-                    omitted.append({"ref":ref, "reason":"limit"}); continue
-                item = self._item_file(ref, request.limits["max_bytes"] - used)
-                if item is None: omitted.append({"ref":ref, "reason":"unsafe"}); continue
-                item["kind"] = "file"; item["reason"] = f"selected {kind} evidence by objective and repository priority"
-                items.append(item); used += int(item["bytes"])
-        if request.include["git"]:
-            try:
-                result = subprocess.run(["git", "-C", str(self.root), "log", "-8", "--format=%H%x09%s"], cwd=self.root, env={"PATH":os.environ.get("PATH", os.defpath), "GIT_CONFIG_NOSYSTEM":"1", "GIT_CONFIG_GLOBAL":os.devnull, "GIT_OPTIONAL_LOCKS":"0"}, capture_output=True, check=True, timeout=10)
-                text = result.stdout.decode("utf-8")
-                entries = []
-                for line in text.splitlines():
-                    commit, _, subject = line.partition("\t"); validate_git_object_id(commit); entries.append({"commit":commit,"subject":subject[:500]})
-                items.append({"kind":"git_history","ref":"HEAD","digest_domain":"canonical_json","digest":raw_file_digest(canonical_json(entries)),"bytes":0,"reason":"bounded recent history","authority":"repository","metadata":{"type":"git_history","ref":"HEAD","note":"8 commits maximum"}})
-            except (OSError, subprocess.SubprocessError, UnicodeDecodeError, ProtocolError) as exc: raise _error("INTERNAL", "Git history read failed") from exc
+        items: list[dict[str, object]] = []; omitted: list[dict[str, str]] = []; used = 0; read: WorkflowRead | None = None
+        if parsed.observed is not None:
+            self._verify_observed(parsed.observed)
+        if parsed.include["workflow"]:
+            read = self._read_workflow(parsed)
+            self._verify_workflow_candidate(read)
+            if parsed.observed is not None: self._verify_observed(parsed.observed, read)
+            value = self._workflow_value(read)
+            items.append({"kind": "workflow", "ref": read.work_id, "digest_domain": "canonical_json",
+                          "digest": raw_file_digest(canonical_json(value)), "bytes": 0,
+                          "reason": "shared core status/validate/readback", "authority": "repository",
+                          "metadata": {"type": "core_readback", "ref": read.work_id,
+                                       "note": "relevant state only; raw state is not dumped"}})
+        refs, discovery_omitted = self._candidate_files(parsed); omitted.extend(discovery_omitted)
+        for ref in refs:
+            is_test = "/test" in ref.lower() or Path(ref).name.startswith("test_")
+            is_config = Path(ref).name in _CONFIG_NAMES or Path(ref).suffix.lower() in {".toml", ".ini"}
+            kind = "tests" if is_test and parsed.include["tests"] else "config" if is_config and parsed.include["config"] else "source" if parsed.include["source"] else None
+            if kind is None: continue
+            if len(items) >= parsed.limits["max_files"] or used >= parsed.limits["max_bytes"]:
+                omitted.append({"ref": ref, "reason": "limit"}); continue
+            item = self._item_file(ref, parsed.limits["max_bytes"] - used)
+            if item is None: omitted.append({"ref": ref, "reason": "unsafe"}); continue
+            item["reason"] = f"selected bounded {kind} evidence"; items.append(item); used += int(item["bytes"])
+        if parsed.include["git"]:
+            entries = _git_history(self.root)
+            items.append({"kind": "git_history", "ref": "HEAD", "digest_domain": "canonical_json",
+                          "digest": raw_file_digest(canonical_json(entries)), "bytes": 0,
+                          "reason": "bounded recent history", "authority": "repository",
+                          "metadata": {"type": "git_history", "ref": "HEAD", "note": "8 commits maximum"}})
         stale: list[str] = []
-        if request.include["memory"]:
+        if parsed.include["memory"]:
             if self.memory is None: raise _error("MEMORY_UNAVAILABLE", "Memory recall boundary unavailable", retryable=True)
-            try: recalled = self.memory.recall(request.objective, paths=list(request.paths), limit=request.limits["max_memory_records"])
+            try: recalled = self.memory.recall(parsed.objective, paths=list(parsed.paths), limit=parsed.limits["max_memory_records"])
             except ProtocolError as exc: raise _error("MEMORY_UNAVAILABLE", "Memory recall failed", retryable=exc.retryable) from exc
             stale = list(recalled["stale_ids"])
             for record in recalled["records"]:
-                items.append({"kind":"memory", "ref":record["id"], "digest_domain":"canonical_json", "digest":record["record_digest"], "bytes":0, "reason":"lower-priority experience; repository evidence outranks it", "authority":"memory", "metadata":{"type":"memory_record","ref":record["id"]}})
+                status = record["status"]
+                label = "stale conflict: repository evidence outranks Memory" if status == "stale" else "lower authority than repository evidence"
+                items.append({"kind": "memory", "ref": record["id"], "digest_domain": "canonical_json",
+                              "digest": record["record_digest"], "bytes": 0,
+                              "reason": f"{label}; status={status}", "authority": "memory",
+                              "metadata": {"type": "memory_record", "ref": record["id"], "note": f"status={status}; authority=lower-than-repository"}})
         items.sort(key=lambda item: (item["kind"], item["ref"], item["digest"]))
         sources = []
         for item in items:
             if item["kind"] == "memory": continue
             if item["kind"] == "file":
                 ref = str(item["ref"]); base = Path(ref).name
-                source_kind = "test" if "/test" in ref.lower() or base.startswith("test_") else "config" if base in {"razr.yaml", "package.json", "pyproject.toml", "tsconfig.json"} or Path(ref).suffix in {".toml", ".ini"} else "source"
+                source_kind = "test" if "/test" in ref.lower() or base.startswith("test_") else "config" if base in _CONFIG_NAMES or Path(ref).suffix.lower() in {".toml", ".ini"} else "source"
             elif item["kind"] == "git_history": source_kind = "git"
             else: source_kind = "workflow"
-            sources.append({"kind": source_kind, "ref":item["ref"], "digest_domain":item["digest_domain"], "digest":item["digest"], "reason":item["reason"]})
-        packet = {"schema_version":1,"request_id":request.request_id,"authoritative_sources":sources,"items":items,"omitted":omitted,"stale_memory_ids":sorted(stale)}
-        packet["packet_digest"] = raw_file_digest(canonical_json({k:packet[k] for k in packet if k != "packet_digest"}))
+            sources.append({"kind": source_kind, "ref": item["ref"], "digest_domain": item["digest_domain"], "digest": item["digest"], "reason": item["reason"]})
+        packet = {"schema_version": 1, "request_id": parsed.request_id, "authoritative_sources": sources,
+                  "items": items, "omitted": omitted, "stale_memory_ids": sorted(stale)}
+        packet["packet_digest"] = raw_file_digest(canonical_json(packet))
         return packet
 
     def context(self, request: ContextRequest | Mapping[str, object]) -> dict[str, object]:
         parsed = request if isinstance(request, ContextRequest) else ContextRequest.from_dict(request)
         result = self.build(parsed)
         digest = result.pop("packet_digest")
-        result = {"packet_digest": digest, **result}
-        return {"schema_version": 1, "ok": True, "request_id": parsed.request_id, "result": result}
+        return {"schema_version": 1, "ok": True, "request_id": parsed.request_id,
+                "result": {"packet_digest": digest, **result}}
 
 
 def build_context(request: ContextRequest | Mapping[str, object], repository_root: Path | str, **kwargs: object) -> dict[str, object]:

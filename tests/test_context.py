@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "packages/razr-pi"))
 from adapter.context import ContextEngine, ContextRequest  # noqa: E402
 from adapter.memory import MemoryStore  # noqa: E402
 from adapter.protocol import ProtocolError, raw_file_digest  # noqa: E402
+from adapter.core_subprocess import _git_head, _source_digest  # noqa: E402
 
 
 class ContextEngineTests(unittest.TestCase):
@@ -64,8 +65,26 @@ class ContextEngineTests(unittest.TestCase):
 
     def test_closed_request_and_safe_paths(self):
         with self.assertRaises(ProtocolError): ContextRequest.from_dict(dict(self.request, extra=True))
+        with self.assertRaises(ProtocolError): ContextRequest.from_dict(dict(self.request, schema_version=True))
         with self.assertRaises(ProtocolError): ContextRequest.from_dict(dict(self.request, paths=["../secret"]))
+        with self.assertRaises(ProtocolError): ContextRequest.from_dict(dict(self.request, include=dict(self.request["include"], source=1)))
         with self.assertRaises(ProtocolError): ContextRequest.from_dict(dict(self.request, limits={"max_files": 201, "max_bytes": 1, "max_memory_records": 1}))
+
+    def test_observed_identity_is_verified_not_advisory(self):
+        commit = _git_head(self.root)
+        source = _source_digest(self.root, commit)
+        request = dict(self.request, observed={"commit": commit, "source_digest": source})
+        self.assertTrue(ContextEngine(self.root).context(request)["ok"])
+        stale = dict(self.request, observed={"commit": "0" * 40, "source_digest": source})
+        with self.assertRaises(ProtocolError) as caught:
+            ContextEngine(self.root).context(stale)
+        self.assertEqual(caught.exception.code, "SOURCE_CHANGED")
+
+    def test_workflow_seam_cannot_return_untyped_authority(self):
+        request = dict(self.request, include=dict(self.request["include"], workflow=True), work_id="work")
+        with self.assertRaises(ProtocolError) as caught:
+            ContextEngine(self.root, workflow=lambda _: {"status": "complete"}).context(request)
+        self.assertEqual(caught.exception.code, "WORKFLOW_UNAVAILABLE")
 
 
 if __name__ == "__main__": unittest.main()
