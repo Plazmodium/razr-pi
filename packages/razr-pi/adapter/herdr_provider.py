@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import shutil
+import stat
 import time
 from typing import Callable, Mapping, Sequence
 
@@ -129,6 +130,22 @@ def _manifest(path: Path) -> tuple[str, list[dict[str, object]]]:
         total += len(data)
         entries.append({"path": child.name, "type": "file", "size": len(data), "digest": raw_file_digest(data)})
     return raw_file_digest(canonical_json(entries)), entries
+
+
+def _read_private_bytes(path: Path, private_root: Path, maximum: int = 1_048_576) -> bytes:
+    try:
+        canonical = path.resolve(strict=True)
+        if canonical != path or not canonical.is_relative_to(private_root) or canonical.is_symlink(): raise _fail("PATH_ESCAPE", "private record path is not canonical")
+        fd = os.open(canonical, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_size > maximum: raise _fail("IDENTITY_MISMATCH", "private record file is unsafe")
+            data = os.read(fd, maximum + 1)
+            if len(data) != info.st_size or len(data) > maximum: raise _fail("OUTPUT_LIMIT", "private record exceeds bound")
+            return data
+        finally: os.close(fd)
+    except ProtocolError: raise
+    except OSError as exc: raise _fail("IDENTITY_MISMATCH", "private record is unavailable") from exc
 
 
 def _marker(root: Path, root_id: str, digest: str, *, create: bool) -> None:
@@ -260,6 +277,8 @@ class AttemptLedger:
             event["record_digest"] = raw_file_digest(canonical_json(event))
             event = self._replay_validate(event)
             same = [row for row in records if row["attempt_id"] == event["attempt_id"]]
+            if event["event"] == "STARTED" and any(row["event"] == "STARTED" and row["allowance_id"] == event["allowance_id"] and row["attempt_id"] != event["attempt_id"] for row in records):
+                raise _fail("ALLOWANCE_REUSED", "allowance is already bound to another attempt")
             if event["event"] == "STARTED" and same: raise _fail("DUPLICATE_ATTEMPT", "duplicate STARTED")
             if event["event"] == "SETTLED" and (len(same) != 1 or same[0]["event"] != "STARTED"):
                 raise _fail("INVALID_ORDER", "SETTLED requires one prior STARTED")
@@ -635,9 +654,14 @@ class HerdrProvider:
             if any(result[key] != value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")): raise _fail("IDENTITY_MISMATCH", "agent host identity differs")
             pane = _envelope(self._exec([self.herdr, "pane", "get", value["host"]["pane_id"]], timeout_ms=10_000), "pane")
             pane_result = pane["result"]
-            if not isinstance(pane_result, dict) or "cwd" not in pane_result or "agent_id" not in pane_result: raise _fail("IDENTITY_MISMATCH", "pane response lacks actual agent cwd")
-            if _canonical_dir(pane_result["cwd"], "agent cwd") != _canonical_dir(value["worktree"], "worktree") or pane_result["agent_id"] != result["agent_id"]:
+            if not isinstance(pane_result, dict): raise _fail("IDENTITY_MISMATCH", "pane response is malformed")
+            if "foreground_cwd" in pane_result and "cwd" in pane_result and _canonical_dir(pane_result["foreground_cwd"], "foreground cwd") != _canonical_dir(pane_result["cwd"], "cwd"):
+                raise _fail("IDENTITY_MISMATCH", "pane cwd telemetry conflicts")
+            current_cwd = pane_result.get("foreground_cwd", pane_result.get("cwd"))
+            if not isinstance(current_cwd, str) or _canonical_dir(current_cwd, "agent cwd") != _canonical_dir(value["worktree"], "worktree"):
                 raise _fail("IDENTITY_MISMATCH", "agent cwd/worktree differs")
+            if "agent_id" in pane_result and pane_result["agent_id"] != result["agent_id"]:
+                raise _fail("IDENTITY_MISMATCH", "pane agent identity differs")
             handle = {"provider_id": "herdr", "handle_id": result["agent_id"], "request_digest": evidence["request_digest"], "attempt_id": value["attempt_id"], "host": value["host"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"]}
             if self.private_root is None: raise _fail("INVALID_REQUEST", "provider private root is unavailable")
             private_dir = _canonical_dir(str(self.private_root), "private_root") / "handles"
@@ -700,6 +724,11 @@ class HerdrProvider:
     def _bind_session_if_available(self, value: Mapping[str, object]) -> bool:
         private = self._private_handles.get(value["handle_id"])
         if private is None or private["session_status"] == "bound": return True
+        private_base = _canonical_dir(str(self.private_root), "private_root")
+        existing_record = private_base / private["session_record_ref"]
+        if existing_record.exists():
+            self._handle(value)
+            return True
         session_root = _canonical_dir(private["paths"]["session_root"], "session_root")
         candidate_path = None
         for attempt in range(3):
@@ -716,7 +745,7 @@ class HerdrProvider:
         opaque = "pi-session-" + hashlib.sha256(str(candidate_path).encode("utf-8")).hexdigest()
         record = {"schema_version": 1, "kind": "pi_session", "handle_id": value["handle_id"], "attempt_id": value["attempt_id"], "request_digest": value["request_digest"], "host": value["host"], "pi_session_path": str(candidate_path), "pi_session_id": opaque}
         record["record_digest"] = raw_file_digest(canonical_json(record))
-        private_base = _canonical_dir(str(self.private_root), "private_root"); path = private_base / private["session_record_ref"]
+        path = private_base / private["session_record_ref"]
         try:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as stream: stream.write(canonical_json(record)); stream.flush(); os.fsync(stream.fileno())
@@ -731,7 +760,7 @@ class HerdrProvider:
         if value["host"] != _host(): raise _fail("IDENTITY_MISMATCH", "foreign Herdr host")
         if self.private_root is None: raise _fail("IDENTITY_MISMATCH", "provider private root is unavailable")
         private_path = _canonical_dir(str(self.private_root), "private_root") / "handles" / ("handle-" + value["handle_id"] + ".json")
-        try: private = json.loads(private_path.read_text(encoding="utf-8"))
+        try: private = json.loads(_read_private_bytes(private_path, _canonical_dir(str(self.private_root), "private_root")).decode("utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "durable private handle evidence is unavailable") from exc
         private = _closed(private, {"schema_version", "handle", "agent_id", "pi_session_id", "session_status", "capability_report_digest", "session_record_ref", "session_record_digest", "handle_digest", "paths", "attempt_path", "attempt_ref", "record_digest"}, "private handle")
         paths = _closed(private["paths"], {"worktree", "output_root", "session_root"}, "private handle paths")
@@ -747,7 +776,7 @@ class HerdrProvider:
         if private["session_status"] == "pending":
             if private["session_record_digest"] is not None: raise _fail("IDENTITY_MISMATCH", "pending session digest is unexpected")
             if session_record_path.exists():
-                try: pending_record = json.loads(session_record_path.read_text(encoding="utf-8"))
+                try: pending_record = json.loads(_read_private_bytes(session_record_path, private_base).decode("utf-8"))
                 except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "pending session binding is malformed") from exc
                 pending_record = _closed(pending_record, {"schema_version", "kind", "handle_id", "attempt_id", "request_digest", "host", "pi_session_path", "pi_session_id", "record_digest"}, "private session record")
                 session_root = _canonical_dir(paths["session_root"], "session_root"); pending_path = Path(pending_record["pi_session_path"])
@@ -757,7 +786,7 @@ class HerdrProvider:
                     raise _fail("IDENTITY_MISMATCH", "pending session binding differs")
         else:
             _digest(private["session_record_digest"], "session_record_digest")
-            try: session_record = json.loads(session_record_path.read_text(encoding="utf-8"))
+            try: session_record = json.loads(_read_private_bytes(session_record_path, private_base).decode("utf-8"))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "private session record is unavailable") from exc
             session_record = _closed(session_record, {"schema_version", "kind", "handle_id", "attempt_id", "request_digest", "host", "pi_session_path", "pi_session_id", "record_digest"}, "private session record")
             session_body = {key: session_record[key] for key in session_record if key != "record_digest"}
@@ -1003,7 +1032,11 @@ class HerdrProvider:
         directory = _canonical_dir(str(self.private_root), "private_root") / "cleanup"
         directory.mkdir(mode=0o700, exist_ok=True)
         record = {"schema_version": 1, "attempt_id": handle["attempt_id"], "handle_id": handle["handle_id"], "request_digest": handle["request_digest"], "outcome": outcome, "observed_at": _now(), "details": details}
-        with (directory / "observations.jsonl").open("ab") as stream:
+        path = directory / "observations.jsonl"
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "ab") as stream:
+            stat_result = os.fstat(stream.fileno())
+            if not stat.S_ISREG(stat_result.st_mode) or stat_result.st_nlink != 1: raise _fail("CLEANUP_UNKNOWN", "cleanup record is unsafe")
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX); stream.write(canonical_json(record) + b"\n"); stream.flush(); os.fsync(stream.fileno()); fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
     def cleanup(self, handle: Mapping[str, object]) -> dict[str, object]:
