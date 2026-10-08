@@ -34,11 +34,13 @@ class HerdrProviderTests(unittest.TestCase):
         calls = []
         def run(argv, **kwargs):
             calls.append((argv, kwargs))
-            return subprocess.CompletedProcess(argv, 0, b"openai-codex/gpt-5.6-luna\n", b"")
-        result = HerdrProvider(runner=run).probe({"schema_version": 1, "request_id": "probe-1", "required_capabilities": ["runtime_identity"], "runtime": {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "thinking": "medium"}})
+            help_text = b"--no-session --session --continue --resume --cwd --path --pane --timeout --lines pane"
+            if argv[:2] == ["pi", "--list-models"]: return subprocess.CompletedProcess(argv, 0, b"openai-codex/gpt-5.6-luna\n", b"")
+            return subprocess.CompletedProcess(argv, 0, help_text, b"")
+        result = HerdrProvider(runner=run).probe({"schema_version": 1, "request_id": "probe-1", "required_capabilities": list(("fresh_context", "working_directory", "bounded_time", "bounded_output", "runtime_identity")), "runtime": {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "thinking": "medium"}})
         self.assertEqual(result["request_id"], "probe-1")
         self.assertEqual(result["result"]["runtime_identity"], "openai-codex/gpt-5.6-luna:medium")
-        self.assertEqual([call[0][:2] for call in calls], [["herdr", "--help"], ["herdr", "agent"], ["pi", "--list-models"]])
+        self.assertEqual([call[0][:2] for call in calls], [["herdr", "--help"], ["herdr", "agent"], ["herdr", "worktree"], ["herdr", "pane"], ["pi", "--help"], ["pi", "--list-models"]])
         self.assertTrue(all(call[1]["shell"] is False and call[1]["stdin"] is subprocess.DEVNULL for call in calls))
 
     def test_malformed_and_timeout_are_mechanical_errors(self):
@@ -92,18 +94,24 @@ class HerdrProviderTests(unittest.TestCase):
                 if argv[:3] == ["herdr", "agent", "get"]:
                     result = {"status": "SETTLED", "workspace_id": "w", "tab_id": "t", "pane_id": "p", "observed_at": "2026-01-01T00:00:00Z", "source": "herdr"}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "get", "result": result}).encode(), b"")
-                if argv[:2] == ["herdr", "--help"] or argv[:2] == ["herdr", "agent"]:
-                    return subprocess.CompletedProcess(argv, 0, b"help", b"")
-                if argv[:2] == ["pi", "--list-models"]:
-                    return subprocess.CompletedProcess(argv, 0, b"openai-codex/gpt-5.6-luna\n", b"")
                 if argv[:3] == ["herdr", "worktree", "open"]:
                     result = {"workspace_id": "w", "tab_id": "t", "pane_id": "p", "path": str(worktree)}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "open", "result": result}).encode(), b"")
                 if argv[:3] == ["herdr", "pane", "get"]:
                     result = {"cwd": str(worktree), "agent_id": "agent-1"}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "pane", "result": result}).encode(), b"")
+                if argv[:2] == ["herdr", "--help"] or argv[:2] == ["herdr", "agent"] or argv[:2] == ["herdr", "worktree"] or argv[:2] == ["herdr", "pane"]:
+                    return subprocess.CompletedProcess(argv, 0, b"help", b"")
+                if argv[:2] == ["pi", "--list-models"]:
+                    return subprocess.CompletedProcess(argv, 0, b"openai-codex/gpt-5.6-luna\n", b"")
+                if argv[:2] == ["pi", "--help"]:
+                    return subprocess.CompletedProcess(argv, 0, b"help", b"")
                 if argv[:3] == ["herdr", "agent", "read"]:
                     return subprocess.CompletedProcess(argv, 0, b"observed output", b"")
+                if argv[:3] == ["herdr", "pane", "close"] or argv[:3] == ["herdr", "worktree", "remove"]:
+                    return subprocess.CompletedProcess(argv, 0, b"", b"")
+                if argv[:3] == ["herdr", "worktree", "list"]:
+                    return subprocess.CompletedProcess(argv, 0, b"[]", b"")
                 if argv[:3] == ["git", "-C", str(worktree)] and argv[3] == "symbolic-ref":
                     return subprocess.CompletedProcess(argv, 0, b"feature/x\n", b"")
                 if argv[:3] == ["git", "-C", str(worktree)] and argv[3] == "rev-parse":
@@ -116,9 +124,12 @@ class HerdrProviderTests(unittest.TestCase):
             provider = HerdrProvider(runner=run, ledger=ledger, private_root=private)
             response = provider.launch(request); handle = response["result"]["handle"]
             self.assertEqual(set(handle), {"provider_id", "handle_id", "request_digest", "attempt_id", "host", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest"})
+            recovery = {"schema_version": 1, "request_id": "recover-1", "attempt_id": "att-1", "recovery_authority": {"kind": "explicit", "authority_id": "human-1", "asserted": True, "reason": "retained crash evidence"}, "retained_evidence": [{"ref": ".razr/evidence/crash.json", "digest_domain": "canonical_json", "digest": "sha256:" + "e" * 64, "kind": "recovery"}]}
+            self.assertEqual(provider.recover_unmatched(recovery)["result"]["outcome"], "UNKNOWN")
             collected = HerdrProvider(runner=run, ledger=ledger, private_root=private)
             result = collected.collect({"schema_version": 1, "request_id": "collect-1", "handle": handle})
             self.assertEqual(result["request_id"], "collect-1"); self.assertEqual(result["result"]["termination"], "UNKNOWN")
+            self.assertEqual(collected.cleanup(handle)["cleanup"], "confirmed")
             with self.assertRaises(ProtocolError): collected._handle({**handle, "request_digest": "sha256:" + "d" * 64})
             self.assertEqual(len(ledger.path.read_text().splitlines()), 2)
 

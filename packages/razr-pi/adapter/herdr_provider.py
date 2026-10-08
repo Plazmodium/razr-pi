@@ -32,6 +32,7 @@ _TERMINATIONS = {"SUCCEEDED", "FAILED", "INTERRUPTED", "TIMED_OUT", "UNKNOWN"}
 _STATUSES = {"STARTING", "ACTIVE", "SETTLED", "STOPPING", "TERMINATED", "UNKNOWN"}
 _OUTCOMES = _TERMINATIONS
 _REASONS = {"cancel", "timeout", "policy_violation"}
+_BASELINE_CAPABILITIES = ("fresh_context", "working_directory", "bounded_time", "bounded_output", "runtime_identity")
 
 
 def _fail(code: str, message: str, **details: object) -> ProtocolError:
@@ -332,9 +333,10 @@ class HerdrProvider:
         if result.returncode: raise _fail("LAUNCH_FAILED", "Herdr command failed", returncode=result.returncode, stderr=stderr.decode("utf-8", "replace")[:2000])
         return stdout
 
-    def _model(self) -> None:
+    def _model(self) -> str:
         output = self._exec([self.pi, "--list-models", "gpt-5.6-luna"], timeout_ms=10_000, max_output=262_144).decode("utf-8", "replace")
         if not any(line.strip() == _MODEL for line in output.splitlines()): raise _fail("UNSUPPORTED_CAPABILITY", "exact Pi model is not installed")
+        return output
 
     def probe(self, request: Mapping[str, object]) -> dict[str, object]:
         request = _closed(request, {"schema_version", "request_id", "required_capabilities", "runtime"}, "probe request")
@@ -345,11 +347,26 @@ class HerdrProvider:
         runtime = _closed(request["runtime"], {"provider", "model", "thinking"}, "probe runtime")
         if runtime["model"] != _MODEL or runtime["thinking"] != "medium": raise _fail("UNSUPPORTED_CAPABILITY", "exact Pi runtime required")
         _host()
-        if any(cap not in _CAPABILITIES or cap != "runtime_identity" for cap in caps): raise _fail("UNSUPPORTED_CAPABILITY", "capability is not directly evidenced by probe")
-        self._exec([self.herdr, "--help"], timeout_ms=10_000, max_output=262_144)
-        self._exec([self.herdr, "agent", "--help"], timeout_ms=10_000, max_output=262_144)
+        if any(cap not in _CAPABILITIES for cap in caps): raise _fail("UNSUPPORTED_CAPABILITY", "unknown capability")
+        herdr_help = self._exec([self.herdr, "--help"], timeout_ms=10_000, max_output=262_144).decode("utf-8", "replace")
+        agent_help = self._exec([self.herdr, "agent", "--help"], timeout_ms=10_000, max_output=262_144).decode("utf-8", "replace")
+        worktree_help = self._exec([self.herdr, "worktree", "--help"], timeout_ms=10_000, max_output=262_144).decode("utf-8", "replace")
+        pane_help = self._exec([self.herdr, "pane", "--help"], timeout_ms=10_000, max_output=262_144).decode("utf-8", "replace")
+        pi_help = self._exec([self.pi, "--help"], timeout_ms=10_000, max_output=262_144).decode("utf-8", "replace")
         self._model()
-        report = {"provider_id": self.provider_id, "runtime_identity": _MODEL + ":medium", "capabilities": ["runtime_identity"]}
+        capabilities = set()
+        if "--no-session" in pi_help and "--session" in pi_help and "--continue" in pi_help and "--resume" in pi_help:
+            capabilities.add("fresh_context")
+        if "--cwd" in worktree_help and "--path" in worktree_help and "--pane" in agent_help and "pane" in pane_help:
+            capabilities.add("working_directory")
+        if "--timeout" in agent_help and "--timeout" in herdr_help + pane_help:
+            capabilities.add("bounded_time")
+        if MAX_OUTPUT_BYTES := 1_048_576:
+            if MAX_OUTPUT_BYTES > 0 and "--lines" in pane_help + agent_help:
+                capabilities.add("bounded_output")
+        capabilities.add("runtime_identity")
+        if any(cap not in capabilities for cap in caps): raise _fail("UNSUPPORTED_CAPABILITY", "required capability was not directly evidenced")
+        report = {"provider_id": self.provider_id, "runtime_identity": _MODEL + ":medium", "capabilities": [cap for cap in _BASELINE_CAPABILITIES if cap in capabilities]}
         report["report_digest"] = raw_file_digest(canonical_json(report))
         return {"schema_version": 1, "ok": True, "request_id": request_id, "result": report}
 
@@ -470,7 +487,8 @@ class HerdrProvider:
             if self.private_root is None: raise _fail("INVALID_REQUEST", "provider private root is unavailable")
             private_dir = _canonical_dir(str(self.private_root), "private_root") / "handles"
             private_dir.mkdir(mode=0o700, exist_ok=True)
-            private = {"schema_version": 1, "handle": handle, "agent_id": result["agent_id"], "pi_session_id": result["pi_session_id"], "handle_digest": raw_file_digest(canonical_json(handle)), "paths": {"worktree": value["worktree"], "output_root": value["output_root"], "session_root": value["session_root"]}}
+            private = {"schema_version": 1, "handle": handle, "agent_id": result["agent_id"], "pi_session_id": result["pi_session_id"], "handle_digest": raw_file_digest(canonical_json(handle)), "paths": {"worktree": value["worktree"], "output_root": value["output_root"], "session_root": value["session_root"]}, "attempt_path": value["worktree"], "attempt_ref": "."}
+            private["record_digest"] = raw_file_digest(canonical_json(private))
             private_path = private_dir / ("handle-" + result["agent_id"] + ".json")
             private_bytes = canonical_json(private)
             fd = os.open(private_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -512,13 +530,14 @@ class HerdrProvider:
         private_path = _canonical_dir(str(self.private_root), "private_root") / "handles" / ("handle-" + value["handle_id"] + ".json")
         try: private = json.loads(private_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "durable private handle evidence is unavailable") from exc
-        private = _closed(private, {"schema_version", "handle", "agent_id", "pi_session_id", "handle_digest", "paths"}, "private handle")
+        private = _closed(private, {"schema_version", "handle", "agent_id", "pi_session_id", "handle_digest", "paths", "attempt_path", "attempt_ref", "record_digest"}, "private handle")
         paths = _closed(private["paths"], {"worktree", "output_root", "session_root"}, "private handle paths")
         private_base = _canonical_dir(str(self.private_root), "private_root")
         for name in paths:
             path = _canonical_dir(paths[name], name)
             if name != "worktree" and not path.is_relative_to(private_base): raise _fail("PATH_ESCAPE", "private handle path escapes provider root")
-        if private["schema_version"] != 1 or private["handle"] != value or private["handle_digest"] != raw_file_digest(canonical_json(value)): raise _fail("IDENTITY_MISMATCH", "handle evidence differs")
+        record_body = {key: private[key] for key in private if key != "record_digest"}
+        if private["schema_version"] != 1 or private["handle"] != value or private["handle_digest"] != raw_file_digest(canonical_json(value)) or private["record_digest"] != raw_file_digest(canonical_json(record_body)) or private["attempt_path"] != paths["worktree"] or private["attempt_ref"] != ".": raise _fail("IDENTITY_MISMATCH", "handle evidence differs")
         cached = self._private_handles.get(value["handle_id"])
         if cached is not None and cached != private: raise _fail("IDENTITY_MISMATCH", "in-memory handle evidence differs")
         self._private_handles[value["handle_id"]] = private
@@ -534,6 +553,28 @@ class HerdrProvider:
         if started is None or any(started.get(key) != value.get(key) for key in ("attempt_id", "provider_id", "request_digest", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest")) or started.get("herdr") != {key: value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")}:
             raise _fail("IDENTITY_MISMATCH", "handle does not match STARTED identity")
         return value
+
+    def recover_unmatched(self, request: Mapping[str, object]) -> dict[str, object]:
+        request = _closed(request, {"schema_version", "request_id", "attempt_id", "recovery_authority", "retained_evidence"}, "recovery request")
+        if request["schema_version"] != 1: raise _fail("INVALID_REQUEST", "invalid recovery schema")
+        request_id = _id(request["request_id"], "request_id"); _id(request["attempt_id"], "attempt_id")
+        authority = _closed(request["recovery_authority"], {"kind", "authority_id", "asserted", "reason"}, "recovery authority")
+        if authority["kind"] != "explicit" or authority["asserted"] is not True: raise _fail("INVALID_REQUEST", "explicit recovery authority is required")
+        _id(authority["authority_id"], "authority_id")
+        if not isinstance(authority["reason"], str) or not authority["reason"]: raise _fail("INVALID_REQUEST", "recovery reason is required")
+        evidence = request["retained_evidence"]
+        if not isinstance(evidence, list) or not evidence: raise _fail("ARTIFACT_UNAVAILABLE", "retained recovery evidence is required")
+        for ref in evidence: AttemptLedger._ref(ref, "evidence_ref")
+        if self.ledger is None or not self.ledger.path.exists(): raise _fail("LEDGER_CORRUPT", "recovery ledger is unavailable")
+        try: records = [AttemptLedger._validate_event(json.loads(line)) for line in self.ledger.path.read_text(encoding="utf-8").splitlines()]
+        except (OSError, json.JSONDecodeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "recovery ledger cannot be replayed") from exc
+        started = next((row for row in records if row["event"] == "STARTED" and row["attempt_id"] == request["attempt_id"]), None)
+        if started is None: raise _fail("INVALID_ORDER", "no unmatched STARTED event")
+        if any(row["attempt_id"] == request["attempt_id"] and row["event"] == "SETTLED" for row in records): raise _fail("INVALID_ORDER", "attempt is already settled")
+        settled = {key: started[key] for key in ("schema_version", "attempt_id", "work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "worktree_ref", "branch", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest", "herdr")}
+        settled.update({"event": "SETTLED", "settled_at": _now(), "outcome": "UNKNOWN", "evidence_refs": evidence, "prev_digest": records[-1]["record_digest"], "cleanup": "uncertain"})
+        settled["record_digest"] = raw_file_digest(canonical_json(settled)); self.ledger.append(settled)
+        return {"schema_version": 1, "ok": True, "request_id": request_id, "result": {"attempt_id": request["attempt_id"], "outcome": "UNKNOWN", "recovered": True}}
 
     def prompt(self, target: str, text: str, *, timeout_ms: int) -> object:
         _id(target, "target")
@@ -557,6 +598,17 @@ class HerdrProvider:
         if timeout_ms <= 0: raise _fail("INVALID_REQUEST", "invalid wait bound")
         return _envelope(self._exec([self.herdr, "agent", "wait", value["handle_id"], "--timeout", str(timeout_ms)], timeout_ms=timeout_ms), "wait")
 
+    def _private_observation(self, handle: Mapping[str, object], kind: str, value: Mapping[str, object]) -> bytes:
+        root = self._attempt_roots[handle["attempt_id"]][1]
+        data = canonical_json({"schema_version": 1, "kind": kind, "attempt_id": handle["attempt_id"], "handle_id": handle["handle_id"], "request_digest": handle["request_digest"], "host": handle["host"], "observation": dict(value)})
+        if len(data) > 65_536: raise _fail("OUTPUT_LIMIT", "private observation exceeds bound")
+        path = root / (kind + "-" + handle["attempt_id"] + ".json")
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as stream: stream.write(data); stream.flush(); os.fsync(stream.fileno())
+        except FileExistsError as exc: raise _fail("RESOURCE_REUSED", "private observation already exists") from exc
+        return data
+
     def _interrupt_handle(self, handle: Mapping[str, object], reason: str = "cancel") -> dict[str, object]:
         value = self._handle(handle)
         if reason not in _REASONS: raise _fail("INVALID_REQUEST", "invalid interrupt reason")
@@ -564,9 +616,12 @@ class HerdrProvider:
             self._exec([self.herdr, "agent", "send-keys", value["handle_id"], "ctrl-c"], timeout_ms=10_000)
             observed = self._inspect_handle(value)["result"]["status"]
             cleanup = "confirmed" if observed in {"SETTLED", "TERMINATED"} else "uncertain"
+            self._private_observation(value, "interrupt", {"reason": reason, "observed": observed, "cleanup": cleanup})
             self._settle(value, "INTERRUPTED" if cleanup == "confirmed" else "UNKNOWN", cleanup=cleanup, reason=reason)
             return {"schema_version": 1, "ok": True, "request_id": "interrupt", "result": {"attempt_id": value["attempt_id"], "host": value["host"], "requested": True, "observed": observed, "cleanup": cleanup}}
         except ProtocolError as exc:
+            try: self._private_observation(value, "interrupt", {"reason": reason, "observed": "UNKNOWN", "error": str(exc)[:500]})
+            except ProtocolError: pass
             self._settle(value, "UNKNOWN", cleanup="uncertain", reason=str(exc))
             raise
 
