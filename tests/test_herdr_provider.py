@@ -245,7 +245,7 @@ class HerdrProviderTests(unittest.TestCase):
             with patch.object(provider, "_handle", return_value=value), patch.object(provider, "_settle"):
                 with self.assertRaises(ProtocolError) as first: provider._interrupt_handle(value, "cancel", "interrupt-fail")
                 with self.assertRaises(ProtocolError) as second: provider._interrupt_handle(value, "cancel", "interrupt-fail")
-            self.assertEqual(first.exception.code, second.exception.code); self.assertEqual(str(first.exception), str(second.exception)); self.assertEqual(len(calls), 1)
+            self.assertEqual(first.exception.code, second.exception.code); self.assertEqual(str(first.exception), str(second.exception)); self.assertEqual(len(calls), 1); self.assertEqual(calls[0][-1], "ctrl+c")
 
     def test_collection_failure_with_malformed_ledger_maps_and_retains_private_record(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -261,7 +261,7 @@ class HerdrProviderTests(unittest.TestCase):
     def test_agent_get_nested_status_projection_maps_all_telemetry(self):
         value = {"attempt_id": "att-status", "handle_id": "worker-status", "request_digest": "sha256:" + "a" * 64, "host": {"mode": "herdr", "workspace_id": "w", "tab_id": "t", "pane_id": "p"}, "output_root_id": "out", "output_root_digest": "sha256:" + "b" * 64, "session_root_id": "sess", "session_root_digest": "sha256:" + "c" * 64}
         provider = HerdrProvider(); provider._private_handles[value["handle_id"]] = {"session_status": "pending"}
-        for telemetry, expected in (("starting", "STARTING"), ("working", "ACTIVE"), ("idle", "ACTIVE"), ("done", "SETTLED"), ("blocked", "ACTIVE"), ("unknown", "UNKNOWN")):
+        for telemetry, expected in (("starting", "STARTING"), ("working", "ACTIVE"), ("idle", "ACTIVE"), ("done", "ACTIVE"), ("blocked", "ACTIVE"), ("unknown", "UNKNOWN")):
             raw = {"id": "get", "result": {"agent": {"name": "worker-status", "agent_status": telemetry, "workspace_id": "w", "tab_id": "t", "pane_id": "p", "extra": True}}}
             with patch.object(provider, "_handle", return_value=value), patch.object(provider, "_bind_session_if_available", return_value=False), patch.object(provider, "_exec", return_value=json.dumps(raw).encode()):
                 self.assertEqual(provider._inspect_handle(value)["result"]["status"], expected)

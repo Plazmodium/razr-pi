@@ -913,8 +913,8 @@ class HerdrProvider:
         for key in ("workspace_id", "tab_id", "pane_id"):
             if not isinstance(agent.get(key), str) or agent[key] != value["host"][key]: raise _fail("IDENTITY_MISMATCH", "agent status host differs")
         telemetry = agent.get("agent_status")
-        if telemetry not in {"starting", "working", "idle", "done", "blocked", "unknown"}: raise _fail("ARTIFACT_UNAVAILABLE", "agent status is absent or malformed")
-        status = {"starting": "STARTING", "working": "ACTIVE", "idle": "ACTIVE", "done": "SETTLED", "blocked": "ACTIVE", "unknown": "UNKNOWN"}[telemetry]
+        if not isinstance(telemetry, str) or telemetry not in {"starting", "working", "idle", "done", "blocked", "unknown"}: raise _fail("ARTIFACT_UNAVAILABLE", "agent status is absent or malformed")
+        status = {"starting": "STARTING", "working": "ACTIVE", "idle": "ACTIVE", "done": "ACTIVE", "blocked": "ACTIVE", "unknown": "UNKNOWN"}[telemetry]
         observed = {"status": status, "workspace_id": agent["workspace_id"], "tab_id": agent["tab_id"], "pane_id": agent["pane_id"], "observed_at": _now(), "source": "herdr"}
         return {"schema_version": 1, "ok": True, "request_id": "inspect", "result": observed}
 
@@ -962,7 +962,7 @@ class HerdrProvider:
             if outcome["response"] is not None or error["code"] not in ERROR_CODES or not isinstance(error["retryable"], bool) or not isinstance(error["details"], dict): raise _fail("IDENTITY_MISMATCH", "invalid stored interrupt error")
             raise ProtocolError(error["code"], error["message"], retryable=error["retryable"], details=error["details"])
         try:
-            self._exec([self.herdr, "agent", "send-keys", value["handle_id"], "ctrl-c"], timeout_ms=10_000)
+            self._exec([self.herdr, "agent", "send-keys", value["handle_id"], "ctrl+c"], timeout_ms=10_000)
             observed = self._inspect_handle(value)["result"]["status"]
             self._bind_session_if_available(value)
             cleanup = "confirmed" if observed in {"SETTLED", "TERMINATED"} else "uncertain"
@@ -975,7 +975,8 @@ class HerdrProvider:
             self._settle(value, "INTERRUPTED" if cleanup == "confirmed" else "UNKNOWN", cleanup=cleanup, reason=reason, evidence_refs=[interruption_ref])
             return response
         except ProtocolError as exc:
-            error_record = {"schema_version": 1, "kind": "interrupt_result", "request_id": request_id, "handle_id": value["handle_id"], "request_digest": value["request_digest"], "reason": reason, "reason_digest": raw_file_digest(canonical_json({"reason": reason})), "outcome": {"ok": False, "response": None, "error": {"code": exc.code, "message": str(exc), "retryable": exc.retryable, "details": exc.details}}}
+            failure = _fail("INTERRUPT_FAILED", "Herdr interrupt command failed", cause=exc.code) if exc.code in {"LAUNCH_FAILED", "TIMEOUT", "PROVIDER_UNAVAILABLE"} else exc
+            error_record = {"schema_version": 1, "kind": "interrupt_result", "request_id": request_id, "handle_id": value["handle_id"], "request_digest": value["request_digest"], "reason": reason, "reason_digest": raw_file_digest(canonical_json({"reason": reason})), "outcome": {"ok": False, "response": None, "error": {"code": failure.code, "message": str(failure), "retryable": failure.retryable, "details": failure.details}}}
             try:
                 error_bytes = canonical_json(error_record); fd = os.open(interrupt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 with os.fdopen(fd, "wb") as stream: stream.write(error_bytes); stream.flush(); os.fsync(stream.fileno())
@@ -985,7 +986,7 @@ class HerdrProvider:
                 if settle_exc.code == "LEDGER_CORRUPT": raise _fail("LEDGER_CORRUPT", "interrupt failure cannot settle") from settle_exc
             except OSError:
                 pass
-            raise
+            raise failure
         except OSError as exc:
             try: self._settle(value, "UNKNOWN", cleanup="uncertain", reason=str(exc), evidence_refs=[])
             except ProtocolError: pass
@@ -995,7 +996,12 @@ class HerdrProvider:
         value = self._handle(handle)
         try:
             status_response = self._inspect_handle(value); status = status_response["result"]["status"]
-            if status not in {"SETTLED", "TERMINATED"}: raise _fail("ARTIFACT_UNAVAILABLE", "collect requires an observed terminal status")
+            raw_status = None
+            if status not in {"SETTLED", "TERMINATED"} and value["attempt_id"] not in self._settled:
+                raw_get = _envelope(self._exec([self.herdr, "agent", "get", value["handle_id"]], timeout_ms=_CLI_TIMEOUT_MS), "collect status")["result"]
+                raw_agent = raw_get.get("agent") if isinstance(raw_get, dict) else None
+                raw_status = raw_agent.get("agent_status") if isinstance(raw_agent, dict) else None
+            if status not in {"SETTLED", "TERMINATED"} and raw_status != "done" and value["attempt_id"] not in self._settled: raise _fail("ARTIFACT_UNAVAILABLE", "collect requires an observed completed turn or settled attempt")
             data = self.read(value)
             session_available = self._bind_session_if_available(value)
             output_root, session_root = self._attempt_roots[value["attempt_id"]]
@@ -1074,7 +1080,7 @@ class HerdrProvider:
             self._cleanup_record(value, "uncertain", reason="attempt is not settled")
             raise _fail("CLEANUP_UNKNOWN", "cleanup requires a settled attempt")
         status = self._inspect_handle(value)["result"]["status"]
-        if status not in {"SETTLED", "TERMINATED"}: raise _fail("CLEANUP_UNKNOWN", "refusing cleanup of active handle")
+        if status not in {"SETTLED", "TERMINATED"} and value["attempt_id"] not in self._settled: raise _fail("CLEANUP_UNKNOWN", "refusing cleanup of active handle")
         try:
             self._exec([self.herdr, "pane", "close", value["host"]["pane_id"]], timeout_ms=10_000)
             self._exec([self.herdr, "worktree", "remove", "--workspace", value["host"]["workspace_id"], "--force"], timeout_ms=120_000)
