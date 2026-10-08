@@ -143,9 +143,11 @@ class HerdrProviderTests(unittest.TestCase):
                 if argv[:3] == ["herdr", "agent", "get"]:
                     result = {"agent": {"name": "worker-1", "agent_status": "done", "workspace_id": "w", "tab_id": "t", "pane_id": "p", "agent_session": {"kind": "path", "agent": "pi", "value": str(session / "pi-session.json")}, "telemetry": {"live": True}}, "telemetry": {"observed": True}}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "get", "result": result}).encode(), b"")
+                if argv[:3] == ["herdr", "workspace", "list"]:
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "workspaces", "result": {"type": "workspace_list", "workspaces": []}}).encode(), b"")
                 if argv[:3] == ["herdr", "worktree", "list"]:
                     list_calls[0] += 1
-                    if list_calls[0] > 1: return subprocess.CompletedProcess(argv, 0, b"[]", b"")
+                    if list_calls[0] > 1: return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "list", "result": {"source": {"repo_key": str(worktree / ".git"), "repo_name": "repo", "repo_root": str(worktree), "source_checkout_path": str(worktree), "source_workspace_id": "other"}, "type": "worktree_list", "worktrees": []}}).encode(), b"")
                     result = {"source": {"repo_key": str(worktree / ".git"), "repo_name": "repo", "repo_root": str(worktree), "source_checkout_path": str(worktree), "source_workspace_id": "w"}, "type": "worktree_list", "worktrees": [{"branch": "feature/x", "is_bare": False, "is_detached": False, "is_linked_worktree": False, "is_prunable": False, "label": "worktree", "open_workspace_id": "w", "path": str(worktree)}]}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "list", "result": result}).encode(), b"")
                 if argv[:3] == ["herdr", "pane", "list"]:

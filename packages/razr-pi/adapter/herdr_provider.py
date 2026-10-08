@@ -963,9 +963,10 @@ class HerdrProvider:
             raise ProtocolError(error["code"], error["message"], retryable=error["retryable"], details=error["details"])
         try:
             self._exec([self.herdr, "agent", "send-keys", value["handle_id"], "ctrl+c"], timeout_ms=10_000)
-            observed = self._inspect_handle(value)["result"]["status"]
+            observed_raw = self._inspect_handle(value)["result"]["status"]
             self._bind_session_if_available(value)
-            cleanup = "confirmed" if observed in {"SETTLED", "TERMINATED"} else "uncertain"
+            observed = "STOPPING" if observed_raw in {"ACTIVE", "STARTING"} else observed_raw
+            cleanup = "confirmed" if observed_raw in {"SETTLED", "TERMINATED"} else "uncertain"
             response = {"schema_version": 1, "ok": True, "request_id": request_id, "result": {"attempt_id": value["attempt_id"], "host": value["host"], "requested": True, "observed": observed, "cleanup": cleanup}}
             interrupt_record = {"schema_version": 1, "kind": "interrupt_result", "request_id": request_id, "handle_id": value["handle_id"], "request_digest": value["request_digest"], "reason": reason, "reason_digest": raw_file_digest(canonical_json({"reason": reason})), "outcome": {"ok": True, "response": response, "error": None}}
             interruption_bytes = canonical_json(interrupt_record)
@@ -1082,10 +1083,21 @@ class HerdrProvider:
         status = self._inspect_handle(value)["result"]["status"]
         if status not in {"SETTLED", "TERMINATED"} and value["attempt_id"] not in self._settled: raise _fail("CLEANUP_UNKNOWN", "refusing cleanup of active handle")
         try:
-            self._exec([self.herdr, "pane", "close", value["host"]["pane_id"]], timeout_ms=10_000)
+            worktree_root = _canonical_dir(str(self._attempt_paths[value["attempt_id"]]), "worktree")
             self._exec([self.herdr, "worktree", "remove", "--workspace", value["host"]["workspace_id"], "--force"], timeout_ms=120_000)
-            listed = self._exec([self.herdr, "worktree", "list"], timeout_ms=10_000)
-            if value["host"]["workspace_id"].encode() in listed: raise _fail("CLEANUP_UNKNOWN", "workspace remains after cleanup")
+            workspace_response = _envelope(self._exec([self.herdr, "workspace", "list"], timeout_ms=10_000), "workspace list")
+            workspace_result = workspace_response["result"]
+            if not isinstance(workspace_result, dict) or workspace_result.get("type") != "workspace_list" or not isinstance(workspace_result.get("workspaces"), list): raise _fail("CLEANUP_UNKNOWN", "workspace list is malformed")
+            for workspace in workspace_result["workspaces"]:
+                if not isinstance(workspace, dict) or not isinstance(workspace.get("workspace_id"), str): raise _fail("CLEANUP_UNKNOWN", "workspace identity is malformed")
+                if workspace["workspace_id"] == value["host"]["workspace_id"]: raise _fail("CLEANUP_UNKNOWN", "workspace remains after cleanup")
+            worktree_response = _envelope(self._exec([self.herdr, "worktree", "list", "--cwd", str(worktree_root)], timeout_ms=10_000), "worktree list")
+            worktree_result = worktree_response["result"]
+            if not isinstance(worktree_result, dict) or worktree_result.get("type") != "worktree_list" or not isinstance(worktree_result.get("worktrees"), list): raise _fail("CLEANUP_UNKNOWN", "worktree list is malformed")
+            root_text = str(worktree_root)
+            for worktree in worktree_result["worktrees"]:
+                if not isinstance(worktree, dict) or not isinstance(worktree.get("path"), str): raise _fail("CLEANUP_UNKNOWN", "worktree identity is malformed")
+                if Path(worktree["path"]).resolve(strict=False) == Path(root_text): raise _fail("CLEANUP_UNKNOWN", "worktree remains registered")
             for root, root_id, root_digest in ((self._attempt_roots[value["attempt_id"]][0], value["output_root_id"], value["output_root_digest"]), (self._attempt_roots[value["attempt_id"]][1], value["session_root_id"], value["session_root_digest"])):
                 marker = root / ".razr-herdr-root.json"
                 _marker(root, root_id, root_digest, create=False)
