@@ -70,6 +70,23 @@ class ContextEngineTests(unittest.TestCase):
         with self.assertRaises(ProtocolError): ContextRequest.from_dict(dict(self.request, include=dict(self.request["include"], source=1)))
         with self.assertRaises(ProtocolError): ContextRequest.from_dict(dict(self.request, limits={"max_files": 201, "max_bytes": 1, "max_memory_records": 1}))
 
+    def test_root_and_explicit_private_paths_cannot_be_reinterpreted(self):
+        with self.assertRaises(ProtocolError): ContextRequest.from_dict(dict(self.request, repository_root="src"))
+        with self.assertRaises(ProtocolError): ContextRequest.from_dict(dict(self.request, repository_root=str(self.root)))
+        private = dict(self.request, paths=[".git/config"])
+        with self.assertRaises(ProtocolError) as caught:
+            ContextEngine(self.root).context(private)
+        self.assertEqual(caught.exception.code, "PATH_ESCAPE")
+        (self.root / "src/link.py").symlink_to(self.root / "src/app.py")
+        with self.assertRaises(ProtocolError):
+            ContextEngine(self.root).context(dict(self.request, paths=["src/link.py"]))
+
+    def test_large_file_is_omitted_by_fd_bound(self):
+        (self.root / "src/large.py").write_bytes(b"x" * 4096)
+        packet = ContextEngine(self.root).build(dict(self.request, limits={"max_files": 4, "max_bytes": 32, "max_memory_records": 1}))
+        self.assertFalse(any(item["ref"] == "src/large.py" for item in packet["items"]))
+        self.assertTrue(any(row["ref"] == "src/large.py" for row in packet["omitted"]))
+
     def test_observed_identity_is_verified_not_advisory(self):
         commit = _git_head(self.root)
         source = _source_digest(self.root, commit)

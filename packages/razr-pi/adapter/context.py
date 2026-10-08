@@ -19,9 +19,14 @@ _LIMITS = {"max_files": 200, "max_bytes": 2_000_000, "max_memory_records": 100}
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _TEXT_SUFFIXES = {".py", ".ts", ".tsx", ".js", ".jsx", ".md", ".yaml", ".yml", ".json", ".toml", ".ini"}
 _CONFIG_NAMES = {"razr.yaml", "package.json", "pyproject.toml", "tsconfig.json"}
-_PRIVATE_DIRS = {".git", ".razr", ".hg", ".svn", ".venv", "venv", "node_modules", "dist", "build", "target", "vendor", "__pycache__"}
+_PRIVATE_DIRS = {".git", ".razr", ".hg", ".svn", ".venv", "venv", "node_modules", "dist", "build", "target", "vendor", "__pycache__", ".cache", "cache", "tmp", "temp", ".pi", ".herdr"}
+_PRIVATE_NAMES = {".env", ".env.local", ".envrc", "credentials", "secrets"}
 _MAX_DISCOVERED = 4096
+_MAX_VISITED_DIRS = 512
 _MAX_DIR_ENTRIES = 512
+_MAX_VISITED_ENTRIES = 8192
+_MAX_QUEUE = 512
+_MAX_DEPTH = 16
 _MAX_HISTORY_BYTES = 64 * 1024
 
 
@@ -82,8 +87,8 @@ class ContextRequest:
                 raise _error("LIMIT_EXCEEDED", "context limit is outside the bounded range", limit=key)
             checked_limits[key] = number
         request_id, objective, repository = value["request_id"], value["objective"], value["repository_root"]
-        if not isinstance(request_id, str) or not _ID.fullmatch(request_id) or not isinstance(objective, str) or not objective or len(objective) > 4000 or not isinstance(repository, str):
-            raise _error("INVALID_REQUEST", "invalid context identity or objective")
+        if not isinstance(request_id, str) or not _ID.fullmatch(request_id) or not isinstance(objective, str) or not objective or len(objective) > 4000 or repository != ".":
+            raise _error("INVALID_REQUEST", "repository_root must be the exact engine checkout token '.'")
         paths = value.get("paths", [])
         if not isinstance(paths, list) or len(paths) > 256 or any(not isinstance(p, str) for p in paths):
             raise _error("INVALID_REQUEST", "paths is not a bounded list")
@@ -111,44 +116,53 @@ class ContextRequest:
         return result
 
 
-def _safe_components(root: Path, ref: str) -> Path:
-    target = root.joinpath(*PurePosixPath(ref).parts)
-    current = root
-    for part in PurePosixPath(ref).parts:
-        current = current / part
-        if current.is_symlink():
-            raise _error("PATH_ESCAPE", "linked repository path refused", ref=ref)
-    if not target.resolve().is_relative_to(root):
-        raise _error("PATH_ESCAPE", "path escapes repository", ref=ref)
-    return target
+def _deny_ref(ref: str) -> None:
+    parts = PurePosixPath(ref).parts
+    if any(part in _PRIVATE_DIRS or part in _PRIVATE_NAMES or part.startswith(".env") for part in parts):
+        raise _error("PATH_ESCAPE", "private or control path refused", ref=ref)
+
+
+def _open_nofollow(root: Path, ref: str) -> int:
+    """Open every component without following links, then open the leaf safely."""
+    parts = PurePosixPath(_ref(ref)).parts
+    _deny_ref(ref)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory = getattr(os, "O_DIRECTORY", 0)
+    try:
+        current = os.open(root, os.O_RDONLY | directory | nofollow)
+        for part in parts[:-1]:
+            child = os.open(part, os.O_RDONLY | directory | nofollow, dir_fd=current)
+            os.close(current); current = child
+        leaf = os.open(parts[-1], os.O_RDONLY | nofollow, dir_fd=current)
+        os.close(current)
+        return leaf
+    except OSError as exc:
+        try: os.close(current)
+        except (UnboundLocalError, OSError): pass
+        raise _error("PATH_ESCAPE", "repository path cannot be opened safely", ref=ref) from exc
 
 
 def _read_bounded(root: Path, ref: str, max_content: int) -> tuple[bytes, str, int] | None:
-    """Read at most max_content bytes while streaming the complete file digest."""
-    target = _safe_components(root, _ref(ref))
-    if not target.is_file() or target.is_symlink() or max_content <= 0:
-        return None
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        fd = os.open(target, flags)
-    except OSError as exc:
-        raise _error("PATH_ESCAPE", "file cannot be opened safely", ref=ref) from exc
-    digest = hashlib.sha256(); content = bytearray(); total = 0
+    """Read max_content+1 from one no-follow FD; digest only a complete bounded file."""
+    if max_content <= 0: return None
+    fd = _open_nofollow(root, ref)
     try:
         info = os.fstat(fd)
-        if not os.path.isfile(target) or not (info.st_mode & 0o170000) == 0o100000:
+        if (info.st_mode & 0o170000) != 0o100000 or info.st_nlink != 1:
             return None
-        while True:
-            chunk = os.read(fd, 65536)
+        data = bytearray()
+        while len(data) <= max_content:
+            chunk = os.read(fd, min(65536, max_content + 1 - len(data)))
             if not chunk: break
-            digest.update(chunk); total += len(chunk)
-            if len(content) < max_content:
-                content.extend(chunk[:max_content - len(content)])
+            data.extend(chunk)
+        if len(data) > max_content:
+            return None
+        raw = bytes(data)
+        return raw, raw_file_digest(raw), len(raw)
     except OSError as exc:
-        raise _error("INTERNAL", "bounded file read failed", ref=ref) from exc
+        raise _error("INTERNAL", "bounded descriptor read failed", ref=ref) from exc
     finally:
         os.close(fd)
-    return bytes(content), "sha256:" + digest.hexdigest(), total
 
 
 def _git_env(git: Path) -> dict[str, str]:
@@ -197,27 +211,58 @@ class ContextEngine:
 
     def _candidate_files(self, request: ContextRequest) -> tuple[list[str], list[dict[str, str]]]:
         objective = set(re.findall(r"[a-z0-9][a-z0-9_.-]{2,}", request.objective.lower()))
-        refs = list(request.paths); omitted: list[dict[str, str]] = []
-        seen = set(refs); queue = [self.root]; discovered = 0
-        while queue and discovered < _MAX_DISCOVERED:
-            directory = queue.pop(0)
-            try: entries = sorted(os.scandir(directory), key=lambda e: e.name)
-            except OSError: continue
+        refs: list[str] = []
+        omitted: list[dict[str, str]] = []
+        seen: set[str] = set()
+        # Explicit paths use exactly the same policy as discovery; they cannot bypass controls.
+        for ref in request.paths:
+            _deny_ref(_ref(ref))
+            fd = _open_nofollow(self.root, ref)
+            try:
+                info = os.fstat(fd)
+                if (info.st_mode & 0o170000) != 0o100000 or info.st_nlink != 1:
+                    raise _error("PATH_ESCAPE", "explicit path is not a private regular file", ref=ref)
+            finally:
+                os.close(fd)
+            refs.append(ref); seen.add(ref)
+        queue: list[tuple[Path, int]] = [(self.root, 0)]
+        visited_dirs = visited_entries = discovered = 0
+        while queue and visited_dirs < _MAX_VISITED_DIRS and visited_entries < _MAX_VISITED_ENTRIES and discovered < _MAX_DISCOVERED:
+            directory, depth = queue.pop(0); visited_dirs += 1
+            try:
+                # Read only a bounded prefix plus one sentinel; sorting makes selection deterministic.
+                with os.scandir(directory) as scan:
+                    entries = []
+                    for _ in range(_MAX_DIR_ENTRIES + 1):
+                        try: entry = next(scan)
+                        except StopIteration: break
+                        entries.append(entry)
+                entries.sort(key=lambda e: e.name)
+            except OSError:
+                continue
             if len(entries) > _MAX_DIR_ENTRIES:
                 omitted.append({"ref": directory.relative_to(self.root).as_posix() or ".", "reason": "directory-entry-limit"})
                 entries = entries[:_MAX_DIR_ENTRIES]
             for entry in entries:
-                ref = entry.path if False else Path(entry.path).relative_to(self.root).as_posix()
-                if entry.name in _PRIVATE_DIRS or ref.startswith(tuple(p + "/" for p in _PRIVATE_DIRS)): continue
+                visited_entries += 1
+                ref = Path(entry.path).relative_to(self.root).as_posix()
+                if entry.name in _PRIVATE_DIRS or entry.name in _PRIVATE_NAMES or entry.name.startswith(".env"):
+                    omitted.append({"ref": ref, "reason": "private"}); continue
                 try: info = entry.stat(follow_symlinks=False)
-                except OSError: omitted.append({"ref": ref, "reason": "unsafe"}); continue
-                if entry.is_dir() and not entry.is_symlink(): queue.append(Path(entry.path)); continue
-                if not entry.is_file() or entry.is_symlink() or Path(entry.name).suffix.lower() not in _TEXT_SUFFIXES: continue
+                except OSError:
+                    omitted.append({"ref": ref, "reason": "unsafe"}); continue
+                mode = info.st_mode & 0o170000
+                if mode == 0o040000:
+                    if depth >= _MAX_DEPTH or len(queue) >= _MAX_QUEUE:
+                        omitted.append({"ref": ref, "reason": "traversal-limit"})
+                    elif len(queue) < _MAX_QUEUE:
+                        queue.append((Path(entry.path), depth + 1))
+                    continue
+                if mode != 0o100000 or info.st_nlink != 1 or Path(entry.name).suffix.lower() not in _TEXT_SUFFIXES: continue
                 discovered += 1
-                if ref not in seen:
-                    refs.append(ref); seen.add(ref)
-        if discovered >= _MAX_DISCOVERED:
-            omitted.append({"ref": ".", "reason": "discovery-limit"})
+                if ref not in seen: refs.append(ref); seen.add(ref)
+        if queue or visited_dirs >= _MAX_VISITED_DIRS or visited_entries >= _MAX_VISITED_ENTRIES or discovered >= _MAX_DISCOVERED:
+            omitted.append({"ref": ".", "reason": "traversal-limit"})
         def score(ref: str) -> tuple[int, str]:
             low, base = ref.lower(), Path(ref).name.lower(); rank = 0
             if any(token in low for token in objective): rank -= 30
@@ -227,12 +272,7 @@ class ContextEngine:
         return sorted(refs, key=score), omitted
 
     def _item_file(self, ref: str, remaining: int) -> dict[str, object] | None:
-        target = _safe_components(self.root, _ref(ref))
-        try:
-            if target.stat(follow_symlinks=False).st_size > remaining:
-                return None
-        except OSError:
-            return None
+        _deny_ref(_ref(ref))
         value = _read_bounded(self.root, ref, remaining)
         if value is None: return None
         content, digest, total = value
