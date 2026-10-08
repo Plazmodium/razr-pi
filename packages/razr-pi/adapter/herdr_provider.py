@@ -905,15 +905,18 @@ class HerdrProvider:
         return _envelope(self._exec([self.herdr, "agent", "prompt", target, text, "--wait", "--timeout", str(timeout_ms)], timeout_ms=timeout_ms), "prompt")
 
     def _inspect_handle(self, handle: Mapping[str, object]) -> object:
-        value = self._handle(handle); response = _envelope(self._exec([self.herdr, "agent", "get", value["handle_id"]], timeout_ms=10_000), "inspect"); result = response["result"]
+        value = self._handle(handle); raw = _envelope(self._exec([self.herdr, "agent", "get", value["handle_id"]], timeout_ms=10_000), "inspect"); result = raw["result"]
         self._bind_session_if_available(value)
-        if not isinstance(result, dict) or not all(key in result for key in ("status", "workspace_id", "tab_id", "pane_id", "observed_at", "source")):  raise _fail("ARTIFACT_UNAVAILABLE", "invalid Herdr status")
-        for key in ("workspace_id", "tab_id", "pane_id", "source", "status"):
-            if not isinstance(result[key], str): raise _fail("ARTIFACT_UNAVAILABLE", "invalid Herdr status")
-        if result["status"] not in _STATUSES or result["source"] != "herdr": raise _fail("ARTIFACT_UNAVAILABLE", "invalid Herdr status")
-        _timestamp(result["observed_at"], "observed_at")
-        if any(result[key] != value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")): raise _fail("IDENTITY_MISMATCH", "status host differs")
-        return response
+        if not isinstance(result, dict) or not isinstance(result.get("agent"), dict): raise _fail("ARTIFACT_UNAVAILABLE", "agent status lacks nested agent")
+        agent = result["agent"]
+        if not isinstance(agent.get("name"), str) or agent["name"] != value["handle_id"]: raise _fail("IDENTITY_MISMATCH", "agent status name differs")
+        for key in ("workspace_id", "tab_id", "pane_id"):
+            if not isinstance(agent.get(key), str) or agent[key] != value["host"][key]: raise _fail("IDENTITY_MISMATCH", "agent status host differs")
+        telemetry = agent.get("agent_status")
+        if telemetry not in {"starting", "working", "idle", "done", "blocked", "unknown"}: raise _fail("ARTIFACT_UNAVAILABLE", "agent status is absent or malformed")
+        status = {"starting": "STARTING", "working": "ACTIVE", "idle": "ACTIVE", "done": "SETTLED", "blocked": "ACTIVE", "unknown": "UNKNOWN"}[telemetry]
+        observed = {"status": status, "workspace_id": agent["workspace_id"], "tab_id": agent["tab_id"], "pane_id": agent["pane_id"], "observed_at": _now(), "source": "herdr"}
+        return {"schema_version": 1, "ok": True, "request_id": "inspect", "result": observed}
 
     def read(self, handle: Mapping[str, object], *, lines: int = 160) -> bytes:
         value = self._handle(handle)
