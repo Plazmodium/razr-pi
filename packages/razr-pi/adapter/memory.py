@@ -168,7 +168,6 @@ class MemoryStore:
             raise _fail("UNSUPPORTED_CAPABILITY", "descriptor-safe storage is unavailable")
         self.root = root
         self.path = root / ".razr/memory.jsonl"
-        self.lock_path = root / ".razr-memory.lock"
         try:
             self._root_fd = os.open(root, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
             self._root_identity = _identity(_regular(self._root_fd, "repository", directory=True))
@@ -274,32 +273,33 @@ class MemoryStore:
     @contextmanager
     def _locked(self) -> Iterator[int]:
         self._verify_root()
-        lock_fd = -1
         storage_fd = -1
+        locked = False
         try:
-            lock_fd = os.open(".razr-memory.lock", os.O_RDWR | os.O_CREAT | _O_NOFOLLOW, 0o644, dir_fd=self._root_fd)
-            self._verify_entry(self._root_fd, ".razr-memory.lock", lock_fd, "memory lock")
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                fcntl.flock(self._root_fd, fcntl.LOCK_EX)
+                locked = True
+            except OSError as exc:
+                raise _fail("LOCK_UNAVAILABLE", "repository flock unavailable", retryable=True) from exc
             self._verify_root()
-            self._verify_entry(self._root_fd, ".razr-memory.lock", lock_fd, "memory lock")
             storage_fd = self._storage_dir()
             self._verify_storage(storage_fd)
             yield storage_fd
             self._verify_storage(storage_fd)
-            self._verify_entry(self._root_fd, ".razr-memory.lock", lock_fd, "memory lock")
+            self._verify_root()
         except ProtocolError:
             raise
-        except (OSError, BlockingIOError) as exc:
-            raise _fail("LOCK_UNAVAILABLE", "memory lock unavailable", retryable=True) from exc
+        except OSError as exc:
+            raise _fail("LOCK_UNAVAILABLE", "repository flock unavailable", retryable=True) from exc
         finally:
             if storage_fd >= 0:
                 try:
                     os.close(storage_fd)
                 except OSError:
                     pass
-            if lock_fd >= 0:
+            if locked:
                 try:
-                    os.close(lock_fd)
+                    fcntl.flock(self._root_fd, fcntl.LOCK_UN)
                 except OSError:
                     pass
 

@@ -160,10 +160,8 @@ class MemoryTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             self.store.inspect()
         (self.root / ".razr/memory.jsonl").unlink()
-        (self.root / ".razr-memory.lock").unlink()
         (self.root / ".razr-memory.lock").symlink_to(self.root / "target.jsonl")
-        with self.assertRaises(ProtocolError):
-            self.store.inspect()
+        self.assertTrue(self.store.validate()["valid"])
         (self.root / ".razr-memory.lock").unlink()
         evidence = self.root / "identity.txt"
         evidence.write_text("one")
@@ -240,12 +238,22 @@ class MemoryTests(unittest.TestCase):
             with self.assertRaises(ProtocolError):
                 linked_store.inspect()
         external_ledger.unlink()
-        external_lock = self.root / "lock-copy"
-        external_lock.hardlink_to(self.root / ".razr-memory.lock")
+        former_lock = self.root / ".razr-memory.lock"
+        former_lock.symlink_to(self.root / "ledger-copy")
         with MemoryStore(self.root) as linked_store:
-            with self.assertRaises(ProtocolError):
-                linked_store.inspect()
-        external_lock.unlink()
+            self.assertTrue(linked_store.validate()["valid"])
+        former_lock.unlink()
+
+        first = MemoryStore(self.root)
+        second = MemoryStore(self.root)
+        first.remember(kind="learning", summary="first instance", repository=self.repo)
+        second.remember(kind="learning", summary="second instance", repository=self.repo)
+        first.close(); second.close()
+        with MemoryStore(self.root) as flock_store:
+            with patch("adapter.memory.fcntl.flock", side_effect=OSError("unsupported")):
+                with self.assertRaises(ProtocolError) as caught:
+                    flock_store.validate()
+            self.assertEqual(caught.exception.code, "LOCK_UNAVAILABLE")
 
         pinned = MemoryStore(self.root)
         pinned.validate()
