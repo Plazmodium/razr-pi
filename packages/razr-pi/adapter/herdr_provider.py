@@ -447,16 +447,20 @@ class HerdrProvider:
         return {**response, "result": self._parse_worktree_response(response, root)}
 
     def _resolve_existing_worktree(self, path: Path) -> dict[str, str] | None:
-        response = _envelope(self._exec([self.herdr, "worktree", "list"], timeout_ms=_CLI_TIMEOUT_MS), "worktree list")
+        response = _envelope(self._exec([self.herdr, "worktree", "list", "--cwd", str(path)], timeout_ms=_CLI_TIMEOUT_MS), "worktree list")
         result = _closed(response["result"], {"source", "type", "worktrees"}, "worktree list result")
         _closed(result["source"], {"repo_key", "repo_name", "repo_root", "source_checkout_path", "source_workspace_id"}, "worktree list source")
         if result["type"] != "worktree_list" or not isinstance(result["worktrees"], list): raise _fail("HERDR_IDENTITY_INCOMPLETE", "worktree list is malformed")
         matches = []
-        for item in result["worktrees"]:
-            item = _closed(item, {"branch", "is_bare", "is_detached", "is_linked_worktree", "is_prunable", "label", "open_workspace_id", "path"}, "worktree list entry")
-            if not {"is_bare", "is_detached", "is_linked_worktree", "is_prunable", "label", "path"} <= set(item): raise _fail("HERDR_IDENTITY_INCOMPLETE", "worktree list entry is incomplete")
-            listed_path = _canonical_dir(item["path"], "listed worktree path")
-            if listed_path == path: matches.append(item)
+        for raw_item in result["worktrees"]:
+            if not isinstance(raw_item, dict) or not isinstance(raw_item.get("path"), str): continue
+            try: listed_path = _canonical_dir(raw_item["path"], "listed worktree path")
+            except ProtocolError: continue
+            if listed_path != path: continue
+            try: item = _closed(raw_item, {"branch", "is_bare", "is_detached", "is_linked_worktree", "is_prunable", "label", "open_workspace_id", "path"}, "worktree list entry")
+            except ProtocolError as exc: raise _fail("HERDR_IDENTITY_INCOMPLETE", "target worktree list entry is malformed") from exc
+            if not {"is_bare", "is_detached", "is_linked_worktree", "is_prunable", "label", "path"} <= set(item): raise _fail("HERDR_IDENTITY_INCOMPLETE", "target worktree list entry is incomplete")
+            matches.append(item)
         if len(matches) > 1: raise _fail("IDENTITY_MISMATCH", "duplicate worktree paths are listed")
         if not matches or "open_workspace_id" not in matches[0]: return None
         workspace_id = matches[0]["open_workspace_id"]; _id(workspace_id, "workspace_id")

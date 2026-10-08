@@ -30,6 +30,21 @@ class HerdrProviderTests(unittest.TestCase):
                 HerdrProvider().probe({"schema_version": 1, "request_id": "probe-1", "required_capabilities": [], "runtime": {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "thinking": "medium"}})
         self.assertEqual(caught.exception.code, "FANOUT_UNAVAILABLE")
 
+    def test_scoped_worktree_resolution_ignores_closed_historical_entries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve(); target = root / "target"; target.mkdir(); old = root / "old"; old.mkdir()
+            listed = {"id": "list", "result": {"source": {"repo_key": str(root / ".git"), "repo_name": "repo", "repo_root": str(root), "source_checkout_path": str(root), "source_workspace_id": "w"}, "type": "worktree_list", "worktrees": [{"is_bare": False, "is_detached": True, "is_linked_worktree": True, "is_prunable": True, "label": "old", "path": str(old), "historical_extra": "ignored"}, {"branch": "main", "is_bare": False, "is_detached": False, "is_linked_worktree": True, "is_prunable": False, "label": "target", "open_workspace_id": "w", "path": str(target)}]}}
+            pane = {"agent_status": "unknown", "cwd": str(target), "focused": False, "foreground_cwd": str(target), "pane_id": "p", "revision": 0, "scroll": {"max_offset_from_bottom": 0, "offset_from_bottom": 0, "viewport_rows": 29}, "tab_id": "t", "terminal_id": "term", "workspace_id": "w"}
+            def run(argv, **kwargs):
+                if argv[:3] == ["herdr", "worktree", "list"]:
+                    self.assertEqual(argv[3:], ["--cwd", str(target)])
+                    return subprocess.CompletedProcess(argv, 0, json.dumps(listed).encode(), b"")
+                if argv[:3] == ["herdr", "pane", "list"]:
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "panes", "result": {"panes": [pane], "type": "pane_list"}}).encode(), b"")
+                raise AssertionError(argv)
+            result = HerdrProvider(runner=run)._resolve_existing_worktree(target)
+            self.assertEqual(result, {"workspace_id": "w", "tab_id": "t", "pane_id": "p"})
+
     def test_nested_worktree_create_open_shape_and_identity_conflicts(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve(); checkout = root / "checkout"; checkout.mkdir()
