@@ -496,7 +496,8 @@ class HerdrProvider:
         if any(opened[key] != value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")):
             raise _fail("IDENTITY_MISMATCH", "dedicated worktree workspace differs from request host")
         root = _canonical_dir(value["worktree"], "worktree")
-        verify_candidate_identity(root, branch=value["candidate"]["branch"], commit=value["candidate"]["commit"], source_digest=value["candidate"]["source_digest"])
+        # Provider-side re-verification confirms the checkout; candidate read-back remains foundation caller authority.
+        verify_candidate_identity(root, branch=value["candidate"]["branch"], commit=value["candidate"]["commit"], source_digest=value["candidate"]["source_digest"], expected_repository=value["candidate"]["repository"])
 
     def _claim_roots(self, request: ProviderRequest, capability_report_digest: str) -> None:
         values = request.value
@@ -547,8 +548,8 @@ class HerdrProvider:
         for key in ("output_root", "session_root"):
             root = _canonical_dir(parsed.value[key], key)
             if root == private_root or not root.is_relative_to(private_root): raise _fail("PATH_ESCAPE", f"{key} is outside provider private root")
-        evidence = self._claim_roots(parsed, probe_report["result"]["report_digest"])
         self._verify_candidate(parsed)
+        evidence = self._claim_roots(parsed, probe_report["result"]["report_digest"])
         value = parsed.value; deadline = value["limits"]["deadline_ms"]
         started = {"schema_version": 1, "event": "STARTED", "attempt_id": value["attempt_id"], "work_id": value["work"]["work_id"], "node_id": value["work"]["node_id"], "observed_generation": value["work"]["generation"], "observed_ordinal": value["work"]["ordinal"], "worker_id": value["worker_id"], "branch": value["branch"], "worktree_ref": ".", "allowance_id": value["allowance_id"], "provider_id": self.provider_id, "started_at": _now(), "started_at_source": "adapter_observed", "candidate": {"commit": value["candidate"]["commit"], "source_digest": value["candidate"]["source_digest"]}, "candidate_evidence": evidence["candidate"], "request_packet": evidence["packet"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"], "request_digest": evidence["request_digest"], "herdr": {key: value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")}, "prev_digest": "sha256:" + "0" * 64}
         # The ledger computes no authority: this is a durable observation only.

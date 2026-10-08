@@ -228,11 +228,30 @@ def _reject_dirty_checkout(root: Path, work_root: str) -> None:
             raise _fail("SOURCE_CHANGED", "checkout has dirty or untracked path", path=path)
 
 
-def verify_candidate_identity(root: Path, *, branch: str, commit: str, source_digest: str) -> None:
-    """Verify canonical Git administration, clean state, HEAD, branch, and source digest."""
+def _repository_from_remote(remote: str) -> str:
+    value = remote.strip()
+    match = re.fullmatch(r"(?:https://|ssh://git@|git@)([^/:]+)[:/]([^/]+)/([^/]+)", value)
+    if not match or match.group(1) == "" or value.startswith(("file" + "://", "/", "./", "../")):
+        raise _fail("IDENTITY_MISMATCH", "origin remote is not a supported SSH/HTTPS repository")
+    repository = match.group(3)[:-4] if match.group(3).endswith(".git") else match.group(3)
+    return match.group(2) + "/" + repository
+
+
+def verify_candidate_identity(root: Path, *, branch: str, commit: str, source_digest: str, expected_repository: str) -> None:
+    """Verify checkout identity; callers remain responsible for candidate read-back/state authority."""
+    if not isinstance(expected_repository, str) or not re.fullmatch(r"[^/\\s]+/[^/\\s]+", expected_repository):
+        raise _fail("INVALID_REQUEST", "invalid expected repository")
     root = _canonical(root, directory=True)
     validate_git_object_id(commit)
     _verify_git_identity(root)
+    try:
+        remote = subprocess.run(["git", "-C", str(root), "remote", "get-url", "origin"], env=_environment(), cwd=root, capture_output=True, check=False, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise _fail("IDENTITY_MISMATCH", "Git origin query unavailable") from exc
+    if remote.returncode or remote.stderr or len(remote.stdout.splitlines()) != 1:
+        raise _fail("IDENTITY_MISMATCH", "Git origin is absent or ambiguous")
+    if _repository_from_remote(remote.stdout.decode("utf-8", "replace")) != expected_repository:
+        raise _fail("IDENTITY_MISMATCH", "Git origin differs from candidate repository")
     if not _git_commit_exists(root, commit):
         raise _fail("IDENTITY_MISMATCH", "expected commit is not present")
     if _git_head(root) != commit:

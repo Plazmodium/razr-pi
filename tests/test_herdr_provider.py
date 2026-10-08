@@ -13,6 +13,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "packages/razr-pi"))
 from adapter.herdr_provider import AttemptLedger, HerdrProvider, ProtocolError
+from adapter.core_subprocess import _repository_from_remote
 from adapter.protocol import canonical_json, raw_file_digest
 
 
@@ -23,6 +24,14 @@ class HerdrProviderTests(unittest.TestCase):
 
     def tearDown(self):
         self.env.stop()
+
+    def test_candidate_repository_remote_forms_are_strict(self):
+        self.assertEqual(_repository_from_remote("git@github.com:owner/repo.git"), "owner/repo")
+        self.assertEqual(_repository_from_remote("ssh://git@github.com/owner/repo"), "owner/repo")
+        self.assertEqual(_repository_from_remote("https://github.com/owner/repo.git"), "owner/repo")
+        for remote in ("/tmp/repo", "file" + "://tmp/repo"):
+            with self.assertRaises(ProtocolError): _repository_from_remote(remote)
+        self.assertNotEqual(_repository_from_remote("https://github.com/other/repo.git"), "owner/repo")
 
     def test_standalone_is_clean_and_never_launches(self):
         with patch.dict(os.environ, {"HERDR_ENV": "0"}, clear=False):
