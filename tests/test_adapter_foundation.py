@@ -13,7 +13,8 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "packages/razr-pi"))
 
-from adapter.core_subprocess import (_environment, _readback, _source_digest, _workflow_projection, invoke_core)
+from adapter.core_subprocess import (_environment, _readback, _source_digest, _validate_core_config,
+                                      _workflow_projection, invoke_core)
 from adapter.protocol import (CoreRequest, CoreResponse, ProtocolError, ProvenancePin, ReadbackResult,
                               ReadbackSpec, canonical_json, raw_file_digest, validate_git_object_id,
                               validate_source_digest)
@@ -79,6 +80,17 @@ class AdapterFoundationTests(unittest.TestCase):
         self.assertNotIn("PYTHONPATH", env)
         self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
 
+    def test_core_config_shape_is_closed_and_typed(self):
+        valid = {"schema_version": 1, "work_root": ".razr/work", "retention": "commit",
+                 "adapter": {"mode": "process-local", "max_active_work_items": 5,
+                 "queue_order": ["priority", "approved_at", "id"]}}
+        self.assertEqual(_validate_core_config(valid), ".razr/work")
+        for bad in ({**valid, "extra": 1}, {**valid, "schema_version": True},
+                    {**valid, "work_root": "../escape"},
+                    {**valid, "adapter": {"mode": "process-local"}}):
+            with self.assertRaises(ValueError):
+                _validate_core_config(bad)
+
     def test_raw_readback_preserves_bytes_and_rejects_malformed_json(self):
         with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
             root = Path(directory)
@@ -135,6 +147,10 @@ class AdapterFoundationTests(unittest.TestCase):
         self.assertEqual(called.call_args_list[2].args[0].expected_readback[0].path, ".razr/work/work/state.yaml")
         self.assertEqual(result.raw_state_digest, raw.digest)
         self.assertEqual(result.raw_state_bytes, len(state_bytes))
+        with patch("adapter.core_subprocess.invoke_core") as never:
+            with self.assertRaises(ProtocolError):
+                __import__("adapter.core_subprocess", fromlist=["read_workflow"]).read_workflow(request, "../bad", "node")
+            never.assert_not_called()
 
     def test_provenance_refusal_precedes_launch(self):
         package = ROOT / "packages/razr-pi"

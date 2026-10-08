@@ -77,6 +77,9 @@ def _validate_request(request: CoreRequest) -> tuple[Path, Path, Path]:
         provenance_bytes = provenance_path.read_bytes()
         if request.expected_core_identity != raw_file_digest(provenance_bytes):
             raise _fail("PROVENANCE_MISMATCH", "provenance identity differs")
+        pin_paths = [pin.path for pin in request.expected_provenance]
+        if len(pin_paths) != len(set(pin_paths)):
+            raise _fail("PROVENANCE_MISMATCH", "duplicate provenance pin path")
         pins = {pin.path: pin for pin in request.expected_provenance}
         required = {"scripts/razr.py", "templates/evidence.md", "templates/executable.yaml",
                     "templates/razr.yaml", "templates/spec.md", "templates/state.yaml"}
@@ -205,6 +208,27 @@ def _source_digest(root: Path, commit: str) -> str:
     return "sha256:" + hashlib.sha256(b"".join(entries)).hexdigest()
 
 
+def _validate_core_config(value: object) -> str:
+    if not isinstance(value, dict) or set(value) != {"schema_version", "work_root", "retention", "adapter"}:
+        raise ValueError("config fields differ")
+    if not isinstance(value["schema_version"], int) or isinstance(value["schema_version"], bool) or value["schema_version"] != 1 or value["retention"] != "commit":
+        raise ValueError("config scalar differs")
+    work = value["work_root"]
+    adapter = value["adapter"]
+    if not isinstance(work, str) or not work or not isinstance(adapter, dict):
+        raise ValueError("config types differ")
+    if set(adapter) != {"mode", "max_active_work_items", "queue_order"}:
+        raise ValueError("adapter fields differ")
+    if adapter["mode"] != "process-local" or not isinstance(adapter["max_active_work_items"], int) or isinstance(adapter["max_active_work_items"], bool) or adapter["max_active_work_items"] != 5:
+        raise ValueError("adapter scalar differs")
+    if adapter["queue_order"] != ["priority", "approved_at", "id"]:
+        raise ValueError("adapter queue differs")
+    path = PurePosixPath(work)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise ValueError("unsafe work root")
+    return work
+
+
 def _core_work_root(root: Path, commit: str) -> str:
     try:
         result = subprocess.run(["git", "-C", str(root), "show", f"{commit}:razr.yaml"],
@@ -215,27 +239,23 @@ def _core_work_root(root: Path, commit: str) -> str:
         raise _fail("SOURCE_CHANGED", "committed razr.yaml is missing")
     committed = result.stdout
     live = root / "razr.yaml"
-    if live.exists() or live.is_symlink():
-        if live.is_symlink() or not live.is_file():
-            raise _fail("SOURCE_CHANGED", "linked live razr.yaml")
-        try:
-            if live.read_bytes() != committed:
-                raise _fail("SOURCE_CHANGED", "live razr.yaml differs from commit")
-        except OSError as exc:
-            raise _fail("SOURCE_CHANGED", "live razr.yaml unavailable") from exc
+    if not live.exists() or live.is_symlink() or not live.is_file():
+        raise _fail("SOURCE_CHANGED", "live razr.yaml is missing or linked")
     try:
-        value = json.loads(committed.decode("utf-8"), object_pairs_hook=_json_object)
-        if not isinstance(value, dict) or set(value) - {"schema_version", "work_root", "retention", "adapter"}:
-            raise ValueError("unsupported config")
-        work = value.get("work_root")
-        if value.get("schema_version") != 1 or value.get("retention") != "commit" or not isinstance(work, str) or not work:
-            raise ValueError("invalid config")
-        path = PurePosixPath(work)
-        if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
-            raise ValueError("unsafe work root")
-        return work
-    except (UnicodeDecodeError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
-        raise _fail("SOURCE_CHANGED", "malformed committed razr.yaml") from exc
+        live_bytes = live.read_bytes()
+        if live_bytes != committed:
+            raise _fail("SOURCE_CHANGED", "live razr.yaml differs from commit")
+        committed_value = json.loads(committed.decode("utf-8"), object_pairs_hook=_json_object)
+        live_value = json.loads(live_bytes.decode("utf-8"), object_pairs_hook=_json_object)
+        committed_work = _validate_core_config(committed_value)
+        live_work = _validate_core_config(live_value)
+        if committed_value != live_value or committed_work != live_work:
+            raise _fail("SOURCE_CHANGED", "live razr.yaml semantics differ from commit")
+        return committed_work
+    except ProtocolError:
+        raise
+    except (OSError, UnicodeDecodeError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise _fail("SOURCE_CHANGED", "malformed committed or live razr.yaml") from exc
 
 
 def _json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -355,6 +375,8 @@ def _workflow_projection(status_row: object, state: object, work_id: str, node_i
 def read_workflow(request: CoreRequest, work_id: str, node_id: str) -> WorkflowRead:
     """Perform the frozen status → validate → raw state read-back sequence."""
     import dataclasses
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", work_id) or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", node_id):
+        raise _fail("INVALID_REQUEST", "invalid core work or node ID")
     status_request = dataclasses.replace(request, argv=("status", work_id, "--json"), expected_readback=())
     status_response = invoke_core(status_request)
     try:
@@ -371,8 +393,6 @@ def read_workflow(request: CoreRequest, work_id: str, node_id: str) -> WorkflowR
         raise _fail("MALFORMED_RESPONSE", "validation output is not UTF-8") from exc
     if validation.returncode != 0 or lines != [f"PASS {work_id}"]:
         raise _fail("READBACK_FAILED", "core validation did not pass")
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", work_id) or "/" in work_id:
-        raise _fail("INVALID_REQUEST", "invalid work ID")
     root = _canonical(request.repository_root, directory=True)
     work_root = _core_work_root(root, request.expected_commit)
     state_path = f"{work_root}/{work_id}/state.yaml"
