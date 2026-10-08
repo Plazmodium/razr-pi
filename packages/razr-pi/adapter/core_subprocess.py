@@ -148,8 +148,8 @@ def _source_digest(root: Path, commit: str) -> str:
         raise _fail("SOURCE_CHANGED", "cannot inspect source tree") from exc
     if result.returncode != 0:
         raise _fail("SOURCE_CHANGED", "source tree inspection failed")
-    # Match core load_json/validate_config/safe_work_root: malformed or linked config refuses.
-    work_root = _core_work_root(root)
+    # Match core load_json/validate_config/safe_work_root from the requested tree.
+    work_root = _core_work_root(root, commit)
     prefix = work_root.rstrip("/") + "/"
     entries = []
     for raw in result.stdout.split(b"\0"):
@@ -167,30 +167,37 @@ def _source_digest(root: Path, commit: str) -> str:
     return "sha256:" + hashlib.sha256(b"".join(entries)).hexdigest()
 
 
-def _core_work_root(root: Path) -> str:
-    config = root / "razr.yaml"
-    if not config.exists():
-        return ".razr/work"
-    if config.is_symlink() or not config.is_file():
-        raise _fail("SOURCE_CHANGED", "linked or invalid razr.yaml")
+def _core_work_root(root: Path, commit: str) -> str:
     try:
-        value = json.loads(config.read_text(encoding="utf-8"), object_pairs_hook=_json_object)
+        result = subprocess.run(["git", "-C", str(root), "show", f"{commit}:razr.yaml"],
+                                env=_environment(), cwd=root, capture_output=True, check=False, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise _fail("SOURCE_CHANGED", "committed razr.yaml unavailable") from exc
+    if result.returncode != 0 or not result.stdout or result.stderr:
+        raise _fail("SOURCE_CHANGED", "committed razr.yaml is missing")
+    committed = result.stdout
+    live = root / "razr.yaml"
+    if live.exists() or live.is_symlink():
+        if live.is_symlink() or not live.is_file():
+            raise _fail("SOURCE_CHANGED", "linked live razr.yaml")
+        try:
+            if live.read_bytes() != committed:
+                raise _fail("SOURCE_CHANGED", "live razr.yaml differs from commit")
+        except OSError as exc:
+            raise _fail("SOURCE_CHANGED", "live razr.yaml unavailable") from exc
+    try:
+        value = json.loads(committed.decode("utf-8"), object_pairs_hook=_json_object)
         if not isinstance(value, dict) or set(value) - {"schema_version", "work_root", "retention", "adapter"}:
             raise ValueError("unsupported config")
         work = value.get("work_root")
-        if value.get("schema_version") != 1 or not isinstance(work, str) or not work:
+        if value.get("schema_version") != 1 or value.get("retention") != "commit" or not isinstance(work, str) or not work:
             raise ValueError("invalid config")
         path = PurePosixPath(work)
         if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
             raise ValueError("unsafe work root")
-        current = root
-        for part in path.parts:
-            current = current / part
-            if current.is_symlink():
-                raise ValueError("linked work root")
         return work
-    except (OSError, UnicodeDecodeError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
-        raise _fail("SOURCE_CHANGED", "malformed or linked razr.yaml") from exc
+    except (UnicodeDecodeError, UnicodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+        raise _fail("SOURCE_CHANGED", "malformed committed razr.yaml") from exc
 
 
 def _json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -237,15 +244,6 @@ def _readback(root: Path, specs: tuple[Any, ...]) -> tuple[ReadbackResult, ...]:
     return tuple(results)
 
 
-def _json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate JSON key")
-        result[key] = value
-    return result
-
-
 def _environment() -> dict[str, str]:
     env = {name: os.environ[name] for name in _ENV_NAMES if name in os.environ}
     env.setdefault("PATH", os.defpath)
@@ -258,43 +256,62 @@ def _environment() -> dict[str, str]:
     return env
 
 
-def _workflow_projection(status_row: object, state: object, work_id: str, node_id: str) -> WorkflowRead:
-    if not isinstance(status_row, dict) or set(status_row) != {"id", "stage", "status", "depth", "priority", "approved_at", "candidate", "pull_request"}:
+def _nullable_string(value: object) -> str | None:
+    if value is not None and not isinstance(value, str):
+        raise _fail("READBACK_FAILED", "nullable string field is malformed")
+    return value
+
+
+def _workflow_projection(status_row: object, state: object, work_id: str, node_id: str,
+                         raw: ReadbackResult, response: CoreResponse, root: Path) -> WorkflowRead:
+    row_fields = {"id", "stage", "status", "depth", "priority", "approved_at", "candidate", "pull_request"}
+    if not isinstance(status_row, dict) or set(status_row) != row_fields:
         raise _fail("READBACK_FAILED", "status row fields differ")
-    if status_row.get("id") != work_id or not isinstance(status_row.get("stage"), str) or not isinstance(status_row.get("status"), str):
-        raise _fail("READBACK_FAILED", "status row identity differs")
-    if status_row.get("depth") not in {"tiny", "standard", "complex"} or not isinstance(status_row.get("priority"), int) or isinstance(status_row.get("priority"), bool):
+    if status_row["id"] != work_id or status_row["stage"] not in {"spec", "build", "verify", "review"} or status_row["status"] not in {"queued", "active", "blocked", "complete", "cancelled"}:
+        raise _fail("READBACK_FAILED", "status row identity/domain differs")
+    if status_row["depth"] not in {"tiny", "standard", "complex"} or not isinstance(status_row["priority"], int) or isinstance(status_row["priority"], bool) or not 0 <= status_row["priority"] <= 1000:
         raise _fail("READBACK_FAILED", "status row domain differs")
-    if not isinstance(state, dict) or state.get("id") != work_id or state.get("stage") != status_row["stage"] or state.get("status") != status_row["status"]:
-        raise _fail("READBACK_FAILED", "state identity differs")
-    generation = state.get("generation")
-    nodes = state.get("nodes")
-    node = nodes.get(node_id) if isinstance(nodes, dict) else None
-    if not isinstance(generation, int) or isinstance(generation, bool) or generation < 1 or not isinstance(node, dict):
-        raise _fail("READBACK_FAILED", "state generation or node is malformed")
-    attempt = node.get("attempt")
-    if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 0 or node.get("status") not in {"pending", "waiting", "running", "blocked", "complete", "failed"}:
-        raise _fail("READBACK_FAILED", "state node is malformed")
-    result_ref = node.get("result_ref")
-    if result_ref is not None and not isinstance(result_ref, str):
-        raise _fail("READBACK_FAILED", "state node result is malformed")
-    candidate = state.get("candidate")
-    if not isinstance(candidate, dict):
-        raise _fail("READBACK_FAILED", "state candidate is malformed")
-    values = {key: candidate.get(key) for key in ("repository", "branch", "commit", "source_digest")}
-    if any(value is not None and not isinstance(value, str) for value in values.values()):
-        raise _fail("READBACK_FAILED", "state candidate is malformed")
+    _nullable_string(status_row["approved_at"])
+    _nullable_string(status_row["candidate"])
+    _nullable_string(status_row["pull_request"])
+    if not isinstance(state, dict):
+        raise _fail("READBACK_FAILED", "state is not an object")
+    required = {"schema_version", "id", "stage", "status", "generation", "created_at", "depth", "priority", "approved_at", "spec", "executable", "nodes", "trajectory", "candidate", "critics", "delivery", "last_transition"}
+    if not required <= set(state) or state["schema_version"] != 1 or state["id"] != work_id:
+        raise _fail("READBACK_FAILED", "state required fields differ")
+    if state["stage"] != status_row["stage"] or state["status"] != status_row["status"] or state["depth"] != status_row["depth"] or state["priority"] != status_row["priority"]:
+        raise _fail("READBACK_FAILED", "state and status row differ")
+    if state["approved_at"] != status_row["approved_at"]:
+        raise _fail("READBACK_FAILED", "approval fields differ")
+    if not isinstance(state["generation"], int) or isinstance(state["generation"], bool) or state["generation"] < 1 or not isinstance(state["created_at"], str):
+        raise _fail("READBACK_FAILED", "state scalar domain differs")
+    _nullable_string(state["approved_at"])
+    candidate = state["candidate"]
+    if not isinstance(candidate, dict) or set(candidate) != {"repository", "branch", "commit", "source_digest"}:
+        raise _fail("READBACK_FAILED", "state candidate fields differ")
+    values = {key: candidate[key] for key in candidate}
+    for key in ("repository", "branch", "commit", "source_digest"):
+        _nullable_string(values[key])
     if values["commit"] is not None:
         validate_git_object_id(values["commit"])
     if values["source_digest"] is not None:
         validate_source_digest(values["source_digest"])
-    if status_row["depth"] != state.get("depth") or status_row["priority"] != state.get("priority"):
-        raise _fail("READBACK_FAILED", "status row and state differ")
     if status_row["candidate"] != values["commit"]:
         raise _fail("READBACK_FAILED", "status candidate differs")
-    return WorkflowRead(work_id, state["stage"], state["status"], generation, node_id,
-                        node["status"], attempt, result_ref, values["repository"], values["branch"],
-                        values["commit"], values["source_digest"], status_row)
+    delivery = state["delivery"]
+    if not isinstance(delivery, dict) or "pull_request" not in delivery or delivery["pull_request"] != status_row["pull_request"]:
+        raise _fail("READBACK_FAILED", "status pull request differs")
+    nodes = state["nodes"]
+    node = nodes.get(node_id) if isinstance(nodes, dict) else None
+    if not isinstance(node, dict) or set(node) != {"status", "attempt", "result_ref"}:
+        raise _fail("READBACK_FAILED", "state node fields differ")
+    if node["status"] not in {"pending", "waiting", "running", "blocked", "complete", "failed"} or not isinstance(node["attempt"], int) or isinstance(node["attempt"], bool) or node["attempt"] < 0:
+        raise _fail("READBACK_FAILED", "state node domain differs")
+    result_ref = _nullable_string(node["result_ref"])
+    return WorkflowRead(work_id, state["stage"], state["status"], state["generation"], node_id,
+                        node["status"], node["attempt"], result_ref, values["repository"], values["branch"],
+                        values["commit"], values["source_digest"], status_row, raw.path, raw.digest,
+                        raw.bytes, root, response.core_identity, response.source_digest, response.provenance)
 
 
 def read_workflow(request: CoreRequest, work_id: str, node_id: str) -> WorkflowRead:
@@ -317,13 +334,18 @@ def read_workflow(request: CoreRequest, work_id: str, node_id: str) -> WorkflowR
     if validation.returncode != 0 or lines != [f"PASS {work_id}"]:
         raise _fail("READBACK_FAILED", "core validation did not pass")
     state_specs = tuple(spec for spec in request.expected_readback if spec.path.endswith("/state.yaml") or spec.path == "state.yaml")
-    if len(state_specs) != 1 or state_specs[0].parse_as != "json":
-        raise _fail("INVALID_REQUEST", "workflow read requires one JSON state read-back")
+    if len(state_specs) != 1 or state_specs[0].parse_as != "bytes":
+        raise _fail("INVALID_REQUEST", "workflow read requires one raw state read-back")
     state_request = dataclasses.replace(request, argv=("status", work_id, "--json"), expected_readback=state_specs)
     state_response = invoke_core(state_request)
-    if len(state_response.readback) != 1:
-        raise _fail("READBACK_FAILED", "state read-back missing")
-    return _workflow_projection(rows[0], state_response.readback[0].parsed, work_id, node_id)
+    if len(state_response.readback) != 1 or state_response.readback[0].digest_domain != "raw_file":
+        raise _fail("READBACK_FAILED", "state raw read-back missing")
+    raw_state = state_response.readback[0]
+    try:
+        state = json.loads((request.repository_root / raw_state.path).read_bytes().decode("utf-8"), object_pairs_hook=_json_object)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise _fail("MALFORMED_RESPONSE", "state JSON is malformed") from exc
+    return _workflow_projection(rows[0], state, work_id, node_id, raw_state, state_response, request.repository_root)
 
 
 def invoke_core(request: CoreRequest) -> CoreResponse:

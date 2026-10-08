@@ -12,9 +12,9 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "packages/razr-pi"))
 
-from adapter.core_subprocess import _source_digest, invoke_core  # noqa: E402
-from adapter.protocol import (CoreRequest, ProtocolError, ProvenancePin, ReadbackSpec,
-                              canonical_json, raw_file_digest, validate_git_object_id,
+from adapter.core_subprocess import (_environment, _readback, _source_digest, _workflow_projection, invoke_core)
+from adapter.protocol import (CoreRequest, CoreResponse, ProtocolError, ProvenancePin, ReadbackResult,
+                              ReadbackSpec, canonical_json, raw_file_digest, validate_git_object_id,
                               validate_source_digest)
 
 
@@ -42,7 +42,10 @@ class AdapterFoundationTests(unittest.TestCase):
                    "GIT_COMMITTER_NAME": "fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid"}
             subprocess.run(["git", "init", "-q", str(fixture)], check=True, env=env)
             (fixture / "input.txt").write_text("fixture\n")
-            subprocess.run(["git", "-C", str(fixture), "add", "input.txt"], check=True, env=env)
+            (fixture / "razr.yaml").write_text(json.dumps({"schema_version": 1, "work_root": ".razr/work",
+                "retention": "commit", "adapter": {"mode": "process-local",
+                "max_active_work_items": 5, "queue_order": ["priority", "approved_at", "id"]}}) + "\n")
+            subprocess.run(["git", "-C", str(fixture), "add", "input.txt", "razr.yaml"], check=True, env=env)
             subprocess.run(["git", "-C", str(fixture), "commit", "-q", "-m", "fixture"], check=True, env=env)
             commit = subprocess.check_output(["git", "-C", str(fixture), "rev-parse", "HEAD"], env=env, text=True).strip()
             request = CoreRequest(
@@ -64,6 +67,48 @@ class AdapterFoundationTests(unittest.TestCase):
             self.assertEqual(response.returncode, 0)
             self.assertEqual(response.source_digest, request.expected_source_digest)
             self.assertEqual(response.readback, ())
+
+    def test_environment_is_allowlisted_and_strips_ambient_git(self):
+        os.environ["GIT_DIR"] = "/ambient"
+        try:
+            env = _environment()
+        finally:
+            os.environ.pop("GIT_DIR", None)
+        self.assertNotIn("GIT_DIR", env)
+        self.assertNotIn("PYTHONPATH", env)
+        self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], "1")
+
+    def test_raw_readback_preserves_bytes_and_rejects_malformed_json(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            root = Path(directory)
+            (root / "state.yaml").write_bytes(b"{bad\n")
+            raw = _readback(root, (ReadbackSpec("state.yaml", True, 100, "bytes"),))[0]
+            self.assertEqual(raw.digest_domain, "raw_file")
+            self.assertEqual(raw.bytes, 5)
+            self.assertIsNone(raw.parsed)
+            with self.assertRaises(ProtocolError) as caught:
+                _readback(root, (ReadbackSpec("state.yaml", True, 100, "json"),))
+            self.assertEqual(caught.exception.code, "MALFORMED_RESPONSE")
+
+    def test_workflow_projection_keeps_raw_identity_and_checks_closed_fields(self):
+        state = {"schema_version": 1, "id": "work", "stage": "build", "status": "active",
+                 "generation": 2, "created_at": "2026-01-01T00:00:00+00:00", "depth": "tiny",
+                 "priority": 4, "approved_at": None, "spec": {}, "executable": {},
+                 "nodes": {"node": {"status": "running", "attempt": 1, "result_ref": None}},
+                 "trajectory": {}, "candidate": {"repository": None, "branch": None,
+                 "commit": None, "source_digest": None}, "critics": {},
+                 "delivery": {"pull_request": None}, "last_transition": {}}
+        row = {"id": "work", "stage": "build", "status": "active", "depth": "tiny",
+               "priority": 4, "approved_at": None, "candidate": None, "pull_request": None}
+        raw = ReadbackResult(".razr/work/work/state.yaml", "raw_file", "sha256:" + "a" * 64, 12, None)
+        response = CoreResponse("r", 0, b"", b"", 1, "sha256:" + "b" * 64, (), "sha256:" + "c" * 64, (raw,))
+        projected = _workflow_projection(row, state, "work", "node", raw, response, ROOT)
+        self.assertEqual(projected.raw_state_digest, raw.digest)
+        self.assertEqual(projected.raw_state_bytes, 12)
+        self.assertEqual(projected.raw_state_root, ROOT)
+        row.pop("candidate")
+        with self.assertRaises(ProtocolError):
+            _workflow_projection(row, state, "work", "node", raw, response, ROOT)
 
     def test_provenance_refusal_precedes_launch(self):
         package = ROOT / "packages/razr-pi"

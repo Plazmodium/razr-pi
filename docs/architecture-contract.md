@@ -1,6 +1,7 @@
 # ADR: Razr-Pi architecture contract
 
-- **Status:** accepted for M01 implementation planning
+- **Status:** accepted for M01 implementation planning; revision 2 approved in M01b PR #4
+- **Revision 2 migration note:** `CoreRequest.expected_commit` is now required and binds source identity to an explicitly verified full commit. No foundation consumers exist yet, so no consumer migration is required; serialized review is performed in this PR. Revision 1 remains preserved in Git history.
 - **Scope:** M02–M05 only; this document does not implement those missions
 
 ## 1. Authority and boundaries

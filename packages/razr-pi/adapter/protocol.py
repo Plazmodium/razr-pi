@@ -179,3 +179,10 @@ class WorkflowRead:
     candidate_commit: str | None
     candidate_source_digest: str | None
     status_row: dict[str, object]
+    raw_state_path: str
+    raw_state_digest: str
+    raw_state_bytes: int
+    raw_state_root: Path
+    raw_state_core_identity: str
+    raw_state_source_digest: str
+    raw_state_provenance: tuple[ProvenancePin, ...]
