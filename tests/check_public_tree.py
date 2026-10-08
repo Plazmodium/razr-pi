@@ -19,7 +19,7 @@ import stat
 import subprocess
 import sys
 
-ALLOWLIST_SHA256 = 'a59b77a02b4fb6c0b0b3780c411d6cbd39fbd032fb8969907a4708d5fbd2577d'
+ALLOWLIST_SHA256 = '39b792a1cc153d3fc5f1a351c0f75b117caac19f56838ae9da6c7c8a67523141'
 LICENSE_SHA256 = '9d2fdecab2aa2dca006dbd67b07d3cc63a9d9f64a4f954aff2fe782251f9f8f4'
 OUTPUT_MARKER = 'clean-source-v1 owned private test output\n'
 PROVENANCE = {
@@ -169,7 +169,7 @@ def check(root):
     raw = regular(root / 'tests/public-tree.txt')
     require(sha(raw) == ALLOWLIST_SHA256, 'public allowlist drift')
     names = raw.decode('utf-8').splitlines()
-    require(len(names) == len(set(names)) == 53, 'invalid allowlist cardinality')
+    require(len(names) == len(set(names)) == 55, 'invalid allowlist cardinality')
     for name in names:
         p = PurePosixPath(name)
         require(not p.is_absolute() and '..' not in p.parts and str(p) == name, 'unsafe allowlist entry')

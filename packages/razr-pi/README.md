@@ -17,6 +17,6 @@ Supported helper surfaces:
 - `scripts/contract-preflight.py`: read-only pair identities and a narrow evidence-authority conflict diagnostic. Not semantic completeness or human approval.
 - `scripts/named-regressions.py`: actual unittest observation collection. Its raw output is private, not public source or independent critique.
 
-Do not infer supported live task, candidate, critique, recovery or delivery automation from commands present in the unchanged core. No live reviewer or PR factory ships here. The narrower project contract/routing always applies. Exact approval, first-task human inspection, source identity, fresh independent dual critique and final human PR review remain required for later work.
+Do not infer supported live task, candidate, critique, recovery or delivery automation from commands present in the unchanged core. No live reviewer or PR factory ships here. The Herdr provider is a bounded, capability-probed host adapter: outside `HERDR_ENV=1` it is cleanly unavailable, and inside Herdr it uses documented argv operations for worktree/agent/pane telemetry only. Herdr state and attempt evidence never authorize or mutate Razr workflow state. The narrower project contract/routing always applies. Exact approval, first-task human inspection, source identity, fresh independent dual critique and final human PR review remain required for later work.
 
 [Public testing](../../docs/testing.md) describes no-model loader and adoption proof, prerequisites and remaining gates. No model, auth or client runtime is required to inspect resources.

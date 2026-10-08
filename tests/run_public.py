@@ -92,7 +92,7 @@ def isolate(run, tools):
     }
 
 
-TEST_MODULES = ('test_adapter_foundation', 'test_memory', 'test_adoption', 'test_clean_package', 'test_contract_preflight',
+TEST_MODULES = ('test_adapter_foundation', 'test_memory', 'test_herdr_provider', 'test_adoption', 'test_clean_package', 'test_contract_preflight',
                 'test_primary_execution', 'test_provenance', 'test_public_boundary', 'test_named_regressions')
 
 
