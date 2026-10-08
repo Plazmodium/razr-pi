@@ -27,7 +27,7 @@ class HerdrProviderTests(unittest.TestCase):
     def test_standalone_is_clean_and_never_launches(self):
         with patch.dict(os.environ, {"HERDR_ENV": "0"}, clear=False):
             with self.assertRaises(ProtocolError) as caught:
-                HerdrProvider().probe()
+                HerdrProvider().probe({"schema_version": 1, "request_id": "probe-1", "required_capabilities": [], "runtime": {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "thinking": "medium"}})
         self.assertEqual(caught.exception.code, "FANOUT_UNAVAILABLE")
 
     def test_probe_uses_capabilities_not_version_and_argv_only(self):
@@ -35,7 +35,8 @@ class HerdrProviderTests(unittest.TestCase):
         def run(argv, **kwargs):
             calls.append((argv, kwargs))
             return subprocess.CompletedProcess(argv, 0, b"openai-codex/gpt-5.6-luna\n", b"")
-        result = HerdrProvider(runner=run).probe(["runtime_identity"])
+        result = HerdrProvider(runner=run).probe({"schema_version": 1, "request_id": "probe-1", "required_capabilities": ["runtime_identity"], "runtime": {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "thinking": "medium"}})
+        self.assertEqual(result["request_id"], "probe-1")
         self.assertEqual(result["result"]["runtime_identity"], "openai-codex/gpt-5.6-luna:medium")
         self.assertEqual([call[0][:2] for call in calls], [["herdr", "--help"], ["herdr", "agent"], ["pi", "--list-models"]])
         self.assertTrue(all(call[1]["shell"] is False and call[1]["stdin"] is subprocess.DEVNULL for call in calls))
@@ -51,7 +52,7 @@ class HerdrProviderTests(unittest.TestCase):
         def timeout(argv, **kwargs):
             raise subprocess.TimeoutExpired(argv, 1)
         with self.assertRaises(ProtocolError) as caught:
-            HerdrProvider(runner=timeout).probe()
+            HerdrProvider(runner=timeout).probe({"schema_version": 1, "request_id": "probe-1", "required_capabilities": [], "runtime": {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "thinking": "medium"}})
         self.assertEqual(caught.exception.code, "TIMEOUT")
 
     def test_ledger_replays_closed_identity_bound_events_and_rejects_duplicate(self):
@@ -68,10 +69,9 @@ class HerdrProviderTests(unittest.TestCase):
                        "started_at": "2026-01-01T00:00:00Z", "started_at_source": "adapter_observed", "candidate": candidate,
                        "candidate_evidence": ref, "request_packet": packet, "output_root_id": "out-1", "output_root_digest": digest,
                        "session_root_id": "sess-1", "session_root_digest": digest, "request_digest": digest,
-                       "herdr": {"workspace_id": "w", "tab_id": "t", "pane_id": "p"}, "agent_id": "agent-1", "pi_session_id": "pi-1",
-                       "core_identity": digest, "core_state_digest": digest, "prev_digest": "sha256:" + "0" * 64}
+                       "herdr": {"workspace_id": "w", "tab_id": "t", "pane_id": "p"}, "prev_digest": "sha256:" + "0" * 64}
             started["record_digest"] = raw_file_digest(canonical_json(started)); ledger.append(started)
-            settled = {key: started[key] for key in ("schema_version", "attempt_id", "work_id", "node_id", "observed_generation", "observed_ordinal", "worker_id", "allowance_id", "provider_id", "worktree_ref", "branch", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest", "herdr", "agent_id", "pi_session_id", "core_identity", "core_state_digest")}
+            settled = {key: started[key] for key in ("schema_version", "attempt_id", "work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "worktree_ref", "branch", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest", "herdr")}
             settled.update({"event": "SETTLED", "settled_at": "2026-01-01T00:01:00Z", "outcome": "UNKNOWN", "evidence_refs": [{**ref, "kind": "result"}], "prev_digest": started["record_digest"], "cleanup": "uncertain"})
             settled["record_digest"] = raw_file_digest(canonical_json(settled)); ledger.append(settled)
             with self.assertRaises(ProtocolError) as caught: ledger.append(started)
