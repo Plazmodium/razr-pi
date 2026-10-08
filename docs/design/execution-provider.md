@@ -185,7 +185,7 @@ A headless provider would:
 8. discover exactly one saved fresh session and return its identity/artifact references; and
 9. never interpret the final report as PASS or mutate Razr state.
 
-Role-specific packet construction and semantic audit remain caller responsibilities. A shared low-level supervisor may eventually serve critic and primary executions, but only after tests establish identical cleanup, capture, and refusal semantics.
+Role-specific packet construction and semantic audit remain caller responsibilities. The M04 Herdr implementation is limited to this approved transport proof; it does not absorb critic, primary, or workflow authority.
 
 ## M04 implemented Herdr proof scope
 

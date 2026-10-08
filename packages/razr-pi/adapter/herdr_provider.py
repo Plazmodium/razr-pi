@@ -226,7 +226,7 @@ class AttemptLedger:
         if not isinstance(candidate, dict) or set(candidate) != {"commit", "source_digest"}:
             raise _fail("LEDGER_CORRUPT", "invalid candidate record")
         _commit(candidate["commit"]); _digest(candidate["source_digest"], "candidate source digest")
-        cls._ref(event["candidate_evidence"], "candidate_evidence")
+        cls._ref(event["candidate_evidence"], "candidate_evidence", "canonical_json")
         cls._ref(event["request_packet"], "request_packet", "canonical_json")
         if event["event"] == "STARTED":
             _timestamp(event["started_at"], "started_at")
@@ -236,7 +236,7 @@ class AttemptLedger:
             if event["outcome"] not in _OUTCOMES: raise _fail("LEDGER_CORRUPT", "invalid outcome")
             if not isinstance(event["evidence_refs"], list) or not event["evidence_refs"]:
                 raise _fail("LEDGER_CORRUPT", "settlement evidence is required")
-            for ref in event["evidence_refs"]: cls._ref(ref, "evidence_ref")
+            for ref in event["evidence_refs"]: cls._ref(ref, "evidence_ref", "raw_file")
             if "exit_code" in event and (not isinstance(event["exit_code"], int) or isinstance(event["exit_code"], bool)):
                 raise _fail("LEDGER_CORRUPT", "invalid exit_code")
             if "cleanup" in event and event["cleanup"] not in {"confirmed", "uncertain", "not_applicable"}:
@@ -351,6 +351,7 @@ class HerdrProvider:
         self._settled: set[str] = set()
         self._attempt_paths: dict[str, Path] = {}
         self._attempt_sessions: dict[str, Path] = {}
+        self._attempt_session_paths: dict[str, Path] = {}
         self._attempt_roots: dict[str, tuple[Path, Path]] = {}
         self._private_handles: dict[str, dict[str, object]] = {}
 
@@ -553,7 +554,7 @@ class HerdrProvider:
                     if any(row["root_id"] == root_id or row["path"] == str(root) for row in rows): raise _fail("RESOURCE_REUSED", "root identity or canonical path was previously claimed")
                     row = {"schema_version": 1, "root_id": root_id, "root_digest": root_digest, "path": str(root), "attempt_id": attempt_id, "request_digest": request_digest, "claimed_at": _now(), "prev_digest": previous}
                     row["record_digest"] = raw_file_digest(canonical_json(row)); stream.seek(0, 2); stream.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"); stream.flush(); os.fsync(stream.fileno()); fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-            except OSError as exc: raise _fail("LEDGER_CORRUPT", "root claims cannot be locked or written") from exc
+            except (OSError, UnicodeDecodeError) as exc: raise _fail("LEDGER_CORRUPT", "root claims cannot be locked or written") from exc
         finally: os.close(dirfd)
 
     def _claim_roots(self, request: ProviderRequest, capability_report_digest: str) -> None:
@@ -804,23 +805,30 @@ class HerdrProvider:
 
     def _verify_root_claim(self, root: Path, root_id: str, root_digest: str) -> None:
         if self.private_root is None: raise _fail("IDENTITY_MISMATCH", "private root is unavailable")
-        claim_path = _canonical_dir(str(self.private_root), "private_root") / "root-claims.jsonl"
-        try: st = claim_path.stat()
-        except OSError as exc: raise _fail("IDENTITY_MISMATCH", "root claim is unavailable") from exc
-        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1 or claim_path.is_symlink(): raise _fail("IDENTITY_MISMATCH", "root claim identity is unsafe")
-        try: claim_bytes = claim_path.read_bytes()
-        except (OSError, UnicodeDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "root claim cannot be read") from exc
-        if not claim_bytes.endswith(b"\n"): raise _fail("IDENTITY_MISMATCH", "root claim is partial")
-        previous = "sha256:" + "0" * 64; found = False
-        for line in claim_bytes.decode("utf-8").splitlines():
-            try: row = json.loads(line)
-            except json.JSONDecodeError as exc: raise _fail("IDENTITY_MISMATCH", "root claim is malformed") from exc
-            expected = {"schema_version", "root_id", "root_digest", "path", "attempt_id", "request_digest", "claimed_at", "prev_digest", "record_digest"}
-            if not isinstance(row, dict) or set(row) != expected or row["prev_digest"] != previous or row["record_digest"] != raw_file_digest(canonical_json({key: row[key] for key in row if key != "record_digest"})):
-                raise _fail("IDENTITY_MISMATCH", "root claim chain is corrupt")
-            if row["root_id"] == root_id and row["path"] == str(root) and row["root_digest"] == root_digest: found = True
-            previous = row["record_digest"]
-        if not found: raise _fail("IDENTITY_MISMATCH", "root claim identity is missing")
+        private = _canonical_dir(str(self.private_root), "private_root")
+        dirfd = os.open(private, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            fd = os.open("root-claims.jsonl", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+            try:
+                file_stat = os.fstat(fd)
+                if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1: raise _fail("IDENTITY_MISMATCH", "root claim identity is unsafe")
+                with os.fdopen(fd, "rb") as stream:
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_SH); claim_bytes = stream.read(); fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                if not claim_bytes.endswith(b"\n"): raise _fail("IDENTITY_MISMATCH", "root claim is partial")
+                try: lines = claim_bytes.decode("utf-8").splitlines()
+                except UnicodeDecodeError as exc: raise _fail("IDENTITY_MISMATCH", "root claim is not UTF-8") from exc
+                previous = "sha256:" + "0" * 64; found = False
+                for line in lines:
+                    try: row = json.loads(line)
+                    except json.JSONDecodeError as exc: raise _fail("IDENTITY_MISMATCH", "root claim is malformed") from exc
+                    expected = {"schema_version", "root_id", "root_digest", "path", "attempt_id", "request_digest", "claimed_at", "prev_digest", "record_digest"}
+                    if not isinstance(row, dict) or set(row) != expected or row["prev_digest"] != previous or row["record_digest"] != raw_file_digest(canonical_json({key: row[key] for key in row if key != "record_digest"})):
+                        raise _fail("IDENTITY_MISMATCH", "root claim chain is corrupt")
+                    if row["root_id"] == root_id and row["path"] == str(root) and row["root_digest"] == root_digest: found = True
+                    previous = row["record_digest"]
+                if not found: raise _fail("IDENTITY_MISMATCH", "root claim identity is missing")
+            except (OSError, UnicodeDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "root claim cannot be read") from exc
+        finally: os.close(dirfd)
         marker = root / ".razr-herdr-root.json"
         if not marker.is_file() or marker.is_symlink(): raise _fail("IDENTITY_MISMATCH", "root ownership marker is unavailable")
         _marker(root, root_id, root_digest, create=False)
@@ -872,6 +880,12 @@ class HerdrProvider:
             except OSError as exc: raise _fail("IDENTITY_MISMATCH", "bound session path is unavailable") from exc
             if not session_path.is_absolute() or session_path != session_path.resolve(strict=False) or not session_path.is_relative_to(session_root) or not session_path.is_file() or session_path.is_symlink() or stat.st_nlink != 1 or session_record["pi_session_id"] != "pi-session-" + hashlib.sha256(str(session_path).encode("utf-8")).hexdigest():
                 raise _fail("IDENTITY_MISMATCH", "private session path identity differs")
+        session_identity = session_record if private["session_status"] == "bound" else (pending_record if "pending_record" in locals() else None)
+        if session_identity is not None:
+            session_path_exact = Path(session_identity["pi_session_path"])
+            if not session_path_exact.is_relative_to(_canonical_dir(paths["session_root"], "session_root")) or session_path_exact.parent != _canonical_dir(paths["session_root"], "session_root"):
+                raise _fail("IDENTITY_MISMATCH", "session path is not an exact direct child of session root")
+            self._attempt_session_paths[value["attempt_id"]] = session_path_exact
         binding_ref = private["session_binding_ref"]
         if not isinstance(binding_ref, str) or PurePosixPath(binding_ref).is_absolute() or ".." in PurePosixPath(binding_ref).parts: raise _fail("PATH_ESCAPE", "session binding reference escapes root")
         binding_path = private_base / binding_ref
@@ -962,12 +976,19 @@ class HerdrProvider:
         return {"schema_version": 1, "ok": True, "request_id": request_id, "result": {"attempt_id": request["attempt_id"], "outcome": "UNKNOWN", "recovered": True}}
 
     def prompt(self, target: str, text: str, *, timeout_ms: int) -> object:
+        if not isinstance(target, str) or len(target) > 128: raise _fail("INVALID_REQUEST", "invalid prompt target")
         _id(target, "target")
-        if not isinstance(text, str) or not text or timeout_ms <= 0: raise _fail("INVALID_REQUEST", "invalid prompt/bound")
-        private = self._private_handles.get(target)
-        if private is not None: self._handle(private["handle"])
+        if not isinstance(text, str) or not text or len(text.encode("utf-8")) > 65_536 or timeout_ms <= 0: raise _fail("INVALID_REQUEST", "invalid prompt/bound")
+        if self.private_root is None: raise _fail("IDENTITY_MISMATCH", "provider private root is unavailable")
+        private_root = _canonical_dir(str(self.private_root), "private_root")
+        record_path = private_root / "handles" / ("handle-" + target + ".json")
+        try: record = json.loads(_read_private_bytes(record_path, private_root).decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "durable prompt handle is unavailable") from exc
+        if not isinstance(record, dict) or not isinstance(record.get("handle"), dict) or record["handle"].get("handle_id") != target: raise _fail("IDENTITY_MISMATCH", "prompt target is not a durable handle")
+        value = self._handle(record["handle"])
+        if value["handle_id"] != target: raise _fail("IDENTITY_MISMATCH", "prompt handle identity differs")
         response = _envelope(self._exec([self.herdr, "agent", "prompt", target, text, "--wait", "--timeout", str(timeout_ms)], timeout_ms=timeout_ms), "prompt")
-        if private is not None: self._bind_session_if_available(private["handle"])
+        self._bind_session_if_available(value)
         return response
 
     def _inspect_handle(self, handle: Mapping[str, object]) -> object:
@@ -1166,7 +1187,9 @@ class HerdrProvider:
                 marker = root / ".razr-herdr-root.json"
                 _marker(root, root_id, root_digest, create=False)
                 for child in root.iterdir():
-                    if child == marker or child.name.endswith(value["attempt_id"] + ".bin") or child.name.endswith(value["attempt_id"] + ".json"):
+                    session_path = self._attempt_session_paths.get(value["attempt_id"])
+                    allowed = {marker, session_path, root / ("agent-read-" + value["attempt_id"] + ".bin"), root / ("agent-status-" + value["attempt_id"] + ".json"), root / ("interrupt-" + value["attempt_id"] + ".json"), root / ("collect-failure-" + value["attempt_id"] + ".json")}
+                    if child in allowed:
                         if child.is_file() and not child.is_symlink(): child.unlink()
                     else: raise _fail("CLEANUP_UNKNOWN", "foreign/nonempty provider root")
                 root.rmdir()
