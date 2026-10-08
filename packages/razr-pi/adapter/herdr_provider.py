@@ -347,8 +347,23 @@ class HerdrProvider:
         return stdout
 
     def _model(self) -> str:
-        output = self._exec([self.pi, "--list-models", "gpt-5.6-luna"], timeout_ms=10_000, max_output=262_144).decode("utf-8", "replace")
-        if not any(line.strip() == _MODEL for line in output.splitlines()): raise _fail("UNSUPPORTED_CAPABILITY", "exact Pi model is not installed")
+        try: output = self._exec([self.pi, "--list-models", "gpt-5.6-luna"], timeout_ms=10_000, max_output=262_144).decode("utf-8", "strict")
+        except UnicodeDecodeError as exc: raise _fail("UNSUPPORTED_CAPABILITY", "Pi model table is not UTF-8") from exc
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
+        if len(lines) < 2: raise _fail("UNSUPPORTED_CAPABILITY", "Pi model table is malformed")
+        header = lines[0].split()
+        if len(header) < 2 or [token.lower() for token in header[:2]] != ["provider", "model"]:
+            raise _fail("UNSUPPORTED_CAPABILITY", "Pi model table header is malformed")
+        rows = []
+        for line in lines[1:]:
+            tokens = line.split()
+            if not tokens or all(set(token) <= {"-", "="} for token in tokens): continue
+            if len(tokens) < 2 or any(not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]*", token) for token in tokens[:2]):
+                raise _fail("UNSUPPORTED_CAPABILITY", "Pi model table row is malformed")
+            rows.append((tokens[0], tokens[1]))
+        matches = [(provider, model) for provider, model in rows if provider == "openai-codex" and model == "gpt-5.6-luna"]
+        if len(matches) != 1 or len(rows) != len(set(rows)):
+            raise _fail("UNSUPPORTED_CAPABILITY", "Pi model table is ambiguous")
         return output
 
     def probe(self, request: Mapping[str, object]) -> dict[str, object]:

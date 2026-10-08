@@ -30,12 +30,29 @@ class HerdrProviderTests(unittest.TestCase):
                 HerdrProvider().probe({"schema_version": 1, "request_id": "probe-1", "required_capabilities": [], "runtime": {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "thinking": "medium"}})
         self.assertEqual(caught.exception.code, "FANOUT_UNAVAILABLE")
 
+    def test_model_probe_requires_unambiguous_structured_table(self):
+        cases = [
+            b"openai-codex gpt-5.6-luna\n",
+            b"Provider Model\nopenai-codex gpt-5.6-luna\nopenai-codex gpt-5.6-luna\n",
+            b"Provider Model\nopenai-codex/gpt-5.6-luna\n",
+            b"Provider Model\nother-provider gpt-5.6-luna\n",
+        ]
+        for output in cases:
+            with self.subTest(output=output):
+                provider = HerdrProvider()
+                with patch.object(provider, "_exec", return_value=output):
+                    with self.assertRaises(ProtocolError) as caught: provider._model()
+                self.assertEqual(caught.exception.code, "UNSUPPORTED_CAPABILITY")
+        provider = HerdrProvider()
+        with patch.object(provider, "_exec", return_value=b"Provider    Model             Context\nopenai-codex gpt-5.6-luna      200000\n"):
+            self.assertEqual(provider._model().splitlines()[1].split()[:2], ["openai-codex", "gpt-5.6-luna"])
+
     def test_probe_uses_capabilities_not_version_and_argv_only(self):
         calls = []
         def run(argv, **kwargs):
             calls.append((argv, kwargs))
             help_text = b"--no-session --session --continue --resume --cwd --path --pane --timeout --lines pane"
-            if argv[:2] == ["pi", "--list-models"]: return subprocess.CompletedProcess(argv, 0, b"openai-codex/gpt-5.6-luna\n", b"")
+            if argv[:2] == ["pi", "--list-models"]: return subprocess.CompletedProcess(argv, 0, b"Provider    Model             Context\nopenai-codex gpt-5.6-luna      200000\n", b"")
             return subprocess.CompletedProcess(argv, 0, help_text, b"")
         result = HerdrProvider(runner=run).probe({"schema_version": 1, "request_id": "probe-1", "required_capabilities": list(("fresh_context", "working_directory", "bounded_time", "bounded_output", "runtime_identity")), "runtime": {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "thinking": "medium"}})
         self.assertEqual(result["request_id"], "probe-1")
@@ -103,7 +120,7 @@ class HerdrProviderTests(unittest.TestCase):
                 if argv[:2] == ["herdr", "--help"] or argv[:2] == ["herdr", "agent"] or argv[:2] == ["herdr", "worktree"] or argv[:2] == ["herdr", "pane"]:
                     return subprocess.CompletedProcess(argv, 0, b"help", b"")
                 if argv[:2] == ["pi", "--list-models"]:
-                    return subprocess.CompletedProcess(argv, 0, b"openai-codex/gpt-5.6-luna\n", b"")
+                    return subprocess.CompletedProcess(argv, 0, b"Provider    Model             Context\nopenai-codex gpt-5.6-luna      200000\n", b"")
                 if argv[:2] == ["pi", "--help"]:
                     return subprocess.CompletedProcess(argv, 0, b"help", b"")
                 if argv[:3] == ["herdr", "agent", "read"]:
