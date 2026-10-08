@@ -78,6 +78,50 @@ class HerdrProviderTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "DUPLICATE_ATTEMPT")
             self.assertEqual(len(path.read_text().splitlines()), 2)
 
+    def test_launch_collect_and_restart_recover_private_handle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp); worktree = (base / "worktree").resolve(); worktree.mkdir()
+            private = (base / "private").resolve(); private.mkdir(); output = (private / "output").resolve(); output.mkdir(); session = (private / "session").resolve(); session.mkdir()
+            tree = b"100644 blob " + b"0" * 40 + b"\tfile.txt\0"
+            source_digest = "sha256:" + hashlib.sha256(tree).hexdigest()
+            empty_digest = raw_file_digest(canonical_json([]))
+            def run(argv, **kwargs):
+                if argv[:3] == ["herdr", "agent", "start"]:
+                    result = {"agent_id": "agent-1", "workspace_id": "w", "tab_id": "t", "pane_id": "p", "pi_session_id": "pi-1"}
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "start", "result": result}).encode(), b"")
+                if argv[:3] == ["herdr", "agent", "get"]:
+                    result = {"status": "SETTLED", "workspace_id": "w", "tab_id": "t", "pane_id": "p", "observed_at": "2026-01-01T00:00:00Z", "source": "herdr"}
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "get", "result": result}).encode(), b"")
+                if argv[:2] == ["herdr", "--help"] or argv[:2] == ["herdr", "agent"]:
+                    return subprocess.CompletedProcess(argv, 0, b"help", b"")
+                if argv[:2] == ["pi", "--list-models"]:
+                    return subprocess.CompletedProcess(argv, 0, b"openai-codex/gpt-5.6-luna\n", b"")
+                if argv[:3] == ["herdr", "worktree", "open"]:
+                    result = {"workspace_id": "w", "tab_id": "t", "pane_id": "p", "path": str(worktree)}
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "open", "result": result}).encode(), b"")
+                if argv[:3] == ["herdr", "pane", "get"]:
+                    result = {"cwd": str(worktree), "agent_id": "agent-1"}
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "pane", "result": result}).encode(), b"")
+                if argv[:3] == ["herdr", "agent", "read"]:
+                    return subprocess.CompletedProcess(argv, 0, b"observed output", b"")
+                if argv[:3] == ["git", "-C", str(worktree)] and argv[3] == "symbolic-ref":
+                    return subprocess.CompletedProcess(argv, 0, b"feature/x\n", b"")
+                if argv[:3] == ["git", "-C", str(worktree)] and argv[3] == "rev-parse":
+                    return subprocess.CompletedProcess(argv, 0, b"0" * 40 + b"\n", b"")
+                if argv[:3] == ["git", "-C", str(worktree)] and argv[3] == "ls-tree":
+                    return subprocess.CompletedProcess(argv, 0, tree, b"")
+                raise AssertionError(argv)
+            request = {"schema_version": 1, "request_id": "exec-1", "attempt_id": "att-1", "role": "worker", "host": {"mode": "herdr", "workspace_id": "w", "tab_id": "t", "pane_id": "p"}, "work": {"work_id": "work", "node_id": "node", "generation": 1, "ordinal": 1}, "worker_id": "worker-1", "branch": "feature/x", "candidate": {"repository": "owner/repo", "branch": "feature/x", "commit": "0" * 40, "source_digest": source_digest}, "worktree": str(worktree), "cwd": str(worktree), "output_root": str(output), "output_root_id": "out-1", "output_root_digest": empty_digest, "session_root": str(session), "session_root_id": "sess-1", "session_root_digest": empty_digest, "fresh_context": True, "neutral_input_digest": "sha256:" + "a" * 64, "environment_policy_digest": "sha256:" + "b" * 64, "tool_policy_digest": "sha256:" + "c" * 64, "required_capabilities": ["runtime_identity"], "runtime": {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "thinking": "medium"}, "limits": {"deadline_ms": 1000, "max_output_bytes": 1000}, "allowance_id": "allow-1"}
+            ledger = AttemptLedger(base / "attempts.jsonl")
+            provider = HerdrProvider(runner=run, ledger=ledger, private_root=private)
+            response = provider.launch(request); handle = response["result"]["handle"]
+            self.assertEqual(set(handle), {"provider_id", "handle_id", "request_digest", "attempt_id", "host", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest"})
+            collected = HerdrProvider(runner=run, ledger=ledger, private_root=private)
+            result = collected.collect({"schema_version": 1, "request_id": "collect-1", "handle": handle})
+            self.assertEqual(result["request_id"], "collect-1"); self.assertEqual(result["result"]["termination"], "UNKNOWN")
+            with self.assertRaises(ProtocolError): collected._handle({**handle, "request_digest": "sha256:" + "d" * 64})
+            self.assertEqual(len(ledger.path.read_text().splitlines()), 2)
+
     def test_request_rejects_runtime_fallback_and_root_reuse(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = (Path(tmp) / "work").resolve(); root.mkdir()

@@ -301,7 +301,7 @@ class HerdrProvider:
         self._attempt_paths: dict[str, Path] = {}
         self._attempt_sessions: dict[str, Path] = {}
         self._attempt_roots: dict[str, tuple[Path, Path]] = {}
-        self._private_handles: dict[str, dict[str, str]] = {}
+        self._private_handles: dict[str, dict[str, object]] = {}
 
     def _env(self) -> dict[str, str]:
         allowed = {"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "HERDR_CONFIG_PATH"}
@@ -423,7 +423,8 @@ class HerdrProvider:
                 "packet": {"ref": str(packet_path.relative_to(_canonical_dir(values["worktree"], "worktree"))), "digest_domain": "canonical_json", "digest": raw_file_digest(packet_bytes)}}
 
     def launch(self, request: Mapping[str, object]) -> dict[str, object]:
-        parsed = ProviderRequest(request); self.probe({"schema_version": 1, "request_id": request["request_id"], "required_capabilities": ["runtime_identity"], "runtime": request["runtime"]})
+        parsed = ProviderRequest(request)
+        probe_report = self.probe({"schema_version": 1, "request_id": request["request_id"], "required_capabilities": request["required_capabilities"], "runtime": request["runtime"]})
         if self.ledger is None: raise _fail("INVALID_REQUEST", "append-only attempt ledger is required")
         if self.private_root is None: raise _fail("INVALID_REQUEST", "provider-approved private root is required")
         private_root = _canonical_dir(str(self.private_root), "private_root")
@@ -433,7 +434,7 @@ class HerdrProvider:
         evidence = self._claim_roots(parsed)
         self._verify_candidate(parsed)
         value = parsed.value; deadline = value["limits"]["deadline_ms"]
-        started = {"schema_version": 1, "event": "STARTED", "attempt_id": value["attempt_id"], "work_id": value["work"]["work_id"], "node_id": value["work"]["node_id"], "observed_generation": value["work"]["generation"], "observed_ordinal": value["work"]["ordinal"], "worker_id": value["worker_id"], "branch": value["branch"], "worktree_ref": ".", "allowance_id": value["allowance_id"], "provider_id": self.provider_id, "started_at": _now(), "started_at_source": "adapter_observed", "candidate": value["candidate"], "candidate_evidence": evidence["candidate"], "request_packet": evidence["packet"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"], "request_digest": parsed.digest, "herdr": value["host"], "prev_digest": "sha256:" + "0" * 64}
+        started = {"schema_version": 1, "event": "STARTED", "attempt_id": value["attempt_id"], "work_id": value["work"]["work_id"], "node_id": value["work"]["node_id"], "observed_generation": value["work"]["generation"], "observed_ordinal": value["work"]["ordinal"], "worker_id": value["worker_id"], "branch": value["branch"], "worktree_ref": ".", "allowance_id": value["allowance_id"], "provider_id": self.provider_id, "started_at": _now(), "started_at_source": "adapter_observed", "candidate": value["candidate"], "candidate_evidence": evidence["candidate"], "request_packet": evidence["packet"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"], "request_digest": parsed.digest, "herdr": {key: value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")}, "prev_digest": "sha256:" + "0" * 64}
         # The ledger computes no authority: this is a durable observation only.
         # Its predecessor is supplied by the ledger caller/chain; STARTED must
         # be appended before the provider launch below.
@@ -469,13 +470,16 @@ class HerdrProvider:
             if self.private_root is None: raise _fail("INVALID_REQUEST", "provider private root is unavailable")
             private_dir = _canonical_dir(str(self.private_root), "private_root") / "handles"
             private_dir.mkdir(mode=0o700, exist_ok=True)
-            private = {"schema_version": 1, "handle": handle, "agent_id": result["agent_id"], "pi_session_id": result["pi_session_id"], "handle_digest": raw_file_digest(canonical_json(handle))}
+            private = {"schema_version": 1, "handle": handle, "agent_id": result["agent_id"], "pi_session_id": result["pi_session_id"], "handle_digest": raw_file_digest(canonical_json(handle)), "paths": {"worktree": value["worktree"], "output_root": value["output_root"], "session_root": value["session_root"]}}
             private_path = private_dir / ("handle-" + result["agent_id"] + ".json")
             private_bytes = canonical_json(private)
             fd = os.open(private_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as stream: stream.write(private_bytes); stream.flush(); os.fsync(stream.fileno())
             self._private_handles[result["agent_id"]] = private
-            return {"schema_version": 1, "ok": True, "request_id": value["request_id"], "result": {"handle": handle, "capability_report_digest": raw_file_digest(canonical_json({"runtime": _MODEL + ":medium", "request_digest": parsed.digest}))}}
+            return {"schema_version": 1, "ok": True, "request_id": value["request_id"], "result": {"handle": handle, "capability_report_digest": probe_report["result"]["report_digest"]}}
+        except OSError as exc:
+            self._settle({"attempt_id": value["attempt_id"]}, "UNKNOWN", cleanup="uncertain", reason=str(exc))
+            raise _fail("LAUNCH_FAILED", "private handle persistence failed") from exc
         except ProtocolError as exc:
             self._settle({"attempt_id": value["attempt_id"]}, "UNKNOWN", cleanup="uncertain", reason=str(exc))
             raise
@@ -504,17 +508,30 @@ class HerdrProvider:
         if value["provider_id"] != "herdr": raise _fail("IDENTITY_MISMATCH", "foreign provider handle")
         _id(value["handle_id"], "handle_id"); _id(value["attempt_id"], "attempt_id"); _digest(value["request_digest"], "request_digest"); _digest(value["output_root_digest"], "output_root_digest"); _digest(value["session_root_digest"], "session_root_digest")
         if value["host"] != _host(): raise _fail("IDENTITY_MISMATCH", "foreign Herdr host")
-        if self.private_root is None or value["handle_id"] not in self._private_handles: raise _fail("IDENTITY_MISMATCH", "handle is not owned by this provider instance")
+        if self.private_root is None: raise _fail("IDENTITY_MISMATCH", "provider private root is unavailable")
         private_path = _canonical_dir(str(self.private_root), "private_root") / "handles" / ("handle-" + value["handle_id"] + ".json")
         try: private = json.loads(private_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "durable private handle evidence is unavailable") from exc
-        private = _closed(private, {"schema_version", "handle", "agent_id", "pi_session_id", "handle_digest"}, "private handle")
-        if private["schema_version"] != 1 or private["handle"] != value or private["handle_digest"] != raw_file_digest(canonical_json(value)) or private != self._private_handles[value["handle_id"]]: raise _fail("IDENTITY_MISMATCH", "handle evidence differs")
+        private = _closed(private, {"schema_version", "handle", "agent_id", "pi_session_id", "handle_digest", "paths"}, "private handle")
+        paths = _closed(private["paths"], {"worktree", "output_root", "session_root"}, "private handle paths")
+        private_base = _canonical_dir(str(self.private_root), "private_root")
+        for name in paths:
+            path = _canonical_dir(paths[name], name)
+            if name != "worktree" and not path.is_relative_to(private_base): raise _fail("PATH_ESCAPE", "private handle path escapes provider root")
+        if private["schema_version"] != 1 or private["handle"] != value or private["handle_digest"] != raw_file_digest(canonical_json(value)): raise _fail("IDENTITY_MISMATCH", "handle evidence differs")
+        cached = self._private_handles.get(value["handle_id"])
+        if cached is not None and cached != private: raise _fail("IDENTITY_MISMATCH", "in-memory handle evidence differs")
+        self._private_handles[value["handle_id"]] = private
+        self._attempt_paths.setdefault(value["attempt_id"], Path(paths["worktree"]))
+        self._attempt_sessions.setdefault(value["attempt_id"], Path(paths["session_root"]))
+        self._attempt_roots.setdefault(value["attempt_id"], (Path(paths["output_root"]), Path(paths["session_root"])))
         if self.ledger is None or not self.ledger.path.exists(): raise _fail("IDENTITY_MISMATCH", "handle ledger is unavailable")
         try: records = [AttemptLedger._validate_event(json.loads(line)) for line in self.ledger.path.read_text(encoding="utf-8").splitlines()]
         except (OSError, json.JSONDecodeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "handle ledger cannot be replayed") from exc
         started = next((row for row in records if row["event"] == "STARTED" and row["attempt_id"] == value["attempt_id"]), None)
-        if started is None or any(started.get(key) != value.get(key) for key in ("attempt_id", "provider_id", "request_digest", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest")) or started.get("herdr") != value["host"]:
+        settled = next((row for row in records if row["event"] == "SETTLED" and row["attempt_id"] == value["attempt_id"]), None)
+        if settled is not None: self._settled.add(value["attempt_id"])
+        if started is None or any(started.get(key) != value.get(key) for key in ("attempt_id", "provider_id", "request_digest", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest")) or started.get("herdr") != {key: value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")}:
             raise _fail("IDENTITY_MISMATCH", "handle does not match STARTED identity")
         return value
 
@@ -568,9 +585,10 @@ class HerdrProvider:
                 fd = os.open(artifact, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 with os.fdopen(fd, "wb") as stream: stream.write(content); stream.flush(); os.fsync(stream.fileno())
             # The frozen status response has no exit code and no semantic
-            # termination. Never consume worker-created metadata or invent one.
-            self._settle(value, "UNKNOWN", reason="Herdr status/read observed; no exit code authority")
-            raise _fail("ARTIFACT_UNAVAILABLE", "Herdr did not provide authoritative exit code/termination")
+            # termination. Preserve that uncertainty; never consume worker
+            # metadata or invent an exit code.
+            self._settle(value, "UNKNOWN", reason="Herdr status/read observed; termination UNKNOWN")
+            return {"schema_version": 1, "ok": True, "request_id": "collect", "result": {"attempt_id": value["attempt_id"], "termination": "UNKNOWN", "runtime_identity": _MODEL + ":medium", "host": value["host"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"], "artifact_refs": [{"kind": "stdout", "digest_domain": "raw_file", "digest": raw_file_digest(data), "bytes": len(data)}, {"kind": "session", "digest_domain": "raw_file", "digest": raw_file_digest(status_bytes), "bytes": len(status_bytes)}], "cleanup": "not_applicable"}}
         except ProtocolError as exc:
             self._settle(value, "UNKNOWN", cleanup="uncertain", reason=str(exc)); raise
 
@@ -595,9 +613,21 @@ class HerdrProvider:
         internal = self._interrupt_handle(request["handle"], request["reason"])
         return {"schema_version": 1, "ok": True, "request_id": request_id, "result": internal["result"]}
 
+    def _cleanup_record(self, handle: Mapping[str, object], outcome: str, **details: object) -> None:
+        if self.private_root is None: return
+        directory = _canonical_dir(str(self.private_root), "private_root") / "cleanup"
+        directory.mkdir(mode=0o700, exist_ok=True)
+        record = {"schema_version": 1, "attempt_id": handle["attempt_id"], "handle_id": handle["handle_id"], "request_digest": handle["request_digest"], "outcome": outcome, "observed_at": _now(), "details": details}
+        with (directory / "observations.jsonl").open("ab") as stream:
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX); stream.write(canonical_json(record) + b"\n"); stream.flush(); os.fsync(stream.fileno()); fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
     def cleanup(self, handle: Mapping[str, object]) -> dict[str, object]:
         value = self._handle(handle)
-        if value["attempt_id"] not in self._settled: raise _fail("CLEANUP_UNKNOWN", "cleanup requires a settled attempt")
+        try: self._cleanup_record(value, "requested")
+        except OSError as exc: raise _fail("CLEANUP_UNKNOWN", "cleanup observation persistence failed") from exc
+        if value["attempt_id"] not in self._settled:
+            self._cleanup_record(value, "uncertain", reason="attempt is not settled")
+            raise _fail("CLEANUP_UNKNOWN", "cleanup requires a settled attempt")
         status = self._inspect_handle(value)["result"]["status"]
         if status not in {"SETTLED", "TERMINATED"}: raise _fail("CLEANUP_UNKNOWN", "refusing cleanup of active handle")
         try:
@@ -613,7 +643,9 @@ class HerdrProvider:
                         if child.is_file() and not child.is_symlink(): child.unlink()
                     else: raise _fail("CLEANUP_UNKNOWN", "foreign/nonempty provider root")
                 root.rmdir()
-            return {"attempt_id": value["attempt_id"], "cleanup": "confirmed", "status": status}
+            result = {"attempt_id": value["attempt_id"], "cleanup": "confirmed", "status": status}
+            self._cleanup_record(value, "confirmed", status=status)
+            return result
         except OSError as exc:
             try:
                 if self.private_root is not None:
@@ -621,8 +653,12 @@ class HerdrProvider:
                     evidence.write_bytes(canonical_json({"attempt_id": value["attempt_id"], "error": str(exc)[:500]}))
             except OSError:
                 pass
+            try: self._cleanup_record(value, "uncertain", reason=str(exc)[:500])
+            except OSError: pass
             raise _fail("CLEANUP_UNKNOWN", "cleanup filesystem operation failed") from exc
         except ProtocolError as exc:
+            try: self._cleanup_record(value, "uncertain", reason=str(exc)[:500])
+            except OSError: pass
             raise _fail("CLEANUP_UNKNOWN", str(exc)) from exc
 
 
