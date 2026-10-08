@@ -199,7 +199,9 @@ class HerdrProviderTests(unittest.TestCase):
             result = collected.collect({"schema_version": 1, "request_id": "collect-1", "handle": handle})
             self.assertEqual(result["request_id"], "collect-1"); self.assertEqual(result["result"]["termination"], "UNKNOWN")
             response_refs = result["result"]["artifact_refs"]
-            self.assertTrue(all("bytes" in ref for ref in response_refs))
+            self.assertTrue(all(set(ref) == {"kind", "digest_domain", "digest", "bytes"} for ref in response_refs))
+            self.assertNotIn("exit_code", result["result"])
+            self.assertTrue(all(not any("/" in str(value) for value in ref.values()) for ref in response_refs))
             settled = json.loads(ledger.path.read_text().splitlines()[1])
             self.assertEqual(set(settled["evidence_refs"][0]), {"ref", "kind", "digest_domain", "digest"})
             self.assertEqual(len(settled["evidence_refs"][:2]), 2)

@@ -250,8 +250,10 @@ The provider response schemas are closed. Launch and collect are:
 
 ```json
 {"schema_version":1,"ok":true,"request_id":"exec-...","result":{"handle":{"provider_id":"herdr","handle_id":"...","request_digest":"sha256:...","attempt_id":"att-...","host":{"mode":"herdr","workspace_id":"...","tab_id":"...","pane_id":"..."},"output_root_id":"out-...","output_root_digest":"sha256:...","session_root_id":"sess-...","session_root_digest":"sha256:..."},"capability_report_digest":"sha256:..."}}
-{"schema_version":1,"ok":true,"request_id":"exec-...","result":{"attempt_id":"att-...","termination":"SUCCEEDED|FAILED|INTERRUPTED|TIMED_OUT|UNKNOWN","runtime_identity":"...","host":{"mode":"herdr","workspace_id":"...","tab_id":"...","pane_id":"..."},"output_root_id":"out-...","output_root_digest":"sha256:...","session_root_id":"sess-...","session_root_digest":"sha256:...","artifact_refs":[{"kind":"stdout|stderr|session|event","digest_domain":"raw_file","digest":"sha256:...","bytes":123}],"exit_code":0,"cleanup":"confirmed|uncertain|not_applicable"}}
+{"schema_version":1,"ok":true,"request_id":"exec-...","result":{"attempt_id":"att-...","termination":"SUCCEEDED|FAILED|INTERRUPTED|TIMED_OUT|UNKNOWN","runtime_identity":"...","host":{"mode":"herdr","workspace_id":"...","tab_id":"...","pane_id":"..."},"output_root_id":"out-...","output_root_digest":"sha256:...","session_root_id":"sess-...","session_root_digest":"sha256:...","artifact_refs":[{"kind":"stdout|stderr|session|event","digest_domain":"raw_file","digest":"sha256:...","bytes":123}],"cleanup":"confirmed|uncertain|not_applicable"}}
 ```
+
+`exit_code` is optional in the collect response and is included only when an authoritative provider exit code is observed. Herdr does not provide an authoritative worker-process exit for this path, so termination `UNKNOWN` omits it; completion and an exit value are never inferred. This is consistent with optional `SETTLED.exit_code` in the attempt ledger and the no-null/no-inference rules.
 
 A fanout status response is Herdr-only and closed, with no null fields:
 
