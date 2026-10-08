@@ -167,33 +167,116 @@ class MemoryStore:
         try:
             self._root_fd = os.open(root, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
             self._root_identity = _identity(_regular(self._root_fd, "repository", directory=True))
-        except OSError as exc:
+        except (OSError, ProtocolError) as exc:
+            if getattr(self, "_root_fd", -1) >= 0:
+                os.close(self._root_fd)
             raise _fail("INVALID_REQUEST", "repository descriptor unavailable") from exc
         self._now = now
         self.default_limit = limit
+        self._razr_identity: tuple[int, int, int, int] | None = None
+        self._closed = False
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> "MemoryStore":
+        self._ensure_open()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        fd = getattr(self, "_root_fd", -1)
+        self._root_fd = -1
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def _ensure_open(self) -> None:
+        if self._closed or getattr(self, "_root_fd", -1) < 0:
+            raise _fail("INVALID_REQUEST", "memory store is closed")
+
+    def _verify_root(self) -> None:
+        self._ensure_open()
+        try:
+            path_info = os.stat(self.root, follow_symlinks=False)
+        except OSError as exc:
+            raise _fail("PATH_ESCAPE", "repository root identity unavailable") from exc
+        if _identity(_regular(self._root_fd, "repository", directory=True))[:2] != self._root_identity[:2]:
+            raise _fail("PATH_ESCAPE", "repository root descriptor changed")
+        if _identity(path_info)[:2] != self._root_identity[:2]:
+            raise _fail("PATH_ESCAPE", "repository root was replaced")
+
+    def _verify_storage(self, storage_fd: int) -> None:
+        self._verify_root()
+        try:
+            path_info = os.stat(".razr", dir_fd=self._root_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise _fail("PATH_ESCAPE", "memory directory identity unavailable") from exc
+        current = _identity(_regular(storage_fd, "memory directory", directory=True))
+        if self._razr_identity is None:
+            self._razr_identity = current
+        if current[:2] != self._razr_identity[:2] or _identity(path_info)[:2] != self._razr_identity[:2]:
+            raise _fail("PATH_ESCAPE", "memory directory was replaced")
+
+    def _verify_entry(self, storage_fd: int, name: str, fd: int, label: str) -> os.stat_result:
+        current = _regular(fd, label)
+        if current.st_nlink != 1:
+            raise _fail("PATH_ESCAPE", f"{label} hardlink refused")
+        try:
+            path_info = os.stat(name, dir_fd=storage_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise _fail("PATH_ESCAPE", f"{label} identity unavailable") from exc
+        if _identity(path_info)[:2] != _identity(current)[:2] or path_info.st_nlink != 1:
+            raise _fail("PATH_ESCAPE", f"{label} identity changed")
+        return current
 
     def _storage_dir(self) -> int:
+        self._verify_root()
         try:
             os.mkdir(".razr", 0o755, dir_fd=self._root_fd)
         except FileExistsError:
             pass
         except OSError as exc:
             raise _fail("LEDGER_CORRUPT", "memory directory unavailable") from exc
+        fd = -1
+        success = False
         try:
             fd = os.open(".razr", os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=self._root_fd)
-            _regular(fd, "memory directory", directory=True)
+            self._verify_storage(fd)
+            success = True
             return fd
+        except ProtocolError:
+            raise
         except OSError as exc:
             raise _fail("LEDGER_CORRUPT", "memory directory is linked or unavailable") from exc
+        finally:
+            if fd >= 0 and not success:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
     @contextmanager
     def _locked(self) -> Iterator[int]:
         storage_fd = self._storage_dir()
         lock_fd = -1
         try:
+            self._verify_storage(storage_fd)
             lock_fd = os.open("memory.jsonl.lock", os.O_RDWR | os.O_CREAT | _O_NOFOLLOW, 0o644, dir_fd=storage_fd)
-            _regular(lock_fd, "memory lock")
+            self._verify_entry(storage_fd, "memory.jsonl.lock", lock_fd, "memory lock")
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            self._verify_entry(storage_fd, "memory.jsonl.lock", lock_fd, "memory lock")
+            self._verify_storage(storage_fd)
             yield storage_fd
         except ProtocolError:
             raise
@@ -211,6 +294,7 @@ class MemoryStore:
                 pass
 
     def _read_locked(self, storage_fd: int) -> list[dict[str, object]]:
+        self._verify_storage(storage_fd)
         try:
             ledger_fd = os.open("memory.jsonl", os.O_RDONLY | _O_NOFOLLOW, dir_fd=storage_fd)
         except FileNotFoundError:
@@ -218,9 +302,9 @@ class MemoryStore:
         except OSError as exc:
             raise _fail("LEDGER_CORRUPT", "memory ledger is linked or unavailable") from exc
         try:
-            before = _regular(ledger_fd, "memory ledger")
+            before = self._verify_entry(storage_fd, "memory.jsonl", ledger_fd, "memory ledger")
             raw = _read_fd(ledger_fd, "memory ledger")
-            after = _regular(ledger_fd, "memory ledger")
+            after = self._verify_entry(storage_fd, "memory.jsonl", ledger_fd, "memory ledger")
             if _identity(before) != _identity(after):
                 raise _fail("LEDGER_CORRUPT", "memory ledger identity changed")
         finally:
@@ -246,6 +330,7 @@ class MemoryStore:
             records.append(value)
             ids.add(value["id"])
             previous = value["record_digest"]
+        self._verify_storage(storage_fd)
         return records
 
     def _validate_record(self, value: object, *, corruption: bool = False) -> None:
@@ -344,11 +429,12 @@ class MemoryStore:
         self._validate_record(record)
         payload = canonical_json(record) + b"\n"
         try:
+            self._verify_storage(storage_fd)
             fd = os.open("memory.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_NOFOLLOW, 0o644, dir_fd=storage_fd)
             try:
-                before = _regular(fd, "memory ledger")
+                before = self._verify_entry(storage_fd, "memory.jsonl", fd, "memory ledger")
                 self._write_all(fd, payload)
-                after = _regular(fd, "memory ledger")
+                after = self._verify_entry(storage_fd, "memory.jsonl", fd, "memory ledger")
                 if _identity(before)[:2] != _identity(after)[:2]:
                     raise _fail("LEDGER_CORRUPT", "memory ledger identity changed")
             finally:
@@ -357,6 +443,7 @@ class MemoryStore:
             raise
         except OSError as exc:
             raise _fail("LEDGER_CORRUPT", "memory ledger is linked or unavailable") from exc
+        self._verify_storage(storage_fd)
         return record
 
     def _logical(self, record: dict[str, object]) -> dict[str, object]:
@@ -388,6 +475,7 @@ class MemoryStore:
         return result
 
     def _read_evidence(self, ref: str) -> bytes:
+        self._ensure_open()
         relative = _repo_path(ref)
         if _identity(_regular(self._root_fd, "repository", directory=True))[:2] != self._root_identity[:2]:
             raise _fail("PATH_ESCAPE", "repository identity changed")
@@ -406,8 +494,12 @@ class MemoryStore:
             try:
                 fd = os.open(components[-1], os.O_RDONLY | _O_NOFOLLOW, dir_fd=current)
                 before = _regular(fd, "evidence file")
+                if before.st_nlink != 1:
+                    raise _fail("PATH_ESCAPE", "evidence hardlink refused")
                 content = _read_fd(fd, "evidence file", max_bytes=MAX_EVIDENCE_CONTENT_BYTES)
                 after = _regular(fd, "evidence file")
+                if after.st_nlink != 1:
+                    raise _fail("PATH_ESCAPE", "evidence hardlink changed")
             except OSError as exc:
                 raise _fail("PATH_ESCAPE", "evidence file is linked or unavailable") from exc
             finally:

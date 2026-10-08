@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 from pathlib import Path
+import resource
 import sys
 import tempfile
 import unittest
@@ -202,6 +203,62 @@ class MemoryTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             self.store.remember(kind="learning", summary="relations", repository=self.repo,
                                 related_ids=["r" * 128] * 32)
+
+    def test_lifecycle_hardlinks_directory_replacement_and_fd_bound(self):
+        store = MemoryStore(self.root)
+        self.assertIs(store.close(), None)
+        store.close()
+        with self.assertRaises(ProtocolError):
+            store.inspect()
+        with MemoryStore(self.root) as managed:
+            managed.remember(kind="learning", summary="managed", repository=self.repo)
+        with self.assertRaises(ProtocolError):
+            managed.inspect()
+
+        evidence = self.root / "hard.txt"
+        evidence.write_text("hard")
+        hardlink = self.root / "hard-copy.txt"
+        hardlink.hardlink_to(evidence)
+        with MemoryStore(self.root) as managed:
+            with self.assertRaises(ProtocolError):
+                managed.remember(kind="learning", summary="hard evidence", repository=self.repo,
+                    evidence=[{"type":"path", "ref":"hard.txt", "digest_domain":"raw_file",
+                               "digest":raw_file_digest(b"hard")}])
+
+        with MemoryStore(self.root) as managed:
+            managed.remember(kind="learning", summary="storage", repository=self.repo)
+        external_ledger = self.root / "ledger-copy"
+        external_ledger.hardlink_to(self.root / ".razr/memory.jsonl")
+        with MemoryStore(self.root) as linked_store:
+            with self.assertRaises(ProtocolError):
+                linked_store.inspect()
+        external_ledger.unlink()
+        external_lock = self.root / "lock-copy"
+        external_lock.hardlink_to(self.root / ".razr/memory.jsonl.lock")
+        with MemoryStore(self.root) as linked_store:
+            with self.assertRaises(ProtocolError):
+                linked_store.inspect()
+        external_lock.unlink()
+
+        pinned = MemoryStore(self.root)
+        pinned.validate()
+        old_storage = self.root / "razr-old"
+        (self.root / ".razr").rename(old_storage)
+        (self.root / ".razr").mkdir()
+        with self.assertRaises(ProtocolError):
+            pinned.inspect()
+        pinned.close()
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        lowered = min(soft, 128)
+        if lowered >= 32:
+            try:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (lowered, hard))
+                for _ in range(80):
+                    with MemoryStore(self.root) as managed:
+                        managed.validate()
+            finally:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
 
     def test_portable_paths_and_validate(self):
         record = self.store.remember(kind="preference", summary="portable", repository=self.repo,
