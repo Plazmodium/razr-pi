@@ -120,6 +120,11 @@ class HerdrProviderTests(unittest.TestCase):
                        "candidate_evidence": ref, "request_packet": packet, "output_root_id": "out-1", "output_root_digest": digest,
                        "session_root_id": "sess-1", "session_root_digest": digest, "request_digest": digest,
                        "herdr": {"workspace_id": "w", "tab_id": "t", "pane_id": "p"}, "prev_digest": "sha256:" + "0" * 64}
+            for index, bad_ref in enumerate(("/absolute", "../traversal", "a\\\\b")):
+                malformed = dict(started); malformed["attempt_id"] = "bad-ref-" + str(index); malformed["allowance_id"] = "bad-allow-" + str(index); malformed["worktree_ref"] = bad_ref; malformed["record_digest"] = raw_file_digest(canonical_json({**malformed, "record_digest": None}))
+                with self.assertRaises(ProtocolError) as caught:
+                    ledger.append(malformed)
+                self.assertEqual(caught.exception.code, "LEDGER_CORRUPT")
             started["record_digest"] = raw_file_digest(canonical_json(started)); ledger.append(started)
             settled = {key: started[key] for key in ("schema_version", "attempt_id", "work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "worktree_ref", "branch", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest", "herdr")}
             settled.update({"event": "SETTLED", "settled_at": "2026-01-01T00:01:00Z", "outcome": "UNKNOWN", "evidence_refs": [{"ref": ".razr/evidence/result.json", "digest_domain": "raw_file", "digest": digest, "kind": "result"}], "prev_digest": started["record_digest"], "cleanup": "uncertain"})

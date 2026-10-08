@@ -215,6 +215,9 @@ class AttemptLedger:
         _id(event["attempt_id"], "attempt_id"); _id(event["work_id"], "work_id"); _id(event["node_id"], "node_id")
         _id(event["worker_id"], "worker_id") if "worker_id" in event else None
         _branch(event["branch"], "branch"); _id(event["allowance_id"], "allowance_id") if "allowance_id" in event else None
+        worktree_ref = event["worktree_ref"]
+        if not isinstance(worktree_ref, str) or not worktree_ref or "\\" in worktree_ref or worktree_ref.startswith("/") or str(PurePosixPath(worktree_ref)) != worktree_ref or (worktree_ref != "." and any(part in {".", ".."} for part in PurePosixPath(worktree_ref).parts)):
+            raise _fail("LEDGER_CORRUPT", "worktree_ref must be a normalized repository-relative POSIX path")
         _id(event["provider_id"], "provider_id"); _id(event["output_root_id"], "output_root_id"); _id(event["session_root_id"], "session_root_id")
         if not isinstance(event["observed_generation"], int) or isinstance(event["observed_generation"], bool) or event["observed_generation"] < 1:
             raise _fail("LEDGER_CORRUPT", "invalid observed generation")
