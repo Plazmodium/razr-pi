@@ -228,6 +228,29 @@ def _reject_dirty_checkout(root: Path, work_root: str) -> None:
             raise _fail("SOURCE_CHANGED", "checkout has dirty or untracked path", path=path)
 
 
+def verify_candidate_identity(root: Path, *, branch: str, commit: str, source_digest: str) -> None:
+    """Verify checkout identity; callers remain responsible for candidate read-back/state authority."""
+    root = _canonical(root, directory=True)
+    if not isinstance(branch, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", branch) or ".." in PurePosixPath(branch).parts:
+        raise _fail("INVALID_REQUEST", "invalid candidate branch")
+    validate_git_object_id(commit)
+    _verify_git_identity(root)
+    if not _git_commit_exists(root, commit):
+        raise _fail("IDENTITY_MISMATCH", "expected commit is not present")
+    if _git_head(root) != commit:
+        raise _fail("SOURCE_CHANGED", "repository HEAD differs from expected commit")
+    _reject_dirty_checkout(root, _core_work_root(root, commit))
+    try:
+        result = subprocess.run(["git", "-C", str(root), "rev-parse", "--verify", f"refs/heads/{branch}"], env=_environment(), cwd=root, capture_output=True, check=False, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise _fail("IDENTITY_MISMATCH", "Git branch query unavailable") from exc
+    actual_commit = result.stdout.decode("ascii", "ignore").strip()
+    if result.returncode or result.stderr or actual_commit != commit:
+        raise _fail("CANDIDATE_CHANGED", "candidate branch does not point to commit")
+    if _source_digest(root, commit) != source_digest:
+        raise _fail("CANDIDATE_CHANGED", "worktree source digest differs")
+
+
 def _git_commit_exists(root: Path, commit: str) -> bool:
     try:
         result = subprocess.run(["git", "-C", str(root), "cat-file", "-e", commit + "^{commit}"],

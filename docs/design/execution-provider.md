@@ -2,7 +2,7 @@
 
 ## Decision
 
-Defer implementation. The public source has no Pi critic or worker launcher to abstract, and it has no duplicated provider-specific execution logic. Its subprocesses run the Razr core, Git, the no-model Pi resource-loader probe, and the public test suite; they are not interchangeable implementations of live reasoning execution. The launcher duplication found during read-only inspection exists only in excluded local workshop helpers. Importing or generalizing those helpers would expand the public capability boundary rather than remove coupling already present here.
+M04 implements a bounded Herdr transport proof within this execution-provider boundary. It does not provide a general delivery adapter: its subprocesses and telemetry remain transport evidence, never workflow authority or inferred approval. The public proof covers capability probing, owned worktree/session identity, durable attempts, bounded collection, interruption, cleanup, and truthful UNKNOWN outcomes; live campaign gates and human approval remain external.
 
 This note is therefore a design target for a later, separately approved vertical slice. That slice should begin with one observable tracer—launch one bounded fresh Technical Critic, collect candidate-bound evidence, and stop for the actual human checkpoint—not with a framework-only refactor. No code, tests, allowlist, lifecycle state, or external file is changed by this mission.
 
@@ -185,11 +185,11 @@ A headless provider would:
 8. discover exactly one saved fresh session and return its identity/artifact references; and
 9. never interpret the final report as PASS or mutate Razr state.
 
-Role-specific packet construction and semantic audit remain caller responsibilities. A shared low-level supervisor may eventually serve critic and primary executions, but only after tests establish identical cleanup, capture, and refusal semantics.
+Role-specific packet construction and semantic audit remain caller responsibilities. The M04 Herdr implementation is limited to this approved transport proof; it does not absorb critic, primary, or workflow authority.
 
-## Future Herdr implementation
+## M04 implemented Herdr proof scope
 
-A Herdr provider would:
+The M04 Herdr provider:
 
 1. verify the installed Herdr API capabilities and select an explicitly owned pane/session topology;
 2. start a fresh Pi session with the same reviewed cwd, runtime constraints, resource policy, and neutral input contract;
@@ -229,7 +229,7 @@ Consistent with Mission 03, a later adapter-owned append-only attempt ledger sho
 
 ## Implementation gate and proof plan
 
-Implementation becomes justified only after an approved public execution slice exists and either duplicated public launch logic or a second concrete provider creates real coupling. The first slice must prove one end-to-end Technical Critic path and stop at the actual human checkpoint. Subsequent slices may add Contract critique and Herdr only after their dependencies and shared interface are approved.
+M04 is implemented as an approved public execution slice, but it remains bounded proof rather than a general delivery adapter. It proves the transport boundary and stops at the actual human checkpoint; live/two-worker acceptance, fresh human review, exact specification approval, independent critics, and campaign gates remain pending and mandatory.
 
 Focused proof for any implementation must cover at least:
 
