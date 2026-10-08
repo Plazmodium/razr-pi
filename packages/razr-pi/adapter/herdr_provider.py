@@ -465,12 +465,16 @@ class HerdrProvider:
             if not isinstance(pane_result, dict) or "cwd" not in pane_result or "agent_id" not in pane_result: raise _fail("IDENTITY_MISMATCH", "pane response lacks actual agent cwd")
             if _canonical_dir(pane_result["cwd"], "agent cwd") != _canonical_dir(value["worktree"], "worktree") or pane_result["agent_id"] != result["agent_id"]:
                 raise _fail("IDENTITY_MISMATCH", "agent cwd/worktree differs")
-            private = {"handle_id": result["agent_id"], "agent_id": result["agent_id"], "pi_session_id": result["pi_session_id"], "workspace_id": result["workspace_id"], "tab_id": result["tab_id"], "pane_id": result["pane_id"]}
-            private_path = _canonical_dir(value["worktree"], "worktree") / ".razr" / "evidence" / ("handle-" + result["agent_id"] + ".json")
-            private_bytes = canonical_json(private); fd = os.open(private_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            handle = {"provider_id": "herdr", "handle_id": result["agent_id"], "request_digest": parsed.digest, "attempt_id": value["attempt_id"], "host": value["host"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"]}
+            if self.private_root is None: raise _fail("INVALID_REQUEST", "provider private root is unavailable")
+            private_dir = _canonical_dir(str(self.private_root), "private_root") / "handles"
+            private_dir.mkdir(mode=0o700, exist_ok=True)
+            private = {"schema_version": 1, "handle": handle, "agent_id": result["agent_id"], "pi_session_id": result["pi_session_id"], "handle_digest": raw_file_digest(canonical_json(handle))}
+            private_path = private_dir / ("handle-" + result["agent_id"] + ".json")
+            private_bytes = canonical_json(private)
+            fd = os.open(private_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as stream: stream.write(private_bytes); stream.flush(); os.fsync(stream.fileno())
             self._private_handles[result["agent_id"]] = private
-            handle = {"provider_id": "herdr", "handle_id": result["agent_id"], "request_digest": parsed.digest, "attempt_id": value["attempt_id"], "host": value["host"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"]}
             return {"schema_version": 1, "ok": True, "request_id": value["request_id"], "result": {"handle": handle, "capability_report_digest": raw_file_digest(canonical_json({"runtime": _MODEL + ":medium", "request_digest": parsed.digest}))}}
         except ProtocolError as exc:
             self._settle({"attempt_id": value["attempt_id"]}, "UNKNOWN", cleanup="uncertain", reason=str(exc))
@@ -500,6 +504,18 @@ class HerdrProvider:
         if value["provider_id"] != "herdr": raise _fail("IDENTITY_MISMATCH", "foreign provider handle")
         _id(value["handle_id"], "handle_id"); _id(value["attempt_id"], "attempt_id"); _digest(value["request_digest"], "request_digest"); _digest(value["output_root_digest"], "output_root_digest"); _digest(value["session_root_digest"], "session_root_digest")
         if value["host"] != _host(): raise _fail("IDENTITY_MISMATCH", "foreign Herdr host")
+        if self.private_root is None or value["handle_id"] not in self._private_handles: raise _fail("IDENTITY_MISMATCH", "handle is not owned by this provider instance")
+        private_path = _canonical_dir(str(self.private_root), "private_root") / "handles" / ("handle-" + value["handle_id"] + ".json")
+        try: private = json.loads(private_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "durable private handle evidence is unavailable") from exc
+        private = _closed(private, {"schema_version", "handle", "agent_id", "pi_session_id", "handle_digest"}, "private handle")
+        if private["schema_version"] != 1 or private["handle"] != value or private["handle_digest"] != raw_file_digest(canonical_json(value)) or private != self._private_handles[value["handle_id"]]: raise _fail("IDENTITY_MISMATCH", "handle evidence differs")
+        if self.ledger is None or not self.ledger.path.exists(): raise _fail("IDENTITY_MISMATCH", "handle ledger is unavailable")
+        try: records = [AttemptLedger._validate_event(json.loads(line)) for line in self.ledger.path.read_text(encoding="utf-8").splitlines()]
+        except (OSError, json.JSONDecodeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "handle ledger cannot be replayed") from exc
+        started = next((row for row in records if row["event"] == "STARTED" and row["attempt_id"] == value["attempt_id"]), None)
+        if started is None or any(started.get(key) != value.get(key) for key in ("attempt_id", "provider_id", "request_digest", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest")) or started.get("herdr") != value["host"]:
+            raise _fail("IDENTITY_MISMATCH", "handle does not match STARTED identity")
         return value
 
     def prompt(self, target: str, text: str, *, timeout_ms: int) -> object:
@@ -542,22 +558,19 @@ class HerdrProvider:
         try:
             status_response = self._inspect_handle(value); status = status_response["result"]["status"]
             if status not in {"SETTLED", "TERMINATED"}: raise _fail("ARTIFACT_UNAVAILABLE", "collect requires an observed terminal status")
-            metadata_path = self._attempt_sessions[value["attempt_id"]] / "terminal.json"
-            metadata_bytes = metadata_path.read_bytes()
-            if len(metadata_bytes) > 65_536: raise _fail("OUTPUT_LIMIT", "terminal metadata exceeds bound")
-            try: metadata_value = json.loads(metadata_bytes.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("ARTIFACT_UNAVAILABLE", "terminal metadata is malformed") from exc
-            metadata = _closed(metadata_value, {"status", "termination", "exit_code", "cleanup", "output_limited"}, "terminal metadata")
-            if metadata["status"] not in _STATUSES or metadata["termination"] not in _TERMINATIONS or not isinstance(metadata["exit_code"], int) or isinstance(metadata["exit_code"], bool) or metadata["cleanup"] not in {"confirmed", "uncertain", "not_applicable"} or not isinstance(metadata["output_limited"], bool): raise _fail("ARTIFACT_UNAVAILABLE", "terminal metadata is invalid")
             data = self.read(value)
-            evidence_dir = _canonical_dir(self._attempt_paths[value["attempt_id"]], "worktree") / ".razr" / "evidence"
-            output_artifact = evidence_dir / ("terminal-" + value["attempt_id"] + ".bin")
-            metadata_artifact = evidence_dir / ("terminal-" + value["attempt_id"] + ".json")
-            for artifact, content in ((output_artifact, data), (metadata_artifact, metadata_bytes)):
+            output_root, session_root = self._attempt_roots[value["attempt_id"]]
+            output_artifact = output_root / ("agent-read-" + value["attempt_id"] + ".bin")
+            status_bytes = canonical_json(status_response["result"])
+            status_artifact = session_root / ("agent-status-" + value["attempt_id"] + ".json")
+            for artifact, content in ((output_artifact, data), (status_artifact, status_bytes)):
+                if len(content) > 1_048_576: raise _fail("OUTPUT_LIMIT", "provider artifact exceeds bound")
                 fd = os.open(artifact, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 with os.fdopen(fd, "wb") as stream: stream.write(content); stream.flush(); os.fsync(stream.fileno())
-            self._settle(value, metadata["termination"], cleanup=metadata["cleanup"], reason="terminal metadata observed")
-            return {"schema_version": 1, "ok": True, "request_id": "collect", "result": {"attempt_id": value["attempt_id"], "termination": metadata["termination"], "runtime_identity": _MODEL + ":medium", "host": value["host"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"], "artifact_refs": [{"kind": "stdout", "digest_domain": "raw_file", "digest": raw_file_digest(data), "bytes": len(data)}, {"kind": "session", "digest_domain": "raw_file", "digest": raw_file_digest(metadata_bytes), "bytes": len(metadata_bytes)}], "exit_code": metadata["exit_code"], "cleanup": metadata["cleanup"]}}
+            # The frozen status response has no exit code and no semantic
+            # termination. Never consume worker-created metadata or invent one.
+            self._settle(value, "UNKNOWN", reason="Herdr status/read observed; no exit code authority")
+            raise _fail("ARTIFACT_UNAVAILABLE", "Herdr did not provide authoritative exit code/termination")
         except ProtocolError as exc:
             self._settle(value, "UNKNOWN", cleanup="uncertain", reason=str(exc)); raise
 
@@ -595,8 +608,20 @@ class HerdrProvider:
             for root, root_id, root_digest in ((self._attempt_roots[value["attempt_id"]][0], value["output_root_id"], value["output_root_digest"]), (self._attempt_roots[value["attempt_id"]][1], value["session_root_id"], value["session_root_digest"])):
                 marker = root / ".razr-herdr-root.json"
                 _marker(root, root_id, root_digest, create=False)
-                marker.unlink(); root.rmdir()
+                for child in root.iterdir():
+                    if child == marker or child.name.endswith(value["attempt_id"] + ".bin") or child.name.endswith(value["attempt_id"] + ".json"):
+                        if child.is_file() and not child.is_symlink(): child.unlink()
+                    else: raise _fail("CLEANUP_UNKNOWN", "foreign/nonempty provider root")
+                root.rmdir()
             return {"attempt_id": value["attempt_id"], "cleanup": "confirmed", "status": status}
+        except OSError as exc:
+            try:
+                if self.private_root is not None:
+                    evidence = _canonical_dir(str(self.private_root), "private_root") / ("cleanup-failure-" + value["attempt_id"] + ".json")
+                    evidence.write_bytes(canonical_json({"attempt_id": value["attempt_id"], "error": str(exc)[:500]}))
+            except OSError:
+                pass
+            raise _fail("CLEANUP_UNKNOWN", "cleanup filesystem operation failed") from exc
         except ProtocolError as exc:
             raise _fail("CLEANUP_UNKNOWN", str(exc)) from exc
 
