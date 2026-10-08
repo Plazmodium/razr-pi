@@ -46,6 +46,10 @@ Missing prerequisites/fixtures, import errors, failed tests, unexpected top-leve
 
 The public contract is newly authored, synthetic and unapproved. Test-owned copies may carry clearly synthetic approval metadata; actual unchanged-core commands alone materialize state/evidence. No positive task completion, candidate commit, genuine critique or PR operation is inferred from those fixtures.
 
+### M04 Herdr proof scope
+
+M04 is implemented and covered by focused provider regressions plus the full public runner. The proof includes structured capability/model/worktree/agent parsing, exact host identity, pending/bound private session evidence, append-only attempt settlement, bounded artifact collection, idempotent interruption, delegated cleanup, equal empty-root manifest digests with distinct root IDs/paths, and truthful UNKNOWN handling. It does not certify live Herdr/two-worker acceptance, execution of a model turn, human approval, independent critique, or campaign release gates.
+
 ## Proof limitations
 
 Do not publish .test-output, raw logs, machine paths, preservation inventories or private decisions. A matching ownership marker is not authentication. Preserve failure output; do not retry silently or relabel an incomplete run. Source changes require a fresh integrated run.

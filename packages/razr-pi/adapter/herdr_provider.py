@@ -550,7 +550,7 @@ class HerdrProvider:
                 except (json.JSONDecodeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "cannot claim roots from corrupt ledger") from exc
         for root_key, id_key in (("output_root", "output_root_id"), ("session_root", "session_root_id")):
             root = _canonical_dir(values[root_key], root_key)
-            if any(row.get(root_key + "_id") == values[id_key] or row.get(root_key + "_digest") == values[root_key + "_digest"] for row in prior):
+            if any(row.get(root_key + "_id") == values[id_key] for row in prior):
                 raise _fail("RESOURCE_REUSED", f"{root_key} identity was previously used")
             digest, entries = _manifest(root)
             if digest != values[root_key + "_digest"] or entries: raise _fail("RESOURCE_REUSED", f"{root_key} manifest differs or is non-empty")
