@@ -1,7 +1,7 @@
 """Closed, dependency-free wire types for the Razr adapter boundary."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
@@ -149,6 +149,7 @@ class ReadbackResult:
     digest: str
     bytes: int
     parsed: object | None
+    raw_bytes: bytes = field(repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)

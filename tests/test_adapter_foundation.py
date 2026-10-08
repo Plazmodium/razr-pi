@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "packages/razr-pi"))
@@ -85,6 +86,7 @@ class AdapterFoundationTests(unittest.TestCase):
             raw = _readback(root, (ReadbackSpec("state.yaml", True, 100, "bytes"),))[0]
             self.assertEqual(raw.digest_domain, "raw_file")
             self.assertEqual(raw.bytes, 5)
+            self.assertEqual(raw.raw_bytes, b"{bad\n")
             self.assertIsNone(raw.parsed)
             with self.assertRaises(ProtocolError) as caught:
                 _readback(root, (ReadbackSpec("state.yaml", True, 100, "json"),))
@@ -100,7 +102,7 @@ class AdapterFoundationTests(unittest.TestCase):
                  "delivery": {"pull_request": None}, "last_transition": {}}
         row = {"id": "work", "stage": "build", "status": "active", "depth": "tiny",
                "priority": 4, "approved_at": None, "candidate": None, "pull_request": None}
-        raw = ReadbackResult(".razr/work/work/state.yaml", "raw_file", "sha256:" + "a" * 64, 12, None)
+        raw = ReadbackResult(".razr/work/work/state.yaml", "raw_file", "sha256:" + "a" * 64, 12, None, b"raw-state!!")
         response = CoreResponse("r", 0, b"", b"", 1, "sha256:" + "b" * 64, (), "sha256:" + "c" * 64, (raw,))
         projected = _workflow_projection(row, state, "work", "node", raw, response, ROOT)
         self.assertEqual(projected.raw_state_digest, raw.digest)
@@ -109,6 +111,30 @@ class AdapterFoundationTests(unittest.TestCase):
         row.pop("candidate")
         with self.assertRaises(ProtocolError):
             _workflow_projection(row, state, "work", "node", raw, response, ROOT)
+
+    def test_status_validate_raw_projection_uses_internal_state_path(self):
+        state = {"schema_version": 1, "id": "work", "stage": "build", "status": "active",
+                 "generation": 2, "created_at": "2026-01-01T00:00:00+00:00", "depth": "tiny",
+                 "priority": 4, "approved_at": None, "spec": {}, "executable": {},
+                 "nodes": {"node": {"status": "running", "attempt": 1, "result_ref": None}},
+                 "trajectory": {}, "candidate": {"repository": None, "branch": None,
+                 "commit": None, "source_digest": None}, "critics": {},
+                 "delivery": {"pull_request": None}, "last_transition": {}}
+        state_bytes = (json.dumps(state, separators=(",", ":")) + "\n").encode()
+        status = CoreResponse("r", 0, b'[{"id":"work","stage":"build","status":"active","depth":"tiny","priority":4,"approved_at":null,"candidate":null,"pull_request":null}]', b"", 1, "sha256:" + "b" * 64, (), "sha256:" + "c" * 64, ())
+        validation = CoreResponse("r", 0, b"PASS work\n", b"", 1, status.core_identity, (), status.source_digest, ())
+        raw = ReadbackResult(".razr/work/work/state.yaml", "raw_file", raw_file_digest(state_bytes), len(state_bytes), None, state_bytes)
+        state_response = CoreResponse("r", 0, b"", b"", 1, status.core_identity, (), status.source_digest, (raw,))
+        request = CoreRequest("r", ROOT, (), ROOT, ROOT / "packages/razr-pi", Path(__import__("sys").executable).resolve(),
+                              ROOT / "packages/razr-pi/runtime/scripts/razr.py", "0" * 40, status.source_digest,
+                              status.core_identity, (), (), 1, 1, 1, 1)
+        with patch("adapter.core_subprocess._core_work_root", return_value=".razr/work"), patch(
+                "adapter.core_subprocess.invoke_core", side_effect=[status, validation, state_response]) as called:
+            result = __import__("adapter.core_subprocess", fromlist=["read_workflow"]).read_workflow(request, "work", "node")
+        self.assertEqual(called.call_count, 3)
+        self.assertEqual(called.call_args_list[2].args[0].expected_readback[0].path, ".razr/work/work/state.yaml")
+        self.assertEqual(result.raw_state_digest, raw.digest)
+        self.assertEqual(result.raw_state_bytes, len(state_bytes))
 
     def test_provenance_refusal_precedes_launch(self):
         package = ROOT / "packages/razr-pi"

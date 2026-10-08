@@ -12,7 +12,7 @@ import time
 from typing import Any
 
 from .protocol import (
-    CoreRequest, CoreResponse, ProtocolError, ProvenancePin, ReadbackResult, WorkflowRead,
+    CoreRequest, CoreResponse, ProtocolError, ProvenancePin, ReadbackResult, ReadbackSpec, WorkflowRead,
     canonical_json, raw_file_digest, validate_git_object_id, validate_source_digest,
 )
 
@@ -107,6 +107,10 @@ def _validate_request(request: CoreRequest) -> tuple[Path, Path, Path]:
     _verify_git_identity(root)
     if not _git_commit_exists(root, request.expected_commit):
         raise _fail("IDENTITY_MISMATCH", "expected commit is not present")
+    committed_work_root = _core_work_root(root, request.expected_commit)
+    if _git_head(root) != request.expected_commit:
+        raise _fail("SOURCE_CHANGED", "repository HEAD differs from expected commit")
+    _reject_dirty_checkout(root, committed_work_root)
     return root, package, runtime
 
 
@@ -129,6 +133,40 @@ def _verify_git_identity(root: Path) -> None:
     if (not git_dir.is_absolute() or not common_dir.is_absolute() or git_dir.is_symlink()
             or common_dir.is_symlink() or not git_dir.is_dir() or not common_dir.is_dir()):
         raise _fail("IDENTITY_MISMATCH", "ambiguous Git administration")
+
+
+def _git_head(root: Path) -> str:
+    try:
+        result = subprocess.run(["git", "-C", str(root), "rev-parse", "--verify", "HEAD"],
+                                env=_environment(), cwd=root, capture_output=True, check=False, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise _fail("IDENTITY_MISMATCH", "Git HEAD query unavailable") from exc
+    head = result.stdout.decode("ascii", "ignore").strip()
+    if result.returncode or result.stderr or not re.fullmatch(r"[0-9a-f]{40}", head):
+        raise _fail("IDENTITY_MISMATCH", "Git HEAD is unavailable or ambiguous")
+    return head
+
+
+def _reject_dirty_checkout(root: Path, work_root: str) -> None:
+    try:
+        result = subprocess.run(["git", "-C", str(root), "status", "--porcelain=v1", "-z", "--untracked-files=no"],
+                                env=_environment(), cwd=root, capture_output=True, check=False, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise _fail("IDENTITY_MISMATCH", "Git dirtiness query unavailable") from exc
+    if result.returncode or result.stderr:
+        raise _fail("IDENTITY_MISMATCH", "Git dirtiness query failed")
+    excluded = {"AGENTS.md", "razr.yaml"}
+    prefix = work_root.rstrip("/") + "/"
+    for entry in result.stdout.split(b"\0"):
+        if not entry:
+            continue
+        raw_path = entry[3:] if len(entry) >= 3 else b""
+        try:
+            path = raw_path.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise _fail("IDENTITY_MISMATCH", "Git returned an invalid dirty path") from exc
+        if path not in excluded and not path.startswith(prefix):
+            raise _fail("SOURCE_CHANGED", "tracked checkout is dirty", path=path)
 
 
 def _git_commit_exists(root: Path, commit: str) -> bool:
@@ -236,7 +274,7 @@ def _readback(root: Path, specs: tuple[Any, ...]) -> tuple[ReadbackResult, ...]:
                 except (UnicodeDecodeError, json.JSONDecodeError, ProtocolError, ValueError) as exc:
                     raise _fail("MALFORMED_RESPONSE", "read-back JSON is malformed", path=spec.path) from exc
                 domain, digest = "canonical_json", raw_file_digest(canonical)
-            results.append(ReadbackResult(spec.path, domain, digest, len(data), parsed))
+            results.append(ReadbackResult(spec.path, domain, digest, len(data), parsed, data))
         except ProtocolError:
             raise
         except OSError as exc:
@@ -333,16 +371,19 @@ def read_workflow(request: CoreRequest, work_id: str, node_id: str) -> WorkflowR
         raise _fail("MALFORMED_RESPONSE", "validation output is not UTF-8") from exc
     if validation.returncode != 0 or lines != [f"PASS {work_id}"]:
         raise _fail("READBACK_FAILED", "core validation did not pass")
-    state_specs = tuple(spec for spec in request.expected_readback if spec.path.endswith("/state.yaml") or spec.path == "state.yaml")
-    if len(state_specs) != 1 or state_specs[0].parse_as != "bytes":
-        raise _fail("INVALID_REQUEST", "workflow read requires one raw state read-back")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", work_id) or "/" in work_id:
+        raise _fail("INVALID_REQUEST", "invalid work ID")
+    root = _canonical(request.repository_root, directory=True)
+    work_root = _core_work_root(root, request.expected_commit)
+    state_path = f"{work_root}/{work_id}/state.yaml"
+    state_specs = (ReadbackSpec(state_path, True, 1_048_576, "bytes"),)
     state_request = dataclasses.replace(request, argv=("status", work_id, "--json"), expected_readback=state_specs)
     state_response = invoke_core(state_request)
     if len(state_response.readback) != 1 or state_response.readback[0].digest_domain != "raw_file":
         raise _fail("READBACK_FAILED", "state raw read-back missing")
     raw_state = state_response.readback[0]
     try:
-        state = json.loads((request.repository_root / raw_state.path).read_bytes().decode("utf-8"), object_pairs_hook=_json_object)
+        state = json.loads(raw_state.raw_bytes.decode("utf-8"), object_pairs_hook=_json_object)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise _fail("MALFORMED_RESPONSE", "state JSON is malformed") from exc
     return _workflow_projection(rows[0], state, work_id, node_id, raw_state, state_response, request.repository_root)
