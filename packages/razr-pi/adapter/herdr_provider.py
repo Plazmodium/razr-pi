@@ -654,7 +654,8 @@ class HerdrProvider:
             if any(result[key] != value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")): raise _fail("IDENTITY_MISMATCH", "agent host identity differs")
             pane = _envelope(self._exec([self.herdr, "pane", "get", value["host"]["pane_id"]], timeout_ms=10_000), "pane")
             pane_result = pane["result"]
-            if not isinstance(pane_result, dict): raise _fail("IDENTITY_MISMATCH", "pane response is malformed")
+            if not isinstance(pane_result, dict) or not isinstance(pane_result.get("pane"), dict): raise _fail("IDENTITY_MISMATCH", "pane response lacks nested pane")
+            pane_result = pane_result["pane"]
             if "foreground_cwd" in pane_result and "cwd" in pane_result and _canonical_dir(pane_result["foreground_cwd"], "foreground cwd") != _canonical_dir(pane_result["cwd"], "cwd"):
                 raise _fail("IDENTITY_MISMATCH", "pane cwd telemetry conflicts")
             current_cwd = pane_result.get("foreground_cwd", pane_result.get("cwd"))
@@ -675,12 +676,17 @@ class HerdrProvider:
                 fd = os.open(session_path_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 with os.fdopen(fd, "wb") as stream: stream.write(canonical_json(session_record)); stream.flush(); os.fsync(stream.fileno())
                 session_record_digest = session_record["record_digest"]; session_status = "bound"
-            private = {"schema_version": 1, "handle": handle, "agent_id": result["agent_id"], "pi_session_id": result["pi_session_id"], "session_status": session_status, "capability_report_digest": evidence["capability_report_digest"], "session_record_ref": session_record_ref, "session_record_digest": session_record_digest, "handle_digest": raw_file_digest(canonical_json(handle)), "paths": {"worktree": value["worktree"], "output_root": value["output_root"], "session_root": value["session_root"]}, "attempt_path": value["worktree"], "attempt_ref": "."}
+            private = {"schema_version": 1, "handle": handle, "agent_id": result["agent_id"], "pi_session_id": result["pi_session_id"], "session_status": session_status, "capability_report_digest": evidence["capability_report_digest"], "session_record_ref": session_record_ref, "session_record_digest": session_record_digest, "session_binding_ref": "handles/pi-binding-" + result["agent_id"] + ".json", "session_binding_digest": None, "handle_digest": raw_file_digest(canonical_json(handle)), "paths": {"worktree": value["worktree"], "output_root": value["output_root"], "session_root": value["session_root"]}, "attempt_path": value["worktree"], "attempt_ref": "."}
             private["record_digest"] = raw_file_digest(canonical_json(private))
             private_path = private_dir / ("handle-" + result["agent_id"] + ".json")
             private_bytes = canonical_json(private)
             fd = os.open(private_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as stream: stream.write(private_bytes); stream.flush(); os.fsync(stream.fileno())
+            if session_status == "bound":
+                binding = {"schema_version": 1, "kind": "pi_session_binding", "handle_record_digest": private["record_digest"], "session_record_digest": session_record_digest, "attempt_id": value["attempt_id"], "request_digest": evidence["request_digest"], "host": value["host"], "bound_at": _now()}
+                binding["record_digest"] = raw_file_digest(canonical_json(binding)); binding_path = private_dir / ("pi-binding-" + result["agent_id"] + ".json")
+                fd = os.open(binding_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "wb") as stream: stream.write(canonical_json(binding)); stream.flush(); os.fsync(stream.fileno())
             self._private_handles[result["agent_id"]] = private
             return {"schema_version": 1, "ok": True, "request_id": value["request_id"], "result": {"handle": handle, "capability_report_digest": probe_report["result"]["report_digest"]}}
         except OSError as exc:
@@ -750,6 +756,13 @@ class HerdrProvider:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as stream: stream.write(canonical_json(record)); stream.flush(); os.fsync(stream.fileno())
         except FileExistsError as exc: raise _fail("RESOURCE_REUSED", "session binding already exists") from exc
+        binding = {"schema_version": 1, "kind": "pi_session_binding", "handle_record_digest": private["record_digest"], "session_record_digest": record["record_digest"], "attempt_id": value["attempt_id"], "request_digest": value["request_digest"], "host": value["host"], "bound_at": _now()}
+        binding["record_digest"] = raw_file_digest(canonical_json(binding))
+        binding_path = private_base / private["session_binding_ref"]
+        try:
+            fd = os.open(binding_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as stream: stream.write(canonical_json(binding)); stream.flush(); os.fsync(stream.fileno())
+        except FileExistsError as exc: raise _fail("RESOURCE_REUSED", "session binding event already exists") from exc
         return True
 
     def _handle(self, handle: Mapping[str, object]) -> dict[str, object]:
@@ -762,7 +775,7 @@ class HerdrProvider:
         private_path = _canonical_dir(str(self.private_root), "private_root") / "handles" / ("handle-" + value["handle_id"] + ".json")
         try: private = json.loads(_read_private_bytes(private_path, _canonical_dir(str(self.private_root), "private_root")).decode("utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "durable private handle evidence is unavailable") from exc
-        private = _closed(private, {"schema_version", "handle", "agent_id", "pi_session_id", "session_status", "capability_report_digest", "session_record_ref", "session_record_digest", "handle_digest", "paths", "attempt_path", "attempt_ref", "record_digest"}, "private handle")
+        private = _closed(private, {"schema_version", "handle", "agent_id", "pi_session_id", "session_status", "capability_report_digest", "session_record_ref", "session_record_digest", "session_binding_ref", "session_binding_digest", "handle_digest", "paths", "attempt_path", "attempt_ref", "record_digest"}, "private handle")
         paths = _closed(private["paths"], {"worktree", "output_root", "session_root"}, "private handle paths")
         private_base = _canonical_dir(str(self.private_root), "private_root")
         for name in paths:
@@ -797,6 +810,17 @@ class HerdrProvider:
             except OSError as exc: raise _fail("IDENTITY_MISMATCH", "bound session path is unavailable") from exc
             if not session_path.is_absolute() or session_path != session_path.resolve(strict=False) or not session_path.is_relative_to(session_root) or not session_path.is_file() or session_path.is_symlink() or stat.st_nlink != 1 or session_record["pi_session_id"] != "pi-session-" + hashlib.sha256(str(session_path).encode("utf-8")).hexdigest():
                 raise _fail("IDENTITY_MISMATCH", "private session path identity differs")
+        binding_ref = private["session_binding_ref"]
+        if not isinstance(binding_ref, str) or PurePosixPath(binding_ref).is_absolute() or ".." in PurePosixPath(binding_ref).parts: raise _fail("PATH_ESCAPE", "session binding reference escapes root")
+        binding_path = private_base / binding_ref
+        session_exists = session_record_path.exists(); binding_exists = binding_path.exists()
+        if session_exists != binding_exists: raise _fail("IDENTITY_MISMATCH", "incomplete session binding chain")
+        if session_exists:
+            try: binding = json.loads(_read_private_bytes(binding_path, private_base).decode("utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "session binding event is unavailable") from exc
+            binding = _closed(binding, {"schema_version", "kind", "handle_record_digest", "session_record_digest", "attempt_id", "request_digest", "host", "bound_at", "record_digest"}, "session binding")
+            if binding["kind"] != "pi_session_binding" or binding["handle_record_digest"] != private["record_digest"] or binding["session_record_digest"] != (private["session_record_digest"] or (json.loads(_read_private_bytes(session_record_path, private_base).decode("utf-8"))["record_digest"])) or binding["attempt_id"] != value["attempt_id"] or binding["request_digest"] != value["request_digest"] or binding["host"] != value["host"] or binding["record_digest"] != raw_file_digest(canonical_json({key: binding[key] for key in binding if key != "record_digest"})):
+                raise _fail("IDENTITY_MISMATCH", "session binding event differs")
         record_body = {key: private[key] for key in private if key != "record_digest"}
         if private["schema_version"] != 1 or private["handle"] != value or private["handle_digest"] != raw_file_digest(canonical_json(value)) or private["record_digest"] != raw_file_digest(canonical_json(record_body)) or private["attempt_path"] != paths["worktree"] or private["attempt_ref"] != ".": raise _fail("IDENTITY_MISMATCH", "handle evidence differs")
         cached = self._private_handles.get(value["handle_id"])
