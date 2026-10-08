@@ -133,6 +133,15 @@ class HerdrProviderTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "DUPLICATE_ATTEMPT")
             self.assertEqual(len(path.read_text().splitlines()), 2)
 
+    def test_evidence_error_code_is_closed_by_kind_and_launch_scope(self):
+        digest = "sha256:" + "a" * 64
+        for code in ("LAUNCH_FAILED", "TIMEOUT", "OUTPUT_LIMIT", "PROVIDER_UNAVAILABLE"):
+            AttemptLedger._ref({"ref": ".razr/evidence/failure.json", "digest_domain": "raw_file", "digest": digest, "kind": "launch_failure", "error_code": code}, "evidence_ref", "raw_file")
+        with self.assertRaises(ProtocolError):
+            AttemptLedger._ref({"ref": ".razr/evidence/result.json", "digest_domain": "raw_file", "digest": digest, "kind": "result", "error_code": "LAUNCH_FAILED"}, "evidence_ref", "raw_file")
+        with self.assertRaises(ProtocolError):
+            AttemptLedger._ref({"ref": ".razr/evidence/failure.json", "digest_domain": "raw_file", "digest": digest, "kind": "launch_failure", "error_code": "CLEANUP_UNKNOWN"}, "evidence_ref", "raw_file")
+
     def test_launch_collect_and_restart_recover_private_handle(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp); worktree = (base / "worktree").resolve(); worktree.mkdir()

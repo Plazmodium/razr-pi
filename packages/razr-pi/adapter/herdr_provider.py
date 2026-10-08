@@ -26,6 +26,7 @@ from .core_subprocess import verify_candidate_identity
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 _MODEL = "openai-codex/gpt-5.6-luna"
+_LAUNCH_EVIDENCE_CODES = frozenset({"LAUNCH_FAILED", "TIMEOUT", "OUTPUT_LIMIT", "PROVIDER_UNAVAILABLE"})
 _CLI_TIMEOUT_MS = 10_000
 _CLI_MAX_OUTPUT = 262_144
 _CAPABILITIES = frozenset({
@@ -195,8 +196,12 @@ class AttemptLedger:
         required = {"ref", "digest_domain", "digest", "kind"} if name == "evidence_ref" else {"ref", "digest_domain", "digest"}
         if not isinstance(value, dict) or not required <= set(value) or set(value) - required - ({"error_code"} if name == "evidence_ref" else set()):
             raise _fail("LEDGER_CORRUPT", f"invalid {name}")
-        if name == "evidence_ref" and value["kind"] == "launch_failure" and value.get("error_code") not in ERROR_CODES:
-            raise _fail("LEDGER_CORRUPT", "invalid launch failure evidence")
+        if name == "evidence_ref":
+            if value["kind"] == "launch_failure":
+                if "error_code" not in value or value["error_code"] not in _LAUNCH_EVIDENCE_CODES:
+                    raise _fail("LEDGER_CORRUPT", "invalid launch failure evidence")
+            elif "error_code" in value:
+                raise _fail("LEDGER_CORRUPT", "error_code is only valid for launch_failure evidence")
         ref = value["ref"]
         if not isinstance(ref, str) or not ref or PurePosixPath(ref).is_absolute() or ".." in PurePosixPath(ref).parts or str(PurePosixPath(ref)) != ref:
             raise _fail("PATH_ESCAPE", f"invalid {name} reference")
