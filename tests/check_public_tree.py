@@ -19,7 +19,7 @@ import stat
 import subprocess
 import sys
 
-ALLOWLIST_SHA256 = '5074eda0654a28560471698626af8f7a79ae52e8ab58965356fb3ca3d5cac3bd'
+ALLOWLIST_SHA256 = '10957279dd515135cf01b4f489e767b741325db6719e32f05f0f1370cb2dcba4'
 LICENSE_SHA256 = '9d2fdecab2aa2dca006dbd67b07d3cc63a9d9f64a4f954aff2fe782251f9f8f4'
 OUTPUT_MARKER = 'clean-source-v1 owned private test output\n'
 PROVENANCE = {
@@ -169,7 +169,7 @@ def check(root):
     raw = regular(root / 'tests/public-tree.txt')
     require(sha(raw) == ALLOWLIST_SHA256, 'public allowlist drift')
     names = raw.decode('utf-8').splitlines()
-    require(len(names) == len(set(names)) == 48, 'invalid allowlist cardinality')
+    require(len(names) == len(set(names)) == 51, 'invalid allowlist cardinality')
     for name in names:
         p = PurePosixPath(name)
         require(not p.is_absolute() and '..' not in p.parts and str(p) == name, 'unsafe allowlist entry')
@@ -230,7 +230,7 @@ def check(root):
                 for node in ast.walk(tree):
                     imports = ([alias.name for alias in node.names] if isinstance(node, ast.Import)
                                else [node.module or ''] if isinstance(node, ast.ImportFrom) else [])
-                    require(all(module.split('.')[0] in sys.stdlib_module_names for module in imports),
+                    require(all(module.startswith('.') or module == 'protocol' or module.split('.')[0] in sys.stdlib_module_names for module in imports),
                             'non-standard static package import: ' + name)
         elif name.endswith('.json'):
             json.loads(text)
@@ -251,7 +251,7 @@ def check(root):
             'unexpected package manifest fields')
     require(manifest['name'] == 'razr-pi' and manifest['private'] is True, 'unsafe package identity/publication policy')
     require(manifest['pi'] == {'skills': ['./skills']}, 'broadened package resource loading')
-    require(manifest['files'] == ['skills', 'runtime', 'scripts', 'README.md'], 'package file declaration drift')
+    require(manifest['files'] == ['skills', 'runtime', 'scripts', 'adapter', 'README.md'], 'package file declaration drift')
     require(sorted(p.relative_to(package).as_posix() for p in (package / 'skills').rglob('SKILL.md'))
             == ['skills/razr/SKILL.md'], 'unexpected package skill inventory')
     provenance = json.loads(regular(package / 'runtime/provenance.json'))
