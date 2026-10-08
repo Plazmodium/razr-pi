@@ -755,7 +755,6 @@ class HerdrProvider:
                 except OSError as exc: raise _fail("IDENTITY_MISMATCH", "pending session path is unavailable") from exc
                 if pending_record["kind"] != "pi_session" or pending_record["handle_id"] != private["agent_id"] or pending_record["attempt_id"] != value["attempt_id"] or pending_record["request_digest"] != value["request_digest"] or pending_record["host"] != value["host"] or pending_record["record_digest"] != raw_file_digest(canonical_json({key: pending_record[key] for key in pending_record if key != "record_digest"})) or not pending_path.is_absolute() or pending_path != pending_path.resolve(strict=False) or not pending_path.is_relative_to(session_root) or not pending_path.is_file() or pending_path.is_symlink() or pending_stat.st_nlink != 1 or pending_record["pi_session_id"] != "pi-session-" + hashlib.sha256(str(pending_path).encode("utf-8")).hexdigest():
                     raise _fail("IDENTITY_MISMATCH", "pending session binding differs")
-            
         else:
             _digest(private["session_record_digest"], "session_record_digest")
             try: session_record = json.loads(session_record_path.read_text(encoding="utf-8"))
