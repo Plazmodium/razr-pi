@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "packages/razr-pi"))
@@ -56,6 +57,16 @@ class MemoryTests(unittest.TestCase):
         retired = self.store.retire(replacement["id"])
         self.assertEqual(retired["status"], "retired")
         self.assertEqual(self.store.recall()["records"], [])
+        with self.assertRaises(TypeError):
+            self.store.supersede(record["id"], summary="bad", scope={})  # type: ignore[call-arg]
+
+    def test_duplicate_remember_is_idempotent_or_conflict(self):
+        first = self.store.remember(kind="learning", summary="same", repository=self.repo, tags=["x"])
+        second = self.store.remember(kind="learning", summary="same", repository=self.repo, tags=["x"])
+        self.assertEqual(first, second)
+        with self.assertRaises(ProtocolError) as caught:
+            self.store.remember(kind="learning", summary="different", repository=self.repo, record_id=first["id"])
+        self.assertEqual(caught.exception.code, "INVALID_REQUEST")
 
     def test_secrets_paths_and_corruption_refused(self):
         with self.assertRaises(ProtocolError):
@@ -75,6 +86,49 @@ class MemoryTests(unittest.TestCase):
         with self.assertRaises(ProtocolError) as caught:
             self.store.inspect()
         self.assertEqual(caught.exception.code, "LEDGER_CORRUPT")
+
+    def test_canonical_parser_and_symlink_components_refuse(self):
+        self.store.path.parent.mkdir()
+        with self.store.path.open("wb") as stream:
+            stream.write(b'{"schema_version":1,"schema_version":1}\n')
+        with self.assertRaises(ProtocolError):
+            self.store.inspect()
+        self.store.path.unlink()
+        (self.root / "real").mkdir()
+        (self.root / "link").symlink_to(self.root / "real", target_is_directory=True)
+        evidence = {"type":"path", "ref":"link/file", "digest_domain":"raw_file", "digest":raw_file_digest(b"x")}
+        with self.assertRaises(ProtocolError) as caught:
+            self.store.remember(kind="learning", summary="safe", repository=self.repo, evidence=[evidence])
+        self.assertEqual(caught.exception.code, "PATH_ESCAPE")
+        (self.root / "real" / "file").write_text("ok")
+        evidence = {"type":"path", "ref":"real/file", "digest_domain":"raw_file", "digest":raw_file_digest(b"ok")}
+        remembered = self.store.remember(kind="learning", summary="symlink later", repository=self.repo, evidence=[evidence])
+        (self.root / "real").rename(self.root / "moved")
+        (self.root / "real").symlink_to(self.root / "moved", target_is_directory=True)
+        self.assertEqual(self.store.recall()["stale_ids"], [remembered["id"]])
+
+    def test_append_retries_eintr_and_rejects_zero_progress(self):
+        original = __import__("os").write
+        calls = {"count": 0}
+        def interrupted_then_write(fd, payload):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise InterruptedError()
+            return original(fd, payload[:4])
+        with patch("adapter.memory.os.write", side_effect=interrupted_then_write):
+            record = self.store.remember(kind="learning", summary="short writes", repository=self.repo)
+        self.assertEqual(self.store.inspect()[0]["id"], record["id"])
+        self.store.path.unlink()
+        with patch("adapter.memory.os.write", return_value=0):
+            with self.assertRaises(ProtocolError) as caught:
+                self.store.remember(kind="learning", summary="zero", repository=self.repo)
+        self.assertEqual(caught.exception.code, "LEDGER_CORRUPT")
+        self.store.path.unlink()
+        with patch("adapter.memory.os.fsync", side_effect=OSError("fsync")):
+            with self.assertRaises(ProtocolError) as caught:
+                self.store.remember(kind="learning", summary="fsync failure", repository=self.repo)
+        self.assertEqual(caught.exception.code, "LOCK_UNAVAILABLE")
+        self.assertEqual(len(self.store.inspect()), 1)
 
     def test_chain_interruption_and_concurrent_append(self):
         self.store.remember(kind="learning", summary="first", repository=self.repo)
