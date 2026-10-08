@@ -170,7 +170,7 @@ class HerdrProviderTests(unittest.TestCase):
                 if argv[:2] == ["pi", "--list-models"]:
                     return subprocess.CompletedProcess(argv, 0, b"Provider    Model             Context\nopenai-codex gpt-5.6-luna      200000\n", b"")
                 if argv[:2] == ["pi", "--help"]:
-                    return subprocess.CompletedProcess(argv, 0, b"help", b"")
+                    return subprocess.CompletedProcess(argv, 0, b"Pi options: --approve -a --no-approve -na --no-context-files --no-extensions --no-skills --no-prompt-templates --no-themes --session --session-dir --no-session --continue --resume\n", b"")
                 if argv[:3] == ["herdr", "agent", "read"]:
                     return subprocess.CompletedProcess(argv, 0, b"observed output", b"")
                 if argv[:3] == ["herdr", "pane", "close"] or argv[:3] == ["herdr", "worktree", "remove"]:

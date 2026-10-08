@@ -448,7 +448,7 @@ class HerdrProvider:
             capabilities.add("interrupt")
         if "--source" in read_help and "--lines" in read_help:
             capabilities.add("stream_capture")
-        if all(flag in pi_help for flag in ("--no-context-files", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes")) and self._env():
+        if all(flag in pi_help for flag in ("--no-context-files", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-approve")) and self._env():
             capabilities.add("environment_policy")
         if self._adapter_bounds_active("output"):
             capabilities.add("bounded_output")
@@ -647,7 +647,7 @@ class HerdrProvider:
         self._attempt_sessions[value["attempt_id"]] = _canonical_dir(value["session_root"], "session_root")
         self._attempt_roots[value["attempt_id"]] = (_canonical_dir(value["output_root"], "output_root"), _canonical_dir(value["session_root"], "session_root"))
         try:
-            response = self._exec([self.herdr, "agent", "start", value["worker_id"], "--kind", "pi", "--pane", value["host"]["pane_id"], "--timeout", str(min(deadline, 300_000)), "--", "--model", _MODEL, "--thinking", "medium", "--session-dir", value["session_root"], "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files"], timeout_ms=min(deadline, 300_000), cwd=_canonical_dir(value["cwd"], "cwd"), max_output=value["limits"]["max_output_bytes"])
+            response = self._exec([self.herdr, "agent", "start", value["worker_id"], "--kind", "pi", "--pane", value["host"]["pane_id"], "--timeout", str(min(deadline, 300_000)), "--", "--model", _MODEL, "--thinking", "medium", "--session-dir", value["session_root"], "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve"], timeout_ms=min(deadline, 300_000), cwd=_canonical_dir(value["cwd"], "cwd"), max_output=value["limits"]["max_output_bytes"])
         except ProtocolError as exc:
             failure = _canonical_dir(value["worktree"], "worktree") / ".razr" / "evidence" / ("launch-failure-" + value["attempt_id"] + ".json")
             data = canonical_json({"error_code": exc.code, "message": str(exc)[:500]})
