@@ -146,6 +146,15 @@ class HerdrProviderTests(unittest.TestCase):
                 with self.assertRaises(ProtocolError) as rollback_error: ledger.append({**started, "attempt_id": "rollback-fail", "allowance_id": "rollback-allow"})
             self.assertEqual(rollback_error.exception.code, "LEDGER_CORRUPT")
 
+    def test_strict_persisted_ledger_json_rejects_duplicate_and_noncanonical_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "attempts.jsonl"; ledger = AttemptLedger(path)
+            for raw in (b'{"schema_version":1,"schema_version":1}\n', b'{ "schema_version": 1 }\n'):
+                path.write_bytes(raw)
+                with self.assertRaises(ProtocolError) as caught:
+                    ledger.append({"schema_version": 1, "event": "STARTED"})
+                self.assertEqual(caught.exception.code, "LEDGER_CORRUPT")
+
     def test_evidence_error_code_is_closed_by_kind_and_launch_scope(self):
         digest = "sha256:" + "a" * 64
         for code in ("LAUNCH_FAILED", "TIMEOUT", "OUTPUT_LIMIT", "PROVIDER_UNAVAILABLE"):

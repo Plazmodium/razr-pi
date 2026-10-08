@@ -385,7 +385,7 @@ class AttemptLedger:
                 for line in stream:
                     if not line.endswith("\n"): raise _fail("LEDGER_CORRUPT", "partial ledger line")
                     try: row = _strict_json(line.rstrip("\n").encode("utf-8"))
-                    except json.JSONDecodeError as exc: raise _fail("LEDGER_CORRUPT", "malformed ledger JSON") from exc
+                    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc: raise _fail("LEDGER_CORRUPT", "malformed ledger JSON") from exc
                     records.append(self._replay_validate(row))
             except OSError as exc: raise _fail("LOCK_UNAVAILABLE", "attempt ledger cannot be read") from exc
             self._replay_chain(records)
@@ -675,7 +675,7 @@ class HerdrProvider:
                     for line in stream:
                         if not line.endswith("\n"): raise _fail("LEDGER_CORRUPT", "partial root claims record")
                         try: row = _strict_json(line.rstrip("\n").encode("utf-8"))
-                        except json.JSONDecodeError as exc: raise _fail("LEDGER_CORRUPT", "malformed root claims record") from exc
+                        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc: raise _fail("LEDGER_CORRUPT", "malformed root claims record") from exc
                         expected = {"schema_version", "root_id", "root_digest", "path", "attempt_id", "request_digest", "claimed_at", "prev_digest", "record_digest"}
                         if not isinstance(row, dict) or set(row) != expected or row["prev_digest"] != previous or row["record_digest"] != raw_file_digest(canonical_json({key: row[key] for key in row if key != "record_digest"})):
                             raise _fail("LEDGER_CORRUPT", "corrupt root claims record")
@@ -715,7 +715,7 @@ class HerdrProvider:
         if self.ledger is not None and self.ledger.path.exists():
             for line in self.ledger.path.read_text(encoding="utf-8").splitlines():
                 try: prior.append(AttemptLedger._replay_validate(_strict_json(line.rstrip("\n").encode("utf-8"))))
-                except (json.JSONDecodeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "cannot claim roots from corrupt ledger") from exc
+                except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "cannot claim roots from corrupt ledger") from exc
         for root_key, id_key in (("output_root", "output_root_id"), ("session_root", "session_root_id")):
             root = _canonical_dir(values[root_key], root_key)
             if any(row.get(root_key + "_id") == values[id_key] for row in prior):
@@ -749,7 +749,7 @@ class HerdrProvider:
             try:
                 root = _canonical_dir(value[root_key], root_key); marker = root / ".razr-herdr-root.json"
                 if marker.is_file() and _strict_json(marker.read_bytes()).get("root_id") == value[id_key]: marker.unlink()
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ProtocolError):
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError, ProtocolError):
                 continue
 
     def launch(self, request: Mapping[str, object]) -> dict[str, object]:
@@ -896,7 +896,7 @@ class HerdrProvider:
             fd = os.open(artifact, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as stream: stream.write(data); stream.flush(); os.fsync(stream.fileno())
         try: records = AttemptLedger._replay_chain([AttemptLedger._replay_validate(_strict_json(line.rstrip("\n").encode("utf-8"))) for line in self.ledger.path.read_text(encoding="utf-8").splitlines()])
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "settlement ledger cannot be replayed") from exc
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "settlement ledger cannot be replayed") from exc
         started = next((row for row in records if row["attempt_id"] == handle["attempt_id"] and row["event"] == "STARTED"), None)
         if started is None: raise _fail("INVALID_ORDER", "settlement has no STARTED event")
         settled = {key: started[key] for key in ("schema_version", "attempt_id", "work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "worktree_ref", "branch", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest", "herdr")}
@@ -1020,7 +1020,7 @@ class HerdrProvider:
             if private["session_record_digest"] is not None: raise _fail("IDENTITY_MISMATCH", "pending session digest is unexpected")
             if session_record_path.exists():
                 try: pending_record = _strict_json(_read_private_bytes(session_record_path, private_base))
-                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "pending session binding is malformed") from exc
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc: raise _fail("IDENTITY_MISMATCH", "pending session binding is malformed") from exc
                 pending_record = _closed(pending_record, {"schema_version", "kind", "handle_id", "attempt_id", "request_digest", "host", "pi_session_path", "pi_session_id", "record_digest"}, "private session record")
                 if not isinstance(pending_record["schema_version"], int) or isinstance(pending_record["schema_version"], bool): raise _fail("IDENTITY_MISMATCH", "private session schema is invalid")
                 session_root = _canonical_dir(paths["session_root"], "session_root"); pending_path = Path(pending_record["pi_session_path"])
@@ -1031,7 +1031,7 @@ class HerdrProvider:
         else:
             _digest(private["session_record_digest"], "session_record_digest")
             try: session_record = _strict_json(_read_private_bytes(session_record_path, private_base))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "private session record is unavailable") from exc
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc: raise _fail("IDENTITY_MISMATCH", "private session record is unavailable") from exc
             session_record = _closed(session_record, {"schema_version", "kind", "handle_id", "attempt_id", "request_digest", "host", "pi_session_path", "pi_session_id", "record_digest"}, "private session record")
             if not isinstance(session_record["schema_version"], int) or isinstance(session_record["schema_version"], bool): raise _fail("IDENTITY_MISMATCH", "private session schema is invalid")
             session_body = {key: session_record[key] for key in session_record if key != "record_digest"}
@@ -1055,10 +1055,12 @@ class HerdrProvider:
         if session_exists != binding_exists: raise _fail("IDENTITY_MISMATCH", "incomplete session binding chain")
         if session_exists:
             try: binding = _strict_json(_read_private_bytes(binding_path, private_base))
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "session binding event is unavailable") from exc
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc: raise _fail("IDENTITY_MISMATCH", "session binding event is unavailable") from exc
             binding = _closed(binding, {"schema_version", "kind", "handle_record_digest", "session_record_digest", "attempt_id", "request_digest", "host", "bound_at", "record_digest"}, "session binding")
             if not isinstance(binding["schema_version"], int) or isinstance(binding["schema_version"], bool): raise _fail("IDENTITY_MISMATCH", "session binding schema is invalid")
-            if binding["kind"] != "pi_session_binding" or binding["handle_record_digest"] != private["record_digest"] or binding["session_record_digest"] != (private["session_record_digest"] or (_strict_json(_read_private_bytes(session_record_path, private_base))["record_digest"])) or binding["attempt_id"] != value["attempt_id"] or binding["request_digest"] != value["request_digest"] or binding["host"] != value["host"] or binding["record_digest"] != raw_file_digest(canonical_json({key: binding[key] for key in binding if key != "record_digest"})):
+            try: session_record_digest = private["session_record_digest"] or _strict_json(_read_private_bytes(session_record_path, private_base))["record_digest"]
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc: raise _fail("IDENTITY_MISMATCH", "session binding record is malformed") from exc
+            if binding["kind"] != "pi_session_binding" or binding["handle_record_digest"] != private["record_digest"] or binding["session_record_digest"] != session_record_digest or binding["attempt_id"] != value["attempt_id"] or binding["request_digest"] != value["request_digest"] or binding["host"] != value["host"] or binding["record_digest"] != raw_file_digest(canonical_json({key: binding[key] for key in binding if key != "record_digest"})):
                 raise _fail("IDENTITY_MISMATCH", "session binding event differs")
         record_body = {key: private[key] for key in private if key != "record_digest"}
         if not isinstance(private["schema_version"], int) or isinstance(private["schema_version"], bool) or private["schema_version"] != 1 or private["handle"] != value or private["handle_digest"] != raw_file_digest(canonical_json(value)) or private["record_digest"] != raw_file_digest(canonical_json(record_body)) or private["attempt_path"] != paths["worktree"] or private["attempt_ref"] != ".": raise _fail("IDENTITY_MISMATCH", "handle evidence differs")
@@ -1070,7 +1072,7 @@ class HerdrProvider:
         self._attempt_roots.setdefault(value["attempt_id"], (Path(paths["output_root"]), Path(paths["session_root"])))
         if self.ledger is None or not self.ledger.path.exists(): raise _fail("IDENTITY_MISMATCH", "handle ledger is unavailable")
         try: records = AttemptLedger._replay_chain([AttemptLedger._replay_validate(_strict_json(line.rstrip("\n").encode("utf-8"))) for line in self.ledger.path.read_text(encoding="utf-8").splitlines()])
-        except (OSError, json.JSONDecodeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "handle ledger cannot be replayed") from exc
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "handle ledger cannot be replayed") from exc
         started = next((row for row in records if row["event"] == "STARTED" and row["attempt_id"] == value["attempt_id"]), None)
         settled = next((row for row in records if row["event"] == "SETTLED" and row["attempt_id"] == value["attempt_id"]), None)
         if settled is not None: self._settled.add(value["attempt_id"])
@@ -1078,7 +1080,7 @@ class HerdrProvider:
         try:
             packet_bytes = packet_path.read_bytes()
             packet = _strict_json(packet_bytes)
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
             raise _fail("IDENTITY_MISMATCH", "request packet is unavailable") from exc
         if started is not None and raw_file_digest(packet_bytes) != started["request_packet"]["digest"]:
             raise _fail("DIGEST_MISMATCH", "request packet digest differs")
@@ -1131,7 +1133,7 @@ class HerdrProvider:
         evidence = checked_evidence
         if self.ledger is None or not self.ledger.path.exists(): raise _fail("LEDGER_CORRUPT", "recovery ledger is unavailable")
         try: records = AttemptLedger._replay_chain([AttemptLedger._replay_validate(_strict_json(line.rstrip("\n").encode("utf-8"))) for line in self.ledger.path.read_text(encoding="utf-8").splitlines()])
-        except (OSError, json.JSONDecodeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "recovery ledger cannot be replayed") from exc
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "recovery ledger cannot be replayed") from exc
         started = next((row for row in records if row["event"] == "STARTED" and row["attempt_id"] == request["attempt_id"]), None)
         if started is None: raise _fail("INVALID_ORDER", "no unmatched STARTED event")
         if any(row["attempt_id"] == request["attempt_id"] and row["event"] == "SETTLED" for row in records): raise _fail("INVALID_ORDER", "attempt is already settled")
@@ -1198,7 +1200,7 @@ class HerdrProvider:
         interrupt_path = self._attempt_sessions[value["attempt_id"]] / ("interrupt-" + value["attempt_id"] + ".json")
         if interrupt_path.exists():
             try: stored = _strict_json(interrupt_path.read_bytes())
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "interrupt record is malformed") from exc
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc: raise _fail("IDENTITY_MISMATCH", "interrupt record is malformed") from exc
             try: stored = _closed(stored, {"schema_version", "kind", "request_id", "handle_id", "request_digest", "reason", "reason_digest", "outcome"}, "interrupt record")
             except ProtocolError as exc: raise _fail("IDENTITY_MISMATCH", "legacy or malformed interrupt record") from exc
             if not isinstance(stored["schema_version"], int) or isinstance(stored["schema_version"], bool): raise _fail("IDENTITY_MISMATCH", "interrupt record schema is invalid")
