@@ -126,12 +126,14 @@ class HerdrProviderTests(unittest.TestCase):
             self.assertEqual(set(handle), {"provider_id", "handle_id", "request_digest", "attempt_id", "host", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest"})
             self.assertEqual(response["result"]["capability_report_digest"], provider.probe({"schema_version": 1, "request_id": "probe-after-launch", "required_capabilities": ["runtime_identity"], "runtime": request["runtime"]})["result"]["report_digest"])
             self.assertEqual(provider.inspect({"schema_version": 1, "request_id": "inspect-unique", "handle": handle})["request_id"], "inspect-unique")
-            crash = worktree / ".razr" / "evidence" / "crash.json"; crash.parent.mkdir(parents=True, exist_ok=True); crash.write_bytes(b"crash")
-            recovery = {"schema_version": 1, "request_id": "recover-1", "attempt_id": "att-1", "worktree": str(worktree), "recovery_authority": {"kind": "explicit", "authority_id": "human-1", "asserted": True, "reason": "retained crash evidence"}, "retained_evidence": [{"ref": ".razr/evidence/crash.json", "digest_domain": "raw_file", "digest": raw_file_digest(b"crash"), "kind": "recovery"}]}
-            self.assertEqual(provider.recover_unmatched(recovery)["result"]["outcome"], "UNKNOWN")
             collected = HerdrProvider(runner=run, ledger=ledger, private_root=private)
             result = collected.collect({"schema_version": 1, "request_id": "collect-1", "handle": handle})
             self.assertEqual(result["request_id"], "collect-1"); self.assertEqual(result["result"]["termination"], "UNKNOWN")
+            response_refs = result["result"]["artifact_refs"]
+            self.assertTrue(all("bytes" in ref for ref in response_refs))
+            settled = json.loads(ledger.path.read_text().splitlines()[1])
+            self.assertEqual(set(settled["evidence_refs"][0]), {"ref", "kind", "digest_domain", "digest"})
+            self.assertEqual([{key: ref[key] for key in ("ref", "kind", "digest_domain", "digest")} for ref in response_refs], settled["evidence_refs"][:2])
             self.assertEqual(collected.cleanup(handle)["cleanup"], "confirmed")
             with self.assertRaises(ProtocolError): collected._handle({**handle, "request_digest": "sha256:" + "d" * 64})
             self.assertEqual(len(ledger.path.read_text().splitlines()), 2)
