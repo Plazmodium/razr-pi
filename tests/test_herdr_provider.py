@@ -145,6 +145,19 @@ class HerdrProviderTests(unittest.TestCase):
         self.assertEqual(result["request_id"], "interrupt-unique")
         with self.assertRaises(ProtocolError): provider.interrupt({"schema_version": 1, "request_id": "interrupt-unique", "handle": {}, "reason": "cancel", "extra": True})
 
+    def test_interrupt_repeat_is_idempotent_and_conflict_refuses_reuse(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); session = root / "session"; session.mkdir()
+            value = {"attempt_id": "att-repeat", "handle_id": "agent-repeat", "request_digest": "sha256:" + "a" * 64, "host": {"mode": "herdr", "workspace_id": "w", "tab_id": "t", "pane_id": "p"}}
+            provider = HerdrProvider(runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, b"", b""))
+            provider._attempt_sessions[value["attempt_id"]] = session; provider._attempt_paths[value["attempt_id"]] = root
+            with patch.object(provider, "_handle", return_value=value), patch.object(provider, "_inspect_handle", return_value={"result": {"status": "TERMINATED"}}), patch.object(provider, "_settle") as settle:
+                first = provider._interrupt_handle(value, "cancel", "interrupt-repeat")
+                second = provider._interrupt_handle(value, "cancel", "interrupt-repeat")
+                self.assertEqual(first, second); self.assertEqual(settle.call_count, 1)
+                with self.assertRaises(ProtocolError) as caught: provider._interrupt_handle(value, "timeout", "interrupt-repeat")
+                self.assertEqual(caught.exception.code, "IDENTITY_MISMATCH")
+
     def test_nested_malformed_records_fail_as_ledger_corrupt(self):
         malformed = [None, [], {}, {"commit": "0" * 40}, {"source_digest": "sha256:" + "a" * 64}]
         for candidate in malformed:

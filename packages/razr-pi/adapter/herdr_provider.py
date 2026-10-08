@@ -526,7 +526,7 @@ class HerdrProvider:
             self._settle({"attempt_id": value["attempt_id"]}, "UNKNOWN", cleanup="uncertain", reason=str(exc))
             raise
 
-    def _settle(self, handle: Mapping[str, object], outcome: str, *, cleanup: str = "not_applicable", reason: str = "", evidence_refs: Sequence[Mapping[str, object]] = ()) -> None:
+    def _settle(self, handle: Mapping[str, object], outcome: str, *, cleanup: str = "not_applicable", reason: str = "", evidence_refs: Sequence[Mapping[str, object]] = (), synthetic: bool = True) -> None:
         if handle["attempt_id"] in self._settled: return
         if self.ledger is None: raise _fail("LEDGER_CORRUPT", "settlement ledger is unavailable")
         root = self._attempt_paths.get(handle["attempt_id"])
@@ -536,15 +536,15 @@ class HerdrProvider:
         data = canonical_json({"attempt_id": handle["attempt_id"], "outcome": outcome, "reason": reason[:500]})
         collected = [dict(ref) for ref in evidence_refs]
         for ref in collected: AttemptLedger._ref(ref, "evidence_ref")
-        if not artifact.exists():
+        if synthetic and not artifact.exists():
             fd = os.open(artifact, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as stream: stream.write(data); stream.flush(); os.fsync(stream.fileno())
         lines = self.ledger.path.read_text(encoding="utf-8").splitlines()
         started = next((json.loads(line) for line in lines if json.loads(line).get("attempt_id") == handle["attempt_id"] and json.loads(line).get("event") == "STARTED"), None)
         if started is None: raise _fail("INVALID_ORDER", "settlement has no STARTED event")
         settled = {key: started[key] for key in ("schema_version", "attempt_id", "work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "worktree_ref", "branch", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest", "herdr")}
-        synthetic = {"ref": str(artifact.relative_to(root)), "digest_domain": "raw_file", "digest": raw_file_digest(data), "kind": "result"}
-        settled.update({"event": "SETTLED", "settled_at": _now(), "outcome": outcome, "evidence_refs": collected + [synthetic], "prev_digest": started["record_digest"], "cleanup": cleanup})
+        supplemental = [{"ref": str(artifact.relative_to(root)), "digest_domain": "raw_file", "digest": raw_file_digest(data), "kind": "result"}] if synthetic else []
+        settled.update({"event": "SETTLED", "settled_at": _now(), "outcome": outcome, "evidence_refs": collected + supplemental, "prev_digest": started["record_digest"], "cleanup": cleanup})
         settled["record_digest"] = raw_file_digest(canonical_json(settled)); self.ledger.append(settled); self._settled.add(handle["attempt_id"])
 
     def _handle(self, handle: Mapping[str, object]) -> dict[str, object]:
@@ -675,17 +675,30 @@ class HerdrProvider:
         except FileExistsError as exc: raise _fail("RESOURCE_REUSED", "private observation already exists") from exc
         return data
 
-    def _interrupt_handle(self, handle: Mapping[str, object], reason: str = "cancel") -> dict[str, object]:
+    def _interrupt_handle(self, handle: Mapping[str, object], reason: str = "cancel", request_id: str = "interrupt") -> dict[str, object]:
         value = self._handle(handle)
         if reason not in _REASONS: raise _fail("INVALID_REQUEST", "invalid interrupt reason")
+        if self._attempt_sessions.get(value["attempt_id"]) is None: raise _fail("ARTIFACT_UNAVAILABLE", "interrupt session root is unavailable")
+        interrupt_path = self._attempt_sessions[value["attempt_id"]] / ("interrupt-" + value["attempt_id"] + ".json")
+        if interrupt_path.exists():
+            try: stored = json.loads(interrupt_path.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "interrupt record is malformed") from exc
+            expected_reason_digest = raw_file_digest(canonical_json({"reason": reason}))
+            if not isinstance(stored, dict) or stored.get("request_id") != request_id or stored.get("handle_id") != value["handle_id"] or stored.get("request_digest") != value["request_digest"] or stored.get("reason") != reason or stored.get("reason_digest") != expected_reason_digest:
+                raise _fail("IDENTITY_MISMATCH", "interrupt reuse identity differs")
+            return stored["response"]
         try:
             self._exec([self.herdr, "agent", "send-keys", value["handle_id"], "ctrl-c"], timeout_ms=10_000)
             observed = self._inspect_handle(value)["result"]["status"]
             cleanup = "confirmed" if observed in {"SETTLED", "TERMINATED"} else "uncertain"
-            interruption_bytes = self._private_observation(value, "interrupt", {"reason": reason, "observed": observed, "cleanup": cleanup})
+            response = {"schema_version": 1, "ok": True, "request_id": request_id, "result": {"attempt_id": value["attempt_id"], "host": value["host"], "requested": True, "observed": observed, "cleanup": cleanup}}
+            interrupt_record = {"schema_version": 1, "request_id": request_id, "handle_id": value["handle_id"], "request_digest": value["request_digest"], "reason": reason, "reason_digest": raw_file_digest(canonical_json({"reason": reason})), "observed": observed, "cleanup": cleanup, "response": response}
+            interruption_bytes = canonical_json(interrupt_record)
+            fd = os.open(interrupt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as stream: stream.write(interruption_bytes); stream.flush(); os.fsync(stream.fileno())
             interruption_ref = {"ref": "private/attempt-" + value["attempt_id"] + "/session/interrupt-" + value["attempt_id"] + ".json", "kind": "event", "digest_domain": "raw_file", "digest": raw_file_digest(interruption_bytes), "bytes": len(interruption_bytes)}
             self._settle(value, "INTERRUPTED" if cleanup == "confirmed" else "UNKNOWN", cleanup=cleanup, reason=reason, evidence_refs=[interruption_ref])
-            return {"schema_version": 1, "ok": True, "request_id": "interrupt", "result": {"attempt_id": value["attempt_id"], "host": value["host"], "requested": True, "observed": observed, "cleanup": cleanup}}
+            return response
         except ProtocolError as exc:
             try:
                 interruption_bytes = self._private_observation(value, "interrupt", {"reason": reason, "observed": "UNKNOWN", "error": str(exc)[:500]})
@@ -721,6 +734,22 @@ class HerdrProvider:
             ledger_refs = [{key: ref[key] for key in ("ref", "kind", "digest_domain", "digest")} for ref in response_refs]
             self._settle(value, "UNKNOWN", reason="Herdr status/read observed; termination UNKNOWN", evidence_refs=ledger_refs)
             return {"schema_version": 1, "ok": True, "request_id": "collect", "result": {"attempt_id": value["attempt_id"], "termination": "UNKNOWN", "runtime_identity": _MODEL + ":medium", "host": value["host"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"], "artifact_refs": response_refs, "cleanup": "not_applicable"}}
+        except OSError as exc:
+            failure_data = canonical_json({"schema_version": 1, "kind": "collect_failure", "attempt_id": value["attempt_id"], "error": str(exc)[:500]})
+            failure_path = self._attempt_sessions[value["attempt_id"]] / ("collect-failure-" + value["attempt_id"] + ".json")
+            try:
+                fd = os.open(failure_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "wb") as stream: stream.write(failure_data); stream.flush(); os.fsync(stream.fileno())
+                failure_ref = {"ref": "private/attempt-" + value["attempt_id"] + "/session/" + failure_path.name, "kind": "event", "digest_domain": "raw_file", "digest": raw_file_digest(failure_data)}
+            except OSError:
+                lines = self.ledger.path.read_text(encoding="utf-8").splitlines() if self.ledger and self.ledger.path.exists() else []
+                started = next((json.loads(line) for line in lines if json.loads(line).get("attempt_id") == value["attempt_id"] and json.loads(line).get("event") == "STARTED"), None)
+                failure_ref = started["request_packet"] if started is not None else None
+            try:
+                self._settle(value, "UNKNOWN", cleanup="uncertain", reason="collect artifact persistence failed", evidence_refs=[failure_ref] if failure_ref else [], synthetic=not bool(failure_ref and failure_ref.get("ref", "").startswith("private/")))
+            except (OSError, ProtocolError) as settle_exc:
+                raise _fail("CLEANUP_UNKNOWN", "collect failure could not be durably settled") from settle_exc
+            raise _fail("ARTIFACT_UNAVAILABLE", "collect artifact persistence failed") from exc
         except ProtocolError as exc:
             self._settle(value, "UNKNOWN", cleanup="uncertain", reason=str(exc)); raise
 
@@ -742,7 +771,7 @@ class HerdrProvider:
         request = _closed(request, {"schema_version", "request_id", "handle", "reason"}, "interrupt request")
         if request["schema_version"] != 1: raise _fail("INVALID_REQUEST", "invalid interrupt schema")
         request_id = _id(request["request_id"], "request_id")
-        internal = self._interrupt_handle(request["handle"], request["reason"])
+        internal = self._interrupt_handle(request["handle"], request["reason"], request_id)
         return {"schema_version": 1, "ok": True, "request_id": request_id, "result": internal["result"]}
 
     def _cleanup_record(self, handle: Mapping[str, object], outcome: str, **details: object) -> None:
