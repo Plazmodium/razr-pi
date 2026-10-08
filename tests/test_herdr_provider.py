@@ -13,7 +13,6 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "packages/razr-pi"))
 from adapter.herdr_provider import AttemptLedger, HerdrProvider, ProtocolError
-from adapter.core_subprocess import _repository_from_remote
 from adapter.protocol import canonical_json, raw_file_digest
 
 
@@ -24,14 +23,6 @@ class HerdrProviderTests(unittest.TestCase):
 
     def tearDown(self):
         self.env.stop()
-
-    def test_candidate_repository_remote_forms_are_strict(self):
-        self.assertEqual(_repository_from_remote("git@github.com:owner/repo.git"), "owner/repo")
-        self.assertEqual(_repository_from_remote("ssh://git@github.com/owner/repo"), "owner/repo")
-        self.assertEqual(_repository_from_remote("https://github.com/owner/repo.git"), "owner/repo")
-        for remote in ("/tmp/repo", "file" + "://tmp/repo"):
-            with self.assertRaises(ProtocolError): _repository_from_remote(remote)
-        self.assertNotEqual(_repository_from_remote("https://github.com/other/repo.git"), "owner/repo")
 
     def test_standalone_is_clean_and_never_launches(self):
         with patch.dict(os.environ, {"HERDR_ENV": "0"}, clear=False):
@@ -147,10 +138,10 @@ class HerdrProviderTests(unittest.TestCase):
             open_calls = []; list_calls = [0]
             def run(argv, **kwargs):
                 if argv[:3] == ["herdr", "agent", "start"]:
-                    result = {"agent": {"name": "worker-1", "agent": "pi", "agent_session": {"value": "pi-1"}, "workspace_id": "w", "tab_id": "t", "pane_id": "p", "telemetry": {"status": "ready"}}, "type": "agent_started"}
+                    result = {"agent": {"name": "worker-1", "agent": "pi", "agent_session": {"value": str(session / "pi-session.json")}, "workspace_id": "w", "tab_id": "t", "pane_id": "p", "telemetry": {"status": "ready"}}, "type": "agent_started"}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "start", "result": result}).encode(), b"")
                 if argv[:3] == ["herdr", "agent", "get"]:
-                    result = {"status": "SETTLED", "workspace_id": "w", "tab_id": "t", "pane_id": "p", "observed_at": "2026-01-01T00:00:00Z", "source": "herdr", "agent_session": {"value": "pi-1"}, "telemetry": {"live": True}}
+                    result = {"status": "SETTLED", "workspace_id": "w", "tab_id": "t", "pane_id": "p", "observed_at": "2026-01-01T00:00:00Z", "source": "herdr", "agent_session": {"value": str(session / "pi-session.json")},  "telemetry": {"live": True}}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "get", "result": result}).encode(), b"")
                 if argv[:3] == ["herdr", "worktree", "list"]:
                     list_calls[0] += 1

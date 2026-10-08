@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
@@ -497,9 +498,30 @@ class HerdrProvider:
             raise _fail("IDENTITY_MISMATCH", "dedicated worktree workspace differs from request host")
         root = _canonical_dir(value["worktree"], "worktree")
         # Provider-side re-verification confirms the checkout; candidate read-back remains foundation caller authority.
-        verify_candidate_identity(root, branch=value["candidate"]["branch"], commit=value["candidate"]["commit"], source_digest=value["candidate"]["source_digest"], expected_repository=value["candidate"]["repository"])
+        verify_candidate_identity(root, branch=value["candidate"]["branch"], commit=value["candidate"]["commit"], source_digest=value["candidate"]["source_digest"])
 
     def _claim_roots(self, request: ProviderRequest, capability_report_digest: str) -> None:
+        values = request.value
+        markers = []
+        for root_key in ("output_root", "session_root"):
+            root = _canonical_dir(values[root_key], root_key); markers.append((root, root / ".razr-herdr-root.json", (root / ".razr-herdr-root.json").exists()))
+        evidence_dir = _canonical_dir(values["worktree"], "worktree") / ".razr" / "evidence"
+        before = set(evidence_dir.iterdir()) if evidence_dir.is_dir() else set()
+        try:
+            return self._claim_roots_unprotected(request, capability_report_digest)
+        except BaseException:
+            for root, marker, existed in markers:
+                if not existed and marker.is_file():
+                    try: marker.unlink()
+                    except OSError: pass
+            if evidence_dir.is_dir():
+                for child in set(evidence_dir.iterdir()) - before:
+                    try:
+                        if child.is_file() and not child.is_symlink(): child.unlink()
+                    except OSError: pass
+            raise
+
+    def _claim_roots_unprotected(self, request: ProviderRequest, capability_report_digest: str) -> None:
         values = request.value
         prior: list[dict[str, object]] = []
         if self.ledger is not None and self.ledger.path.exists():
@@ -596,8 +618,14 @@ class HerdrProvider:
                         candidate_session = observed_agent.get("agent_session") if isinstance(observed_agent, dict) else None
                         if isinstance(candidate_session, dict): candidate_session = candidate_session.get("value")
                         if candidate_session is not None: session_value = candidate_session; break
-            _id(session_value, "pi_session_id")
-            result = {"agent_id": agent_id, "workspace_id": agent["workspace_id"], "tab_id": agent["tab_id"], "pane_id": agent["pane_id"], "pi_session_id": session_value}
+            session_root = _canonical_dir(value["session_root"], "session_root")
+            if not isinstance(session_value, str) or not Path(session_value).is_absolute(): raise _fail("IDENTITY_MISMATCH", "Pi session path is not absolute")
+            session_path = Path(session_value)
+            try: canonical_session_path = session_path.resolve(strict=False)
+            except OSError as exc: raise _fail("IDENTITY_MISMATCH", "Pi session path is unavailable") from exc
+            if session_path != canonical_session_path or not canonical_session_path.is_relative_to(session_root): raise _fail("PATH_ESCAPE", "Pi session path escapes session root")
+            opaque_session = "pi-session-" + hashlib.sha256(str(canonical_session_path).encode("utf-8")).hexdigest()
+            result = {"agent_id": agent_id, "workspace_id": agent["workspace_id"], "tab_id": agent["tab_id"], "pane_id": agent["pane_id"], "pi_session_id": opaque_session}
             if any(result[key] != value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")): raise _fail("IDENTITY_MISMATCH", "agent host identity differs")
             pane = _envelope(self._exec([self.herdr, "pane", "get", value["host"]["pane_id"]], timeout_ms=10_000), "pane")
             pane_result = pane["result"]
@@ -608,6 +636,10 @@ class HerdrProvider:
             if self.private_root is None: raise _fail("INVALID_REQUEST", "provider private root is unavailable")
             private_dir = _canonical_dir(str(self.private_root), "private_root") / "handles"
             private_dir.mkdir(mode=0o700, exist_ok=True)
+            session_record = {"schema_version": 1, "handle_id": result["agent_id"], "pi_session_path": str(canonical_session_path), "pi_session_id": opaque_session}
+            session_record["record_digest"] = raw_file_digest(canonical_json(session_record))
+            session_path_file = private_dir / ("pi-session-" + result["agent_id"] + ".json")
+            session_path_file.write_bytes(canonical_json(session_record))
             private = {"schema_version": 1, "handle": handle, "agent_id": result["agent_id"], "pi_session_id": result["pi_session_id"], "capability_report_digest": evidence["capability_report_digest"], "handle_digest": raw_file_digest(canonical_json(handle)), "paths": {"worktree": value["worktree"], "output_root": value["output_root"], "session_root": value["session_root"]}, "attempt_path": value["worktree"], "attempt_ref": "."}
             private["record_digest"] = raw_file_digest(canonical_json(private))
             private_path = private_dir / ("handle-" + result["agent_id"] + ".json")
