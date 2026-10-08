@@ -27,6 +27,7 @@ _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 _MODEL = "openai-codex/gpt-5.6-luna"
 _LAUNCH_EVIDENCE_CODES = frozenset({"LAUNCH_FAILED", "TIMEOUT", "OUTPUT_LIMIT", "PROVIDER_UNAVAILABLE"})
+_EVIDENCE_KIND_DOMAINS = {"launch_failure": "raw_file", "stdout": "raw_file", "stderr": "raw_file", "session": "raw_file", "event": "raw_file", "result": "raw_file", "candidate": "canonical_json", "request_packet": "canonical_json", "capability_report": "canonical_json", "identity": "canonical_json", "report": "canonical_json"}
 _CLI_TIMEOUT_MS = 10_000
 _CLI_MAX_OUTPUT = 262_144
 _CAPABILITIES = frozenset({
@@ -207,6 +208,8 @@ class AttemptLedger:
             raise _fail("PATH_ESCAPE", f"invalid {name} reference")
         if domain and value["digest_domain"] != domain:
             raise _fail("LEDGER_CORRUPT", f"invalid {name} digest domain")
+        if name == "evidence_ref" and value["kind"] in _EVIDENCE_KIND_DOMAINS and value["digest_domain"] != _EVIDENCE_KIND_DOMAINS[value["kind"]]:
+            raise _fail("LEDGER_CORRUPT", "evidence kind and digest domain differ")
         _digest(value["digest"], f"{name} digest")
 
     @classmethod
@@ -244,7 +247,7 @@ class AttemptLedger:
             if event["outcome"] not in _OUTCOMES: raise _fail("LEDGER_CORRUPT", "invalid outcome")
             if not isinstance(event["evidence_refs"], list) or not event["evidence_refs"]:
                 raise _fail("LEDGER_CORRUPT", "settlement evidence is required")
-            for ref in event["evidence_refs"]: cls._ref(ref, "evidence_ref", "raw_file")
+            for ref in event["evidence_refs"]: cls._ref(ref, "evidence_ref")
             if "exit_code" in event and (not isinstance(event["exit_code"], int) or isinstance(event["exit_code"], bool)):
                 raise _fail("LEDGER_CORRUPT", "invalid exit_code")
             if "cleanup" in event and event["cleanup"] not in {"confirmed", "uncertain", "not_applicable"}:
@@ -281,6 +284,9 @@ class AttemptLedger:
                     if root_id in roots and roots[root_id] != attempt: raise _fail("RESOURCE_REUSED", "root identity was reused")
                     roots[root_id] = attempt
             elif attempts[attempt] == "STARTED" and row["event"] == "SETTLED":
+                started = next(item for item in records if item["attempt_id"] == attempt and item["event"] == "STARTED")
+                for key in ("work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "branch", "worktree_ref", "candidate", "candidate_evidence", "request_packet", "request_digest", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "herdr"):
+                    if row.get(key) != started.get(key): raise _fail("IDENTITY_MISMATCH", f"settlement {key} differs")
                 attempts[attempt] = "SETTLED"
             else: raise _fail("LEDGER_CORRUPT", "invalid per-attempt event order")
             previous = row["record_digest"]
@@ -565,6 +571,7 @@ class HerdrProvider:
 
     def _parse_worktree_response(self, response: Mapping[str, object], expected_path: Path | None) -> dict[str, object]:
         result = _closed(response["result"], {"root_pane", "tab", "type", "workspace", "worktree"}, "worktree result")
+        if result["type"] not in {"worktree_created", "worktree_opened"}: raise _fail("ARTIFACT_UNAVAILABLE", "unexpected worktree result type")
         root_pane = _closed(result["root_pane"], {"agent_status", "cwd", "focused", "foreground_cwd", "pane_id", "revision", "scroll", "tab_id", "terminal_id", "workspace_id"}, "root pane")
         _closed(root_pane["scroll"], {"max_offset_from_bottom", "offset_from_bottom", "viewport_rows"}, "pane scroll")
         tab = _closed(result["tab"], {"agent_status", "focused", "label", "number", "pane_count", "tab_id", "workspace_id"}, "worktree tab")
@@ -576,6 +583,8 @@ class HerdrProvider:
         if not (root_pane["workspace_id"] == tab["workspace_id"] == workspace["workspace_id"] == worktree["open_workspace_id"]): raise _fail("IDENTITY_MISMATCH", "nested workspace identities conflict")
         if root_pane["tab_id"] != tab["tab_id"] or workspace["active_tab_id"] != tab["tab_id"]: raise _fail("IDENTITY_MISMATCH", "nested tab identities conflict")
         path = _canonical_dir(worktree["path"], "worktree path")
+        if _canonical_dir(root_pane["cwd"], "root pane cwd") != path or _canonical_dir(root_pane["foreground_cwd"], "root pane foreground cwd") != path or _canonical_dir(workspace_worktree["checkout_path"], "workspace checkout path") != path:
+            raise _fail("IDENTITY_MISMATCH", "nested checkout paths differ")
         if expected_path is not None and path != expected_path: raise _fail("IDENTITY_MISMATCH", "worktree path differs")
         return {"workspace_id": workspace["workspace_id"], "tab_id": root_pane["tab_id"], "pane_id": root_pane["pane_id"], "path": str(path)}
 

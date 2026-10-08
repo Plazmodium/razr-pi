@@ -120,6 +120,9 @@ class HerdrProviderTests(unittest.TestCase):
                        "candidate_evidence": ref, "request_packet": packet, "output_root_id": "out-1", "output_root_digest": digest,
                        "session_root_id": "sess-1", "session_root_digest": digest, "request_digest": digest,
                        "herdr": {"workspace_id": "w", "tab_id": "t", "pane_id": "p"}, "prev_digest": "sha256:" + "0" * 64}
+            for bad_schema in (True, 1.0):
+                malformed = dict(started); malformed["schema_version"] = bad_schema
+                with self.assertRaises(ProtocolError): ledger.append(malformed)
             for index, bad_ref in enumerate(("/absolute", "../traversal", "a\\\\b")):
                 malformed = dict(started); malformed["attempt_id"] = "bad-ref-" + str(index); malformed["allowance_id"] = "bad-allow-" + str(index); malformed["worktree_ref"] = bad_ref; malformed["record_digest"] = raw_file_digest(canonical_json({**malformed, "record_digest": None}))
                 with self.assertRaises(ProtocolError) as caught:
@@ -207,6 +210,8 @@ class HerdrProviderTests(unittest.TestCase):
             request = {"schema_version": 1, "request_id": "exec-1", "attempt_id": "att-1", "role": "worker", "host": {"mode": "herdr", "workspace_id": "w", "tab_id": "t", "pane_id": "p"}, "work": {"work_id": "work", "node_id": "node", "generation": 1, "ordinal": 1}, "worker_id": "worker-1", "branch": "feature/x", "candidate": {"repository": "owner/repo", "branch": "feature/x", "commit": "0" * 40, "source_digest": source_digest}, "worktree": str(worktree), "cwd": str(worktree), "output_root": str(output), "output_root_id": "out-1", "output_root_digest": empty_digest, "session_root": str(session), "session_root_id": "sess-1", "session_root_digest": empty_digest, "fresh_context": True, "neutral_input_digest": "sha256:" + "a" * 64, "environment_policy_digest": "sha256:" + "b" * 64, "tool_policy_digest": "sha256:" + "c" * 64, "required_capabilities": ["runtime_identity"], "runtime": {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "thinking": "medium"}, "limits": {"deadline_ms": 1000, "max_output_bytes": 1000}, "allowance_id": "allow-1"}
             ledger = AttemptLedger(base / "attempts.jsonl")
             provider = HerdrProvider(runner=run, ledger=ledger, private_root=private)
+            for bad_schema in (True, 1.0):
+                with self.assertRaises(ProtocolError): provider.launch({**request, "schema_version": bad_schema})
             with patch("adapter.herdr_provider.verify_candidate_identity"):
                 response = provider.launch(request)
             handle = response["result"]["handle"]
