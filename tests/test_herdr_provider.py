@@ -40,7 +40,7 @@ class HerdrProviderTests(unittest.TestCase):
         result = HerdrProvider(runner=run).probe({"schema_version": 1, "request_id": "probe-1", "required_capabilities": list(("fresh_context", "working_directory", "bounded_time", "bounded_output", "runtime_identity")), "runtime": {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "thinking": "medium"}})
         self.assertEqual(result["request_id"], "probe-1")
         self.assertEqual(result["result"]["runtime_identity"], "openai-codex/gpt-5.6-luna:medium")
-        self.assertEqual([call[0][:2] for call in calls], [["herdr", "--help"], ["herdr", "agent"], ["herdr", "worktree"], ["herdr", "pane"], ["pi", "--help"], ["pi", "--list-models"]])
+        self.assertEqual([call[0][:2] for call in calls], [["herdr", "--help"], ["herdr", "agent"], ["herdr", "agent"], ["herdr", "worktree"], ["herdr", "pane"], ["pi", "--help"], ["pi", "--list-models"]])
         self.assertTrue(all(call[1]["shell"] is False and call[1]["stdin"] is subprocess.DEVNULL for call in calls))
 
     def test_malformed_and_timeout_are_mechanical_errors(self):
@@ -141,6 +141,14 @@ class HerdrProviderTests(unittest.TestCase):
             result = provider.interrupt({"schema_version": 1, "request_id": "interrupt-unique", "handle": {}, "reason": "cancel"})
         self.assertEqual(result["request_id"], "interrupt-unique")
         with self.assertRaises(ProtocolError): provider.interrupt({"schema_version": 1, "request_id": "interrupt-unique", "handle": {}, "reason": "cancel", "extra": True})
+
+    def test_nested_malformed_records_fail_as_ledger_corrupt(self):
+        malformed = [None, [], {}, {"commit": "0" * 40}, {"source_digest": "sha256:" + "a" * 64}]
+        for candidate in malformed:
+            with self.subTest(candidate=candidate):
+                with self.assertRaises(ProtocolError) as caught:
+                    AttemptLedger._replay_validate({"schema_version": 1, "event": "STARTED", "candidate": candidate, "candidate_evidence": [], "request_packet": None, "herdr": []})
+                self.assertEqual(caught.exception.code, "LEDGER_CORRUPT")
 
     def test_request_rejects_runtime_fallback_and_root_reuse(self):
         with tempfile.TemporaryDirectory() as tmp:

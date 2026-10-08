@@ -18,7 +18,7 @@ import subprocess
 import shutil
 from typing import Callable, Mapping, Sequence
 
-from .protocol import ProtocolError, canonical_json, raw_file_digest
+from .protocol import ERROR_CODES, ProtocolError, canonical_json, raw_file_digest
 
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
@@ -33,6 +33,7 @@ _STATUSES = {"STARTING", "ACTIVE", "SETTLED", "STOPPING", "TERMINATED", "UNKNOWN
 _OUTCOMES = _TERMINATIONS
 _REASONS = {"cancel", "timeout", "policy_violation"}
 _BASELINE_CAPABILITIES = ("fresh_context", "working_directory", "bounded_time", "bounded_output", "runtime_identity")
+_CAPABILITY_ORDER = ("fresh_context", "saved_session", "neutral_instructions", "working_directory", "environment_policy", "bounded_time", "bounded_output", "stream_capture", "interrupt", "tool_policy_observation", "runtime_identity")
 
 
 def _fail(code: str, message: str, **details: object) -> ProtocolError:
@@ -173,7 +174,7 @@ class AttemptLedger:
         required = {"ref", "digest_domain", "digest", "kind"} if name == "evidence_ref" else {"ref", "digest_domain", "digest"}
         if not isinstance(value, dict) or not required <= set(value) or set(value) - required - ({"error_code"} if name == "evidence_ref" else set()):
             raise _fail("LEDGER_CORRUPT", f"invalid {name}")
-        if name == "evidence_ref" and value["kind"] == "launch_failure" and value.get("error_code") not in {"LAUNCH_FAILED", "TIMEOUT", "OUTPUT_LIMIT", "PROVIDER_UNAVAILABLE", "ARTIFACT_UNAVAILABLE"}:
+        if name == "evidence_ref" and value["kind"] == "launch_failure" and value.get("error_code") not in ERROR_CODES:
             raise _fail("LEDGER_CORRUPT", "invalid launch failure evidence")
         ref = value["ref"]
         if not isinstance(ref, str) or not ref or PurePosixPath(ref).is_absolute() or ".." in PurePosixPath(ref).parts or str(PurePosixPath(ref)) != ref:
@@ -200,7 +201,10 @@ class AttemptLedger:
             raise _fail("LEDGER_CORRUPT", "invalid observed ordinal")
         _digest(event["output_root_digest"], "output_root_digest"); _digest(event["session_root_digest"], "session_root_digest")
         _digest(event["request_digest"], "request_digest"); _digest(event["prev_digest"], "prev_digest"); _digest(event["record_digest"], "record_digest")
-        _commit(event["candidate"]["commit"]); _digest(event["candidate"]["source_digest"], "candidate source digest")
+        candidate = event.get("candidate")
+        if not isinstance(candidate, dict) or set(candidate) != {"commit", "source_digest"}:
+            raise _fail("LEDGER_CORRUPT", "invalid candidate record")
+        _commit(candidate["commit"]); _digest(candidate["source_digest"], "candidate source digest")
         cls._ref(event["candidate_evidence"], "candidate_evidence")
         cls._ref(event["request_packet"], "request_packet", "canonical_json")
         if event["event"] == "STARTED":
@@ -223,9 +227,18 @@ class AttemptLedger:
         if event["record_digest"] != expected: raise _fail("LEDGER_CORRUPT", "record digest differs")
         return event
 
+    @classmethod
+    def _replay_validate(cls, event: object) -> dict[str, object]:
+        try:
+            return cls._validate_event(event)
+        except ProtocolError as exc:
+            raise _fail("LEDGER_CORRUPT", "malformed attempt record", cause=exc.code) from exc
+        except (KeyError, TypeError, AttributeError, ValueError, UnicodeError) as exc:
+            raise _fail("LEDGER_CORRUPT", "malformed attempt record") from exc
+
     def append(self, event: Mapping[str, object]) -> dict[str, object]:
         import copy
-        event = self._validate_event(copy.deepcopy(dict(event)))
+        event = self._replay_validate(copy.deepcopy(dict(event)))
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a+", encoding="utf-8") as stream:
             fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
@@ -234,7 +247,7 @@ class AttemptLedger:
                 if not line.endswith("\n"): raise _fail("LEDGER_CORRUPT", "partial ledger line")
                 try: row = json.loads(line)
                 except json.JSONDecodeError as exc: raise _fail("LEDGER_CORRUPT", "malformed ledger JSON") from exc
-                records.append(self._validate_event(row))
+                records.append(self._replay_validate(row))
             previous = records[-1]["record_digest"] if records else "sha256:" + "0" * 64
             same = [row for row in records if row["attempt_id"] == event["attempt_id"]]
             if event["event"] == "STARTED" and same: raise _fail("DUPLICATE_ATTEMPT", "duplicate STARTED")
@@ -350,6 +363,7 @@ class HerdrProvider:
         if any(cap not in _CAPABILITIES for cap in caps): raise _fail("UNSUPPORTED_CAPABILITY", "unknown capability")
         herdr_help = self._exec([self.herdr, "--help"], timeout_ms=10_000, max_output=262_144).decode("utf-8", "replace")
         agent_help = self._exec([self.herdr, "agent", "--help"], timeout_ms=10_000, max_output=262_144).decode("utf-8", "replace")
+        read_help = self._exec([self.herdr, "agent", "read", "--help"], timeout_ms=10_000, max_output=262_144).decode("utf-8", "replace")
         worktree_help = self._exec([self.herdr, "worktree", "--help"], timeout_ms=10_000, max_output=262_144).decode("utf-8", "replace")
         pane_help = self._exec([self.herdr, "pane", "--help"], timeout_ms=10_000, max_output=262_144).decode("utf-8", "replace")
         pi_help = self._exec([self.pi, "--help"], timeout_ms=10_000, max_output=262_144).decode("utf-8", "replace")
@@ -357,16 +371,24 @@ class HerdrProvider:
         capabilities = set()
         if "--no-session" in pi_help and "--session" in pi_help and "--continue" in pi_help and "--resume" in pi_help:
             capabilities.add("fresh_context")
+        if "--session-dir" in pi_help and "--session" in pi_help:
+            capabilities.add("saved_session")
         if "--cwd" in worktree_help and "--path" in worktree_help and "--pane" in agent_help and "pane" in pane_help:
             capabilities.add("working_directory")
         if "--timeout" in agent_help and "--timeout" in herdr_help + pane_help:
             capabilities.add("bounded_time")
+        if "send-keys" in agent_help:
+            capabilities.add("interrupt")
+        if "--source" in read_help and "--lines" in read_help:
+            capabilities.add("stream_capture")
+        if all(flag in pi_help for flag in ("--no-context-files", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes")) and self._env():
+            capabilities.add("environment_policy")
         if MAX_OUTPUT_BYTES := 1_048_576:
             if MAX_OUTPUT_BYTES > 0 and "--lines" in pane_help + agent_help:
                 capabilities.add("bounded_output")
         capabilities.add("runtime_identity")
         if any(cap not in capabilities for cap in caps): raise _fail("UNSUPPORTED_CAPABILITY", "required capability was not directly evidenced")
-        report = {"provider_id": self.provider_id, "runtime_identity": _MODEL + ":medium", "capabilities": [cap for cap in _BASELINE_CAPABILITIES if cap in capabilities]}
+        report = {"provider_id": self.provider_id, "runtime_identity": _MODEL + ":medium", "capabilities": [cap for cap in _CAPABILITY_ORDER if cap in capabilities]}
         report["report_digest"] = raw_file_digest(canonical_json(report))
         return {"schema_version": 1, "ok": True, "request_id": request_id, "result": report}
 
@@ -414,7 +436,7 @@ class HerdrProvider:
         prior: list[dict[str, object]] = []
         if self.ledger is not None and self.ledger.path.exists():
             for line in self.ledger.path.read_text(encoding="utf-8").splitlines():
-                try: prior.append(AttemptLedger._validate_event(json.loads(line)))
+                try: prior.append(AttemptLedger._replay_validate(json.loads(line)))
                 except (json.JSONDecodeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "cannot claim roots from corrupt ledger") from exc
         for root_key, id_key in (("output_root", "output_root_id"), ("session_root", "session_root_id")):
             root = _canonical_dir(values[root_key], root_key)
@@ -453,7 +475,7 @@ class HerdrProvider:
         evidence = self._claim_roots(parsed, probe_report["result"]["report_digest"])
         self._verify_candidate(parsed)
         value = parsed.value; deadline = value["limits"]["deadline_ms"]
-        started = {"schema_version": 1, "event": "STARTED", "attempt_id": value["attempt_id"], "work_id": value["work"]["work_id"], "node_id": value["work"]["node_id"], "observed_generation": value["work"]["generation"], "observed_ordinal": value["work"]["ordinal"], "worker_id": value["worker_id"], "branch": value["branch"], "worktree_ref": ".", "allowance_id": value["allowance_id"], "provider_id": self.provider_id, "started_at": _now(), "started_at_source": "adapter_observed", "candidate": value["candidate"], "candidate_evidence": evidence["candidate"], "request_packet": evidence["packet"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"], "request_digest": evidence["request_digest"], "herdr": {key: value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")}, "prev_digest": "sha256:" + "0" * 64}
+        started = {"schema_version": 1, "event": "STARTED", "attempt_id": value["attempt_id"], "work_id": value["work"]["work_id"], "node_id": value["work"]["node_id"], "observed_generation": value["work"]["generation"], "observed_ordinal": value["work"]["ordinal"], "worker_id": value["worker_id"], "branch": value["branch"], "worktree_ref": ".", "allowance_id": value["allowance_id"], "provider_id": self.provider_id, "started_at": _now(), "started_at_source": "adapter_observed", "candidate": {"commit": value["candidate"]["commit"], "source_digest": value["candidate"]["source_digest"]}, "candidate_evidence": evidence["candidate"], "request_packet": evidence["packet"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"], "request_digest": evidence["request_digest"], "herdr": {key: value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")}, "prev_digest": "sha256:" + "0" * 64}
         # The ledger computes no authority: this is a durable observation only.
         # Its predecessor is supplied by the ledger caller/chain; STARTED must
         # be appended before the provider launch below.
@@ -548,7 +570,7 @@ class HerdrProvider:
         self._attempt_sessions.setdefault(value["attempt_id"], Path(paths["session_root"]))
         self._attempt_roots.setdefault(value["attempt_id"], (Path(paths["output_root"]), Path(paths["session_root"])))
         if self.ledger is None or not self.ledger.path.exists(): raise _fail("IDENTITY_MISMATCH", "handle ledger is unavailable")
-        try: records = [AttemptLedger._validate_event(json.loads(line)) for line in self.ledger.path.read_text(encoding="utf-8").splitlines()]
+        try: records = [AttemptLedger._replay_validate(json.loads(line)) for line in self.ledger.path.read_text(encoding="utf-8").splitlines()]
         except (OSError, json.JSONDecodeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "handle ledger cannot be replayed") from exc
         started = next((row for row in records if row["event"] == "STARTED" and row["attempt_id"] == value["attempt_id"]), None)
         settled = next((row for row in records if row["event"] == "SETTLED" and row["attempt_id"] == value["attempt_id"]), None)
@@ -579,7 +601,7 @@ class HerdrProvider:
         if not isinstance(evidence, list) or not evidence: raise _fail("ARTIFACT_UNAVAILABLE", "retained recovery evidence is required")
         for ref in evidence: AttemptLedger._ref(ref, "evidence_ref")
         if self.ledger is None or not self.ledger.path.exists(): raise _fail("LEDGER_CORRUPT", "recovery ledger is unavailable")
-        try: records = [AttemptLedger._validate_event(json.loads(line)) for line in self.ledger.path.read_text(encoding="utf-8").splitlines()]
+        try: records = [AttemptLedger._replay_validate(json.loads(line)) for line in self.ledger.path.read_text(encoding="utf-8").splitlines()]
         except (OSError, json.JSONDecodeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "recovery ledger cannot be replayed") from exc
         started = next((row for row in records if row["event"] == "STARTED" and row["attempt_id"] == request["attempt_id"]), None)
         if started is None: raise _fail("INVALID_ORDER", "no unmatched STARTED event")
