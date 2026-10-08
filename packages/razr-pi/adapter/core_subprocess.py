@@ -464,7 +464,7 @@ def _workflow_projection(status_row: object, state: object, work_id: str, node_i
 def read_workflow(request: CoreRequest, work_id: str, node_id: str) -> WorkflowRead:
     """Perform the frozen status → validate → raw state read-back sequence."""
     import dataclasses
-    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", work_id) or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", node_id):
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", work_id) or (node_id != "*" and not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", node_id)):
         raise _fail("INVALID_REQUEST", "invalid core work or node ID")
     status_id = _child_request_id(request.request_id, "status")
     validate_id = _child_request_id(request.request_id, "validate")
@@ -501,7 +501,17 @@ def read_workflow(request: CoreRequest, work_id: str, node_id: str) -> WorkflowR
         state = json.loads(raw_state.raw_bytes.decode("utf-8"), object_pairs_hook=_json_object)
     except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise _fail("MALFORMED_RESPONSE", "state JSON is malformed") from exc
+    if node_id == "*":
+        nodes = state.get("nodes") if isinstance(state, dict) else None
+        if not isinstance(nodes, dict) or not nodes:
+            raise _fail("READBACK_FAILED", "workflow has no nodes")
+        node_id = sorted(nodes)[0]
     return _workflow_projection(rows[0], state, work_id, node_id, raw_state, state_response, request.repository_root, request.request_id)
+
+
+def read_workflow_context(request: CoreRequest, work_id: str) -> WorkflowRead:
+    """Read a work item without inventing a node: select its first core node deterministically."""
+    return read_workflow(request, work_id, "*")
 
 
 def invoke_core(request: CoreRequest) -> CoreResponse:

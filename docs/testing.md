@@ -40,6 +40,7 @@ The selected public modules are:
 | test_primary_execution | Core-materialized synthetic item, read-only null-candidate inspection, discovery/unknown/linked/malformed/drift refusal and stale-generation fence |
 | test_provenance | Six immutable core/template hashes, retained helper/provenance pins, relocation, missing/drifted files, unchanged license and file modes |
 | test_public_boundary | Exact tree, ignored private extras, missing fixtures before execution, synthetic privacy patterns, links, traversal, output ownership, imports, resources and fixture drift; genuine normal/linked repository identity, ambient-Git override isolation, malformed/outside/missing/linked administration and query-error refusals |
+| test_context | M03 tracer and deterministic bounded selector: source/tests/config/Git selection, omission limits, stale Memory labels and closed safe-path requests |
 | test_named_regressions | Actual callback outcomes, subcases, fixture errors, skips/failures and explicit coverage mappings |
 
 Missing prerequisites/fixtures, import errors, failed tests, unexpected top-level skips/expected failures and unobserved module categories fail the runner. It retains named observations, source identities and raw-log hashes. Nested collector probes deliberately exercise failures/skips in isolated in-memory results; they are not outer-suite acceptance failures. Module observations identify selected coverage, not exhaustive security or semantic certification.
