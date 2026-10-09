@@ -77,6 +77,33 @@ assert.deepEqual(settings.drainErrors(), []);
 assert.deepEqual(loader.getExtensions().errors, []);
 assert.equal(loader.getExtensions().extensions.length, 1);
 assert.equal(loader.getExtensions().extensions[0].path, join(pkg, 'extensions/razr.ts'));
+const commandMap = loader.getExtensions().extensions[0].commands;
+assert.deepEqual([...commandMap.keys()].sort(), [
+  'razr-context', 'razr-memory-inspect', 'razr-recall', 'razr-remember', 'razr-status',
+]);
+const notifications = [];
+const commandContext = {
+  cwd, mode: 'print', signal: new AbortController().signal,
+  ui: { notify: (message, level) => notifications.push({ message, level }) },
+};
+await commandMap.get('razr-memory-inspect').handler('', commandContext);
+await commandMap.get('razr-recall').handler('', commandContext);
+await commandMap.get('razr-context').handler(JSON.stringify({
+  schema_version: 1, request_id: 'ignored', objective: 'smoke', repository_root: '.',
+  include: { source: true, tests: false, config: false, git: false, workflow: false, memory: false },
+  limits: { max_files: 2, max_bytes: 1000, max_memory_records: 1 },
+}), commandContext);
+await commandMap.get('razr-status').handler('', commandContext);
+await commandMap.get('razr-context').handler('null', commandContext);
+await commandMap.get('razr-recall').handler('[]', commandContext);
+await commandMap.get('razr-remember').handler('null', commandContext);
+assert.ok(notifications.some(item => item.level === 'error'), 'invalid/unadopted handlers must refuse');
+const contextNotice = notifications.find(item => item.level === 'info' && item.message.includes('packet_digest'));
+assert.ok(contextNotice, 'context handler must return the M03 packet');
+assert.match(JSON.parse(contextNotice.message).request_id, /^ctx-[0-9a-f]{32}$/);
+assert.equal(readdirSync(cwd).includes('.razr'), false, 'handler smoke must not implicitly adopt');
+assert.deepEqual(snapshot(cwd), before.project, 'handler smoke must not mutate project');
+assert.deepEqual(snapshot(agentDir), before.agent, 'handler smoke must not mutate Pi config');
 assert.deepEqual(loader.getSkills().diagnostics, []);
 const skills = loader.getSkills().skills;
 assert.equal(skills.length, 1);
