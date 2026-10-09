@@ -13,6 +13,8 @@ CORE = PACKAGE / "runtime/scripts/razr.py"
 
 def _request(root: Path, argv: tuple[str, ...]):
     sys.path.insert(0, str(PACKAGE))
+    # These package-internal identity primitives are the same ones M03 uses to
+    # populate the frozen CoreRequest; do not duplicate or broaden their policy.
     from adapter.core_subprocess import _git_head, _source_digest
     from adapter.protocol import CoreRequest, ProvenancePin, raw_file_digest
     provenance_path = PACKAGE / "runtime/provenance.json"

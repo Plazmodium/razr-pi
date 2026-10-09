@@ -6,7 +6,7 @@ The package registers `/razr-status`, `/razr-context`, `/razr-remember`, `/razr-
 
 Review [the skill](skills/razr/SKILL.md) and [managed routing](runtime/AGENTS.project-razr.md) before loading. This private package provides the primary skill plus a thin command extension for explicit inspection/adoption workflows. Loading does not authorize writes or adopt a project. Do not install automatically.
 
-The package resolves helpers and runtime internally. The core and five canonical templates are unchanged snapshots identified by [provenance](runtime/provenance.json). Provenance is not execution proof or licensing clearance.
+The package resolves helpers and runtime internally. Status constructs the frozen `CoreRequest` using the package-internal identity primitives already shared with M03 (`_git_head` and `_source_digest`); it does not duplicate digest logic or broaden the frozen protocol. The core and five canonical templates are unchanged snapshots identified by [provenance](runtime/provenance.json). Provenance is not execution proof or licensing clearance.
 
 Stable adapter surfaces:
 
