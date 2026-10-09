@@ -45,7 +45,7 @@ def _validate_request(request: object) -> dict:
     if operation == "snapshot":
         allowed, required = common | {"branch", "base"}, ("branch",)
     elif operation == "read":
-        allowed, required = common | {"url", "repository", "base", "branch", "base_sha", "head_sha", "source_digest"}, ("url",)
+        allowed, required = common | {"url", "repository", "base", "branch", "base_sha", "head_sha", "source_digest"}, ("url", "repository", "base", "branch", "base_sha", "head_sha", "source_digest")
     else:
         allowed, required = common | {"base", "branch", "title", "body", "repository", "base_sha", "head_sha", "source_digest"}, ("base", "branch", "title", "body", "repository", "base_sha", "head_sha", "source_digest")
     if set(request) - allowed:
@@ -78,10 +78,10 @@ def main() -> int:
         if operation == "snapshot":
             result = delivery.snapshot(root, branch=request["branch"], base=request.get("base", "campaign/razr-pi-next"))
         elif operation == "read":
-            result = delivery.read_pr(root, request["url"], expected_repository=request.get("repository"),
-                                      expected_base=request.get("base"), expected_base_sha=request.get("base_sha"),
-                                      expected_head=request.get("branch"), expected_head_sha=request.get("head_sha"),
-                                      expected_source_digest=request.get("source_digest"))
+            result = delivery.read_pr(root, request["url"], expected_repository=request["repository"],
+                                      expected_base=request["base"], expected_base_sha=request["base_sha"],
+                                      expected_head=request["branch"], expected_head_sha=request["head_sha"],
+                                      expected_source_digest=request["source_digest"])
         else:
             result = delivery.create_pr(root, base=request["base"], head=request["branch"],
                                         title=request["title"], body=request["body"],

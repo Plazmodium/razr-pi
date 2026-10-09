@@ -17,6 +17,9 @@ from adapter import github_delivery as delivery
 URL = "https://github.com/o/r/pull/1"
 SHA = "a" * 40
 DIGEST = "sha256:" + "c" * 64
+READ_EXPECTATIONS = {"expected_repository": "o/r", "expected_base": "campaign/razr-pi-next",
+                     "expected_base_sha": "b" * 40, "expected_head": "feature",
+                     "expected_head_sha": SHA, "expected_source_digest": DIGEST}
 
 
 def pr_value(**changes):
@@ -92,10 +95,7 @@ class GithubDeliveryTests(unittest.TestCase):
                   "headRefName": "feature", "headRefOid": SHA, "mergeStateStatus": "CLEAN",
                   "mergeable": "MERGEABLE", "reviewDecision": "", "mergedAt": None,
                   "closedAt": None, "updatedAt": "2026-01-01T00:00:00Z"}]):
-            result = delivery.read_pr(Path("."), URL, expected_repository="o/r",
-                                      expected_base="campaign/razr-pi-next", expected_base_sha="b" * 40,
-                                      expected_head="feature", expected_head_sha=SHA,
-                                      expected_source_digest=DIGEST)
+            result = delivery.read_pr(Path("."), URL, **READ_EXPECTATIONS)
             self.assertEqual(result["repository"], "o/r")
             self.assertEqual(result["sourceDigest"], DIGEST)
             self.assertFalse(result["collectionCompleteness"]["reviews"]["complete"])
@@ -149,7 +149,9 @@ class GithubDeliveryTests(unittest.TestCase):
                  patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA]), \
                  patch.object(delivery, "source_identity", return_value=DIGEST):
                 with self.assertRaises(delivery.DeliveryError):
-                    delivery.read_pr(Path("."), URL, **kwargs)
+                    expectations = dict(READ_EXPECTATIONS)
+                    expectations.update(kwargs)
+                    delivery.read_pr(Path("."), URL, **expectations)
 
     def test_final_readback_fence_rejects_dynamic_collection_change(self):
         changed = pr_value(comments=[{"id": "c", "author": None, "authorAssociation": "NONE", "body": "x",
@@ -163,7 +165,7 @@ class GithubDeliveryTests(unittest.TestCase):
              patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA, "b" * 40, SHA]), \
              patch.object(delivery, "source_identity", side_effect=[DIGEST, DIGEST]):
             with self.assertRaises(delivery.CandidateChanged):
-                delivery.read_pr(Path("."), URL, expected_repository="o/r")
+                delivery.read_pr(Path("."), URL, **READ_EXPECTATIONS)
 
     def test_final_readback_fence_rejects_moved_head(self):
         moved = "d" * 40
@@ -175,9 +177,7 @@ class GithubDeliveryTests(unittest.TestCase):
              patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA, "b" * 40, moved]), \
              patch.object(delivery, "source_identity", side_effect=[DIGEST, DIGEST]):
             with self.assertRaises(delivery.CandidateChanged):
-                delivery.read_pr(Path("."), URL, expected_repository="o/r", expected_base="campaign/razr-pi-next",
-                                 expected_base_sha="b" * 40, expected_head="feature", expected_head_sha=SHA,
-                                 expected_source_digest=DIGEST)
+                delivery.read_pr(Path("."), URL, **READ_EXPECTATIONS)
 
     def test_trailing_fence_rejects_head_move_during_final_checks(self):
         fence = {"number": 1, "url": URL, "state": "OPEN", "isDraft": False,
@@ -192,7 +192,7 @@ class GithubDeliveryTests(unittest.TestCase):
              patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA, "b" * 40, SHA, "b" * 40, "d" * 40]), \
              patch.object(delivery, "source_identity", side_effect=[DIGEST, DIGEST, DIGEST]):
             with self.assertRaises(delivery.CandidateChanged):
-                delivery.read_pr(Path("."), URL, expected_repository="o/r")
+                delivery.read_pr(Path("."), URL, **READ_EXPECTATIONS)
 
     def test_hostile_gh_host_is_overridden(self):
         with patch.dict(delivery.os.environ, {"GH_HOST": "evil.invalid"}):
@@ -528,12 +528,32 @@ class GithubDeliveryTests(unittest.TestCase):
                 self.assertEqual(cli.main(), 1)
                 self.assertIn('"code": "INVALID_REQUEST"', stream.getvalue())
                 auth.assert_not_called()
-        valid_read = '{"schema_version":1,"operation":"read","url":"https://github.com/o/r/pull/1"}'
+        bound_read = {"schema_version": 1, "operation": "read", "url": URL,
+                      "repository": "o/r", "base": "campaign/razr-pi-next", "branch": "feature",
+                      "base_sha": "b" * 40, "head_sha": SHA, "source_digest": DIGEST}
+        for missing in ("url", "repository", "base", "branch", "base_sha", "head_sha", "source_digest"):
+            request = dict(bound_read); request.pop(missing)
+            with self.subTest(missing=missing), patch.object(cli.delivery, "auth_preflight") as auth, \
+                 patch.object(cli.delivery, "read_pr") as read, patch.object(sys, "stdin", io.StringIO(json.dumps(request))), \
+                 patch.object(sys, "stdout", io.StringIO()) as stream:
+                self.assertEqual(cli.main(), 1)
+                self.assertIn('"code": "INVALID_REQUEST"', stream.getvalue())
+                auth.assert_not_called(); read.assert_not_called()
+        for malformed, value in (("url", "not-a-url"), ("repository", "bad"), ("base", "../base"),
+                                 ("branch", "../head"), ("base_sha", "bad"), ("head_sha", "bad"),
+                                 ("source_digest", "sha256:bad")):
+            request = dict(bound_read); request[malformed] = value
+            with self.subTest(malformed=malformed), patch.object(cli.delivery, "auth_preflight") as auth, \
+                 patch.object(cli.delivery, "read_pr") as read, patch.object(sys, "stdin", io.StringIO(json.dumps(request))), \
+                 patch.object(sys, "stdout", io.StringIO()) as stream:
+                self.assertEqual(cli.main(), 1)
+                self.assertIn('"code": "INVALID_REQUEST"', stream.getvalue())
+                auth.assert_not_called(); read.assert_not_called()
         for error, code in ((cli.delivery.CandidateChanged("moved"), "CANDIDATE_CHANGED"),
                             (cli.delivery.IdentityMismatch("identity"), "IDENTITY_MISMATCH"),
                             (cli.delivery.DeliveryError("network"), "PROVIDER_UNAVAILABLE")):
             with self.subTest(code=code), patch.object(cli.delivery, "auth_preflight"), \
-                 patch.object(cli.delivery, "read_pr", side_effect=error), patch.object(sys, "stdin", io.StringIO(valid_read)), \
+                 patch.object(cli.delivery, "read_pr", side_effect=error), patch.object(sys, "stdin", io.StringIO(json.dumps(bound_read))), \
                  patch.object(sys, "stdout", io.StringIO()) as stream:
                 self.assertEqual(cli.main(), 1)
                 self.assertIn('"code": "' + code + '"', stream.getvalue())

@@ -633,10 +633,21 @@ def _stable_collection(label: str, first: Any, second: Any) -> Any:
     return second
 
 
-def read_pr(root: Path, url: str, *, expected_repository: str | None = None,
-            expected_base: str | None = None, expected_base_sha: str | None = None,
-            expected_head: str | None = None, expected_head_sha: str | None = None,
-            expected_source_digest: str | None = None) -> dict[str, Any]:
+def read_pr(root: Path, url: str, *, expected_repository: str,
+            expected_base: str, expected_base_sha: str,
+            expected_head: str, expected_head_sha: str,
+            expected_source_digest: str) -> dict[str, Any]:
+    if not isinstance(expected_repository, str) or not REPOSITORY_RE.fullmatch(expected_repository):
+        raise InvalidRequest("read requires a valid repository expectation")
+    for field, value in (("base", expected_base), ("head", expected_head)):
+        if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9._/-]{1,255}", value) or ".." in value:
+            raise InvalidRequest(f"read requires a valid {field} expectation")
+    if not isinstance(expected_base_sha, str) or not SHA_RE.fullmatch(expected_base_sha):
+        raise InvalidRequest("read requires a valid base_sha expectation")
+    if not isinstance(expected_head_sha, str) or not SHA_RE.fullmatch(expected_head_sha):
+        raise InvalidRequest("read requires a valid head_sha expectation")
+    if not isinstance(expected_source_digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_source_digest):
+        raise InvalidRequest("read requires a valid source_digest expectation")
     owner, repo, number = _pr_url(url)
     repository = f"{owner}/{repo}"
     actual_repository = remote_identity(root)
@@ -650,15 +661,15 @@ def read_pr(root: Path, url: str, *, expected_repository: str | None = None,
     actual_head_sha = pushed_head(root, value["headRefName"])
     if value["baseRefOid"] != actual_base_sha or value["headRefOid"] != actual_head_sha:
         raise CandidateChanged("PR SHA differs from current remote branch")
-    if expected_repository and actual_repository.lower() != expected_repository.lower():
+    if actual_repository.lower() != expected_repository.lower():
         raise IdentityMismatch("PR repository expectation mismatch")
-    if expected_base is not None and value["baseRefName"] != expected_base:
+    if value["baseRefName"] != expected_base:
         raise IdentityMismatch("PR base branch mismatch")
-    if expected_base_sha is not None and actual_base_sha != expected_base_sha:
+    if actual_base_sha != expected_base_sha:
         raise IdentityMismatch("PR base commit mismatch")
-    if expected_head is not None and value["headRefName"] != expected_head:
+    if value["headRefName"] != expected_head:
         raise IdentityMismatch("PR head branch mismatch")
-    if expected_head_sha is not None and actual_head_sha != expected_head_sha:
+    if actual_head_sha != expected_head_sha:
         raise IdentityMismatch("PR head commit mismatch")
     checks, status = _required_checks(root, url, actual_repository)
     threads = _threads(root, owner, repo, number)
@@ -666,7 +677,7 @@ def read_pr(root: Path, url: str, *, expected_repository: str | None = None,
     value["requiredChecksStatus"] = status
     value["reviewThreads"] = threads
     actual_source_digest = source_identity(root, actual_head_sha)
-    if expected_source_digest is not None and actual_source_digest != expected_source_digest:
+    if actual_source_digest != expected_source_digest:
         raise IdentityMismatch("PR source identity mismatch")
     # Final fence after all network/page reads: branch and PR identity must
     # remain stable from the initial observation through the returned result.
@@ -691,11 +702,11 @@ def read_pr(root: Path, url: str, *, expected_repository: str | None = None,
             or final_base_sha != actual_base_sha or final_head_sha != actual_head_sha
             or final_digest != actual_source_digest):
         raise CandidateChanged("PR or remote branch identity changed during readback")
-    if expected_base_sha is not None and final_base_sha != expected_base_sha:
+    if final_base_sha != expected_base_sha:
         raise CandidateChanged("final base identity mismatch")
-    if expected_head_sha is not None and final_head_sha != expected_head_sha:
+    if final_head_sha != expected_head_sha:
         raise CandidateChanged("final head identity mismatch")
-    if expected_source_digest is not None and final_digest != expected_source_digest:
+    if final_digest != expected_source_digest:
         raise CandidateChanged("final source identity mismatch")
     # Authoritative trailing fence: no provider/network read follows this
     # candidate PR/ref/source observation.
@@ -715,11 +726,11 @@ def read_pr(root: Path, url: str, *, expected_repository: str | None = None,
             or fenced_base_sha != final_base_sha or fenced_head_sha != final_head_sha \
             or fenced_digest != final_digest:
         raise CandidateChanged("PR or remote branch identity changed during trailing readback fence")
-    if expected_base_sha is not None and fenced_base_sha != expected_base_sha:
+    if fenced_base_sha != expected_base_sha:
         raise CandidateChanged("trailing base identity mismatch")
-    if expected_head_sha is not None and fenced_head_sha != expected_head_sha:
+    if fenced_head_sha != expected_head_sha:
         raise CandidateChanged("trailing head identity mismatch")
-    if expected_source_digest is not None and fenced_digest != expected_source_digest:
+    if fenced_digest != expected_source_digest:
         raise CandidateChanged("trailing source identity mismatch")
     final_value["requiredChecks"] = final_checks
     final_value["requiredChecksStatus"] = final_status
