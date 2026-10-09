@@ -158,6 +158,13 @@ def _parse_record_line(line: bytes) -> dict[str, object]:
     return value
 
 
+def _live_repository_identity(root: Path) -> str:
+    """Resolve current core source identity; constructor values are expectations only."""
+    from .core_subprocess import _git_head, _source_digest
+    commit = _git_head(root)
+    return _source_digest(root, commit)
+
+
 def _valid_timestamp(value: object) -> bool:
     if not isinstance(value, str) or not UTC_RE.fullmatch(value):
         return False
@@ -180,19 +187,20 @@ class MemoryStore:
             raise _fail("INVALID_REQUEST", "invalid memory limit")
         if _O_NOFOLLOW is None or _O_DIRECTORY is None:
             raise _fail("UNSUPPORTED_CAPABILITY", "descriptor-safe storage is unavailable")
-        if repository is None:
-            try:
-                from .core_subprocess import _git_head, _source_digest
-                def live_repository() -> str:
-                    commit = _git_head(root)
-                    return _source_digest(root, commit)
-                repository = live_repository()
-                if repository_identity is None:
-                    repository_identity = live_repository
-            except ProtocolError as exc:
-                raise _fail("INVALID_REQUEST", "current repository identity is required") from exc
-        self.repository = validate_source_digest(repository)
-        self._repository_identity = repository_identity
+        try:
+            current_repository = validate_source_digest(_live_repository_identity(root))
+            if repository_identity is not None and validate_source_digest(repository_identity()) != current_repository:
+                raise _fail("SOURCE_CHANGED", "repository identity observer disagrees with live core identity")
+        except (OSError, ProtocolError, TypeError, ValueError) as exc:
+            if isinstance(exc, ProtocolError) and exc.code == "SOURCE_CHANGED":
+                raise
+            raise _fail("INVALID_REQUEST", "current repository identity is required") from exc
+        expected_repository = current_repository if repository is None else validate_source_digest(repository)
+        if current_repository != expected_repository:
+            raise _fail("SOURCE_CHANGED", "repository does not match expected identity",
+                        expected=expected_repository, actual=current_repository)
+        self.repository = expected_repository
+        self._repository_identity_observer = repository_identity
         self.root = root
         self.path = root / ".razr/memory.jsonl"
         self.lock_path = root / ".razr/memory.jsonl.lock"
@@ -249,13 +257,17 @@ class MemoryStore:
             raise _fail("PATH_ESCAPE", "repository root was replaced")
 
     def _verify_repository_identity(self, expected: str | None = None) -> str:
-        current = self.repository if self._repository_identity is None else self._repository_identity()
         try:
-            current = validate_source_digest(current)
-        except ProtocolError as exc:
+            current = validate_source_digest(_live_repository_identity(self.root))
+            if (self._repository_identity_observer is not None
+                    and validate_source_digest(self._repository_identity_observer()) != current):
+                raise _fail("SOURCE_CHANGED", "repository identity observer disagrees with live core identity")
+        except (OSError, ProtocolError, TypeError, ValueError) as exc:
+            if isinstance(exc, ProtocolError) and exc.code == "SOURCE_CHANGED":
+                raise
             raise _fail("SOURCE_CHANGED", "current repository identity is unavailable") from exc
-        wanted = None if expected is None else validate_source_digest(expected)
-        if wanted is not None and current != wanted:
+        wanted = self.repository if expected is None else validate_source_digest(expected)
+        if current != self.repository or current != wanted:
             raise _fail("SOURCE_CHANGED", "repository identity changed", expected=wanted, actual=current)
         return current
 
@@ -318,7 +330,7 @@ class MemoryStore:
     @contextmanager
     def _locked(self) -> Iterator[int]:
         self._verify_root()
-        observed_repository = self._verify_repository_identity()
+        observed_repository = self._verify_repository_identity(self.repository)
         storage_fd = lock_fd = -1
         locked = False
         try:

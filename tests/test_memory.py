@@ -5,6 +5,7 @@ import multiprocessing
 from pathlib import Path
 import resource
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -12,6 +13,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "packages/razr-pi"))
+from adapter.core_subprocess import _git_head, _source_digest  # noqa: E402
 from adapter.memory import GENESIS, MAX_LEDGER_BYTES, MemoryStore  # noqa: E402
 from adapter.protocol import ProtocolError, raw_file_digest  # noqa: E402
 
@@ -24,7 +26,17 @@ class MemoryTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name).resolve()
-        self.repo = "sha256:" + "a" * 64
+        env = {"PATH": __import__("os").environ.get("PATH", ""), "HOME": str(self.root),
+               "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": __import__("os").devnull,
+               "GIT_AUTHOR_NAME": "fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+               "GIT_COMMITTER_NAME": "fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid"}
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True, env=env)
+        (self.root / "tracked.txt").write_text("initial\n")
+        (self.root / "razr.yaml").write_text('{"schema_version":1,"work_root":".razr/work"}\n')
+        subprocess.run(["git", "-C", str(self.root), "add", "tracked.txt", "razr.yaml"], check=True, env=env)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-q", "-m", "initial"], check=True, env=env)
+        self.git_env = env
+        self.repo = _source_digest(self.root, _git_head(self.root))
         self.store = MemoryStore(self.root, repository=self.repo, now=lambda: "2026-01-01T00:00:00Z")
 
     def tearDown(self):
@@ -171,11 +183,11 @@ class MemoryTests(unittest.TestCase):
         evidence.write_text("one")
         digest = raw_file_digest(evidence.read_bytes())
         original_stat = __import__("os").stat
-        calls = {"count": 0}
+        calls = {"leaf": 0}
         def pathname_swap(path, *args, **kwargs):
-            calls["count"] += 1
             info = original_stat(path, *args, **kwargs)
-            if calls["count"] == 2:
+            if path == "identity.txt": calls["leaf"] += 1
+            if path == "identity.txt" and calls["leaf"] == 1:
                 values = list(info); values[1] += 1
                 return type(info)(values)
             return info
@@ -282,14 +294,37 @@ class MemoryTests(unittest.TestCase):
             finally:
                 resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
 
+    def test_explicit_repository_is_expected_not_authority_after_commit(self):
+        record = self.store.remember(kind="learning", summary="old source", repository=self.repo)
+        (self.root / "tracked.txt").write_text("changed\n")
+        subprocess.run(["git", "-C", str(self.root), "add", "tracked.txt"], check=True, env=self.git_env)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-q", "-m", "changed"], check=True, env=self.git_env)
+        current = _source_digest(self.root, _git_head(self.root))
+        self.assertNotEqual(current, self.repo)
+        operations = (
+            self.store.inspect,
+            self.store.recall,
+            lambda: self.store.remember(kind="learning", summary="wrong source", repository=self.repo),
+            lambda: self.store.retire(record["id"]),
+            lambda: self.store.supersede(record["id"], summary="wrong source"),
+        )
+        for operation in operations:
+            with self.subTest(operation=operation), self.assertRaises(ProtocolError) as caught:
+                operation()
+            self.assertEqual(caught.exception.code, "SOURCE_CHANGED")
+        with self.assertRaises(ProtocolError) as caught:
+            MemoryStore(self.root, repository=self.repo)
+        self.assertEqual(caught.exception.code, "SOURCE_CHANGED")
+        with MemoryStore(self.root, repository=current) as current_store:
+            recalled = current_store.recall(repository=current)
+        self.assertEqual(recalled["records"], [])
+        self.assertEqual(recalled["stale_ids"], [record["id"]])
+
     def test_repository_scope_bounds_permissions_and_secret_heuristics(self):
-        current = [self.repo]
-        with MemoryStore(self.root, repository=self.repo, repository_identity=lambda: current[0]) as store:
-            record = store.remember(kind="learning", summary="repository scoped", repository=self.repo)
-            current[0] = "sha256:" + "b" * 64
-            recalled = store.recall(repository=current[0])
-            self.assertEqual(recalled["records"], [])
-            self.assertEqual(recalled["stale_ids"], [record["id"]])
+        record = self.store.remember(kind="learning", summary="repository scoped", repository=self.repo)
+        recalled = self.store.recall(repository=self.repo)
+        self.assertEqual([row["id"] for row in recalled["records"]], [record["id"]])
+        self.assertEqual(recalled["stale_ids"], [])
 
         for secret in ("AKIAABCDEFGHIJKLMNOP", "https://user:password@example.invalid/path",
                        "eyJabcdefgh.abcdefgh.abcdefgh", "secret_b64=YWJjZGVmZ2hpamtsbW5vcA==",
@@ -345,7 +380,9 @@ class MemoryTests(unittest.TestCase):
             def reject_directory_fsync(fd):
                 if stat.S_ISDIR(__import__("os").fstat(fd).st_mode): raise OSError("directory fsync")
                 return actual_fsync(fd)
-            with MemoryStore(root, repository=self.repo) as store, patch("adapter.memory.os.fsync", side_effect=reject_directory_fsync):
+            with patch("adapter.memory._live_repository_identity", return_value=self.repo), \
+                 MemoryStore(root, repository=self.repo) as store, \
+                 patch("adapter.memory.os.fsync", side_effect=reject_directory_fsync):
                 with self.assertRaises(ProtocolError) as caught:
                     store.remember(kind="learning", summary="durability", repository=self.repo)
             self.assertEqual(caught.exception.code, "LEDGER_CORRUPT")

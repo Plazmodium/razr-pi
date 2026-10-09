@@ -7,7 +7,6 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
-import stat
 import subprocess
 from typing import Any, Callable, Mapping
 
@@ -24,12 +23,17 @@ _CONFIG_NAMES = {"razr.yaml", "package.json", "pyproject.toml", "tsconfig.json"}
 _PRIVATE_DIRS = {".git", ".razr", ".hg", ".svn", ".venv", "venv", "node_modules", "dist", "build", "target", "vendor", "__pycache__", ".cache", "cache", "tmp", "temp", ".pi", ".herdr"}
 _PRIVATE_NAMES = {".env", ".env.local", ".envrc", "credentials", "secrets"}
 _MAX_DISCOVERED = 4096
-_MAX_VISITED_DIRS = 512
-_MAX_DIR_ENTRIES = 512
 _MAX_VISITED_ENTRIES = 8192
-_MAX_QUEUE = 512
-_MAX_DEPTH = 16
 _MAX_HISTORY_BYTES = 64 * 1024
+_MAX_TREE_BYTES = 4 * 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class _SnapshotFile:
+    ref: str
+    object_id: str
+    mode: str
+    commit: str
 
 
 def _error(code: str, message: str, **details: object) -> ProtocolError:
@@ -143,90 +147,6 @@ def _deny_ref(ref: str) -> None:
         raise _error("PATH_ESCAPE", "private or control path refused", ref=ref)
 
 
-def _identity(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
-    return info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size, info.st_mtime_ns
-
-
-def _open_nofollow(root: Path, ref: str) -> tuple[int, int, os.stat_result]:
-    """Open every component from a pinned root FD and retain the leaf parent."""
-    parts = PurePosixPath(_ref(ref)).parts
-    _deny_ref(ref)
-    nofollow = getattr(os, "O_NOFOLLOW", 0)
-    directory = getattr(os, "O_DIRECTORY", 0)
-    root_fd = current = leaf = -1
-    try:
-        root_fd = current = os.open(root, os.O_RDONLY | directory | nofollow)
-        root_info = os.fstat(root_fd)
-        path_info = os.stat(root, follow_symlinks=False)
-        if not stat.S_ISDIR(root_info.st_mode) or _identity(root_info)[:2] != _identity(path_info)[:2]:
-            raise _error("SOURCE_CHANGED", "repository root identity changed")
-        for part in parts[:-1]:
-            child = os.open(part, os.O_RDONLY | directory | nofollow, dir_fd=current)
-            child_info = os.fstat(child)
-            path_child = os.stat(part, dir_fd=current, follow_symlinks=False)
-            if not stat.S_ISDIR(child_info.st_mode) or _identity(child_info)[:2] != _identity(path_child)[:2]:
-                os.close(child)
-                raise _error("PATH_ESCAPE", "repository directory identity changed", ref=ref)
-            if current != root_fd:
-                os.close(current)
-            current = child
-        leaf = os.open(parts[-1], os.O_RDONLY | nofollow, dir_fd=current)
-        if current == root_fd:
-            root_fd = -1
-        elif root_fd >= 0:
-            os.close(root_fd)
-            root_fd = -1
-        return leaf, current, root_info
-    except ProtocolError:
-        for fd in {leaf, current, root_fd}:
-            if fd >= 0:
-                try: os.close(fd)
-                except OSError: pass
-        raise
-    except OSError as exc:
-        for fd in {leaf, current, root_fd}:
-            if fd >= 0:
-                try: os.close(fd)
-                except OSError: pass
-        raise _error("PATH_ESCAPE", "repository path cannot be opened safely", ref=ref) from exc
-
-
-def _read_bounded(root: Path, ref: str, max_content: int) -> tuple[bytes, str, int] | None:
-    """Read one stable regular file and reject pathname/root races."""
-    if max_content <= 0: return None
-    fd, parent_fd, root_before = _open_nofollow(root, ref)
-    leaf = PurePosixPath(ref).name
-    try:
-        before = os.fstat(fd)
-        path_before = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
-        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-            return None
-        if _identity(before) != _identity(path_before):
-            raise _error("SOURCE_CHANGED", "selected file pathname identity changed", ref=ref)
-        data = bytearray()
-        while len(data) <= max_content:
-            chunk = os.read(fd, min(65536, max_content + 1 - len(data)))
-            if not chunk: break
-            data.extend(chunk)
-        after = os.fstat(fd)
-        path_after = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
-        root_after = os.stat(root, follow_symlinks=False)
-        if (_identity(before) != _identity(after) or _identity(after) != _identity(path_after)
-                or _identity(root_before)[:2] != _identity(root_after)[:2]):
-            raise _error("SOURCE_CHANGED", "selected file or repository changed during read", ref=ref)
-        if len(data) > max_content:
-            return None
-        raw = bytes(data)
-        return raw, raw_file_digest(raw), len(raw)
-    except ProtocolError:
-        raise
-    except OSError as exc:
-        raise _error("SOURCE_CHANGED", "bounded descriptor read raced with source change", ref=ref) from exc
-    finally:
-        os.close(fd)
-        os.close(parent_fd)
-
-
 def _git_env(git: Path) -> dict[str, str]:
     return {"PATH": str(git.parent), "HOME": os.devnull, "LANG": "C", "LC_ALL": "C",
             "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_SYSTEM": os.devnull,
@@ -234,7 +154,80 @@ def _git_env(git: Path) -> dict[str, str]:
             "GIT_OPTIONAL_LOCKS": "0", "GIT_PAGER": "cat"}
 
 
-def _git_history(root: Path) -> list[dict[str, str]]:
+def _git_tree(root: Path, commit: str) -> dict[str, _SnapshotFile]:
+    """Return tracked regular files from one immutable committed tree."""
+    validate_git_object_id(commit)
+    found = shutil.which("git")
+    if not found:
+        raise _error("INTERNAL", "Git executable unavailable")
+    git = Path(found).resolve(strict=True)
+    argv = [str(git), "-C", str(root), "ls-tree", "-r", "-z", "--full-tree", commit]
+    try:
+        result = subprocess.run(argv, cwd=root, env=_git_env(git), stdin=subprocess.DEVNULL,
+                                capture_output=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise _error("SOURCE_CHANGED", "immutable Git tree read failed") from exc
+    if result.returncode or result.stderr:
+        raise _error("SOURCE_CHANGED", "immutable Git tree unavailable")
+    if len(result.stdout) > _MAX_TREE_BYTES:
+        raise _error("LIMIT_EXCEEDED", "Git tree output exceeded bound")
+    files: dict[str, _SnapshotFile] = {}
+    try:
+        entries = result.stdout.split(b"\0")
+        if entries[-1] != b"":
+            raise ValueError("unterminated tree entry")
+        if len(entries) - 1 > _MAX_VISITED_ENTRIES:
+            raise _error("LIMIT_EXCEEDED", "Git tree entry count exceeded bound")
+        for raw in entries[:-1]:
+            metadata, separator, raw_ref = raw.partition(b"\t")
+            mode, kind, object_id = metadata.decode("ascii").split(" ")
+            ref = raw_ref.decode("utf-8")
+            _ref(ref)
+            validate_git_object_id(object_id)
+            if not separator or ref in files:
+                raise ValueError("malformed or duplicate tree entry")
+            if kind == "blob" and mode in {"100644", "100755"}:
+                files[ref] = _SnapshotFile(ref, object_id, mode, commit)
+    except (UnicodeError, ValueError, ProtocolError) as exc:
+        if isinstance(exc, ProtocolError) and exc.code == "LIMIT_EXCEEDED":
+            raise
+        raise _error("SOURCE_CHANGED", "immutable Git tree response malformed") from exc
+    return files
+
+
+def _git_blob(root: Path, snapshot: _SnapshotFile, maximum: int) -> bytes | None:
+    """Read content-addressed bytes, never the mutable worktree pathname."""
+    if maximum <= 0:
+        return None
+    found = shutil.which("git")
+    if not found:
+        raise _error("INTERNAL", "Git executable unavailable")
+    git = Path(found).resolve(strict=True)
+    base = [str(git), "-C", str(root), "cat-file"]
+    try:
+        size_result = subprocess.run([*base, "-s", snapshot.object_id], cwd=root, env=_git_env(git),
+                                     stdin=subprocess.DEVNULL, capture_output=True, timeout=10, check=False)
+        if size_result.returncode or size_result.stderr:
+            raise ValueError("size query failed")
+        size = int(size_result.stdout.strip())
+        if size < 0:
+            raise ValueError("negative size")
+        if size > maximum:
+            return None
+        blob = subprocess.run([*base, "blob", snapshot.object_id], cwd=root, env=_git_env(git),
+                              stdin=subprocess.DEVNULL, capture_output=True, timeout=10, check=False)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        raise _error("SOURCE_CHANGED", "immutable Git blob read failed", ref=snapshot.ref) from exc
+    if blob.returncode or blob.stderr or len(blob.stdout) != size:
+        raise _error("SOURCE_CHANGED", "immutable Git blob identity changed", ref=snapshot.ref)
+    algorithm = hashlib.sha1 if len(snapshot.object_id) == 40 else hashlib.sha256
+    identity = algorithm(b"blob " + str(size).encode("ascii") + b"\0" + blob.stdout).hexdigest()
+    if identity != snapshot.object_id:
+        raise _error("SOURCE_CHANGED", "immutable Git blob digest changed", ref=snapshot.ref)
+    return blob.stdout
+
+
+def _git_history(root: Path, commit: str) -> list[dict[str, str]]:
     found = shutil.which("git")
     if not found:
         raise _error("INTERNAL", "Git executable unavailable")
@@ -242,7 +235,7 @@ def _git_history(root: Path) -> list[dict[str, str]]:
     if not git.is_file() or git.is_symlink():
         raise _error("INTERNAL", "Git executable is not canonical")
     argv = [str(git), "-C", str(root), "--no-pager", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
-            "log", "-8", "--format=%H%x09%.500s"]
+            "log", "-8", "--format=%H%x09%.500s", commit]
     try:
         result = subprocess.run(argv, cwd=root, env=_git_env(git), stdin=subprocess.DEVNULL,
                                 capture_output=True, timeout=10, check=True)
@@ -271,100 +264,53 @@ class ContextEngine:
         self.core_request = core_request
         self.workflow = workflow
 
-    def _candidate_files(self, request: ContextRequest) -> tuple[list[str], list[dict[str, str]]]:
+    def _candidate_files(self, request: ContextRequest, commit: str) -> tuple[list[_SnapshotFile], list[dict[str, str]]]:
         objective = set(re.findall(r"[a-z0-9][a-z0-9_.-]{2,}", request.objective.lower()))
+        tree = _git_tree(self.root, commit)
         refs: list[str] = []
         omitted: list[dict[str, str]] = []
         seen: set[str] = set()
-        # Explicit paths use exactly the same policy as discovery; they cannot bypass controls.
+        # Explicit context is tracked committed evidence only; untracked/live paths are unsupported.
         for ref in request.paths:
             _deny_ref(_ref(ref))
-            fd, parent_fd, _ = _open_nofollow(self.root, ref)
-            try:
-                info = os.fstat(fd)
-                path_info = os.stat(PurePosixPath(ref).name, dir_fd=parent_fd, follow_symlinks=False)
-                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or _identity(info) != _identity(path_info):
-                    raise _error("PATH_ESCAPE", "explicit path is not a stable private regular file", ref=ref)
-            finally:
-                os.close(fd)
-                os.close(parent_fd)
+            if ref not in tree:
+                raise _error("SOURCE_CHANGED", "explicit context path is not a tracked regular file", ref=ref)
             refs.append(ref); seen.add(ref)
-        nofollow = getattr(os, "O_NOFOLLOW", 0)
-        directory_flag = getattr(os, "O_DIRECTORY", 0)
-        try:
-            root_fd = os.open(self.root, os.O_RDONLY | directory_flag | nofollow)
-        except OSError as exc:
-            raise _error("SOURCE_CHANGED", "repository root cannot be pinned") from exc
-        queue: list[tuple[int, str, int]] = [(root_fd, ".", 0)]
-        visited_dirs = visited_entries = discovered = 0
-        try:
-            while queue and visited_dirs < _MAX_VISITED_DIRS and visited_entries < _MAX_VISITED_ENTRIES and discovered < _MAX_DISCOVERED:
-                directory_fd, directory_ref, depth = queue.pop(0); visited_dirs += 1
-                try:
-                    with os.scandir(directory_fd) as scan:
-                        entries = []
-                        for _ in range(_MAX_DIR_ENTRIES + 1):
-                            try: entry = next(scan)
-                            except StopIteration: break
-                            entries.append(entry)
-                    entries.sort(key=lambda entry: entry.name)
-                    if len(entries) > _MAX_DIR_ENTRIES:
-                        omitted.append({"ref": directory_ref, "reason": "limit"})
-                        entries = entries[:_MAX_DIR_ENTRIES]
-                    for entry in entries:
-                        visited_entries += 1
-                        ref = entry.name if directory_ref == "." else directory_ref + "/" + entry.name
-                        if entry.name in _PRIVATE_DIRS or entry.name in _PRIVATE_NAMES or entry.name.startswith(".env"):
-                            omitted.append({"ref": ref, "reason": "unsafe"}); continue
-                        try: info = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
-                        except OSError:
-                            omitted.append({"ref": ref, "reason": "unsafe"}); continue
-                        if stat.S_ISDIR(info.st_mode):
-                            if depth >= _MAX_DEPTH or len(queue) >= _MAX_QUEUE:
-                                omitted.append({"ref": ref, "reason": "limit"})
-                                continue
-                            try:
-                                child_fd = os.open(entry.name, os.O_RDONLY | directory_flag | nofollow, dir_fd=directory_fd)
-                                child_info = os.fstat(child_fd)
-                                path_info = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
-                                if not stat.S_ISDIR(child_info.st_mode) or _identity(child_info)[:2] != _identity(path_info)[:2]:
-                                    os.close(child_fd)
-                                    raise OSError("directory identity changed")
-                            except OSError:
-                                omitted.append({"ref": ref, "reason": "unsafe"}); continue
-                            queue.append((child_fd, ref, depth + 1))
-                            continue
-                        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or Path(entry.name).suffix.lower() not in _TEXT_SUFFIXES:
-                            continue
-                        discovered += 1
-                        if ref not in seen: refs.append(ref); seen.add(ref)
-                finally:
-                    os.close(directory_fd)
-            if queue or visited_dirs >= _MAX_VISITED_DIRS or visited_entries >= _MAX_VISITED_ENTRIES or discovered >= _MAX_DISCOVERED:
-                omitted.append({"ref": ".", "reason": "limit"})
-        finally:
-            for directory_fd, _, _ in queue:
-                try: os.close(directory_fd)
-                except OSError: pass
+        for ref in sorted(tree):
+            try:
+                _deny_ref(ref)
+            except ProtocolError:
+                omitted.append({"ref": ref, "reason": "unsafe"})
+                continue
+            if Path(ref).suffix.lower() in _TEXT_SUFFIXES and ref not in seen:
+                refs.append(ref); seen.add(ref)
+        if len(refs) > _MAX_DISCOVERED:
+            omitted.append({"ref": ".", "reason": "limit"})
+            refs = refs[:_MAX_DISCOVERED]
         def score(ref: str) -> tuple[int, str]:
             low, base = ref.lower(), Path(ref).name.lower(); rank = 0
             if any(token in low for token in objective): rank -= 30
             if base in {"readme.md", "razr.yaml", "pyproject.toml", "package.json"}: rank -= 20
             if "/test" in low or base.startswith("test_"): rank -= 10
             return rank, ref
-        return sorted(refs, key=score), omitted
+        return [tree[ref] for ref in sorted(refs, key=score)], omitted
 
-    def _item_file(self, ref: str, remaining: int) -> dict[str, object] | None:
+    def _item_file(self, snapshot: _SnapshotFile, remaining: int) -> dict[str, object] | None:
+        ref = snapshot.ref
         _deny_ref(_ref(ref))
-        value = _read_bounded(self.root, ref, remaining)
-        if value is None: return None
-        content, digest, total = value
+        content = _git_blob(self.root, snapshot, remaining)
+        if content is None: return None
+        digest = raw_file_digest(content)
         try: text = content.decode("utf-8")
         except UnicodeDecodeError:
             return {"kind": "file", "ref": ref, "digest_domain": "raw_file", "digest": digest, "bytes": 0,
-                    "reason": "binary metadata", "authority": "repository", "metadata": {"type": "binary", "ref": ref}}
+                    "reason": "binary metadata", "authority": "repository",
+                    "metadata": {"type": "git_blob", "ref": ref, "object": snapshot.object_id,
+                                 "mode": snapshot.mode, "commit": snapshot.commit, "encoding": "binary"}}
         return {"kind": "file", "ref": ref, "digest_domain": "raw_file", "digest": digest, "bytes": len(content),
-                "reason": "selected bounded repository evidence", "authority": "repository", "content_utf8": text}
+                "reason": "selected bounded repository evidence", "authority": "repository", "content_utf8": text,
+                "metadata": {"type": "git_blob", "ref": ref, "object": snapshot.object_id,
+                             "mode": snapshot.mode, "commit": snapshot.commit, "encoding": "utf-8"}}
 
     @staticmethod
     def _workflow_value(read: WorkflowRead) -> dict[str, object]:
@@ -445,23 +391,24 @@ class ContextEngine:
                           "reason": "shared core status/validate/readback", "authority": "repository",
                           "metadata": {"type": "core_readback", "ref": read.work_id,
                                        "note": "relevant state only; raw state is not dumped"}})
-        refs, discovery_omitted = self._candidate_files(parsed); omitted.extend(discovery_omitted)
-        for ref in refs:
+        snapshots, discovery_omitted = self._candidate_files(parsed, initial_commit); omitted.extend(discovery_omitted)
+        for snapshot in snapshots:
+            ref = snapshot.ref
             is_test = "/test" in ref.lower() or Path(ref).name.startswith("test_")
             is_config = Path(ref).name in _CONFIG_NAMES or Path(ref).suffix.lower() in {".toml", ".ini"}
             kind = "tests" if is_test and parsed.include["tests"] else "config" if is_config and parsed.include["config"] else "source" if parsed.include["source"] else None
             if kind is None: continue
             if len(items) >= parsed.limits["max_files"] or used >= parsed.limits["max_bytes"]:
                 omitted.append({"ref": ref, "reason": "limit"}); continue
-            item = self._item_file(ref, parsed.limits["max_bytes"] - used)
+            item = self._item_file(snapshot, parsed.limits["max_bytes"] - used)
             if item is None: omitted.append({"ref": ref, "reason": "unsafe"}); continue
             item["reason"] = f"selected bounded {kind} evidence"; items.append(item); used += int(item["bytes"])
         if parsed.include["git"]:
-            entries = _git_history(self.root)
-            items.append({"kind": "git_history", "ref": "HEAD", "digest_domain": "canonical_json",
+            entries = _git_history(self.root, initial_commit)
+            items.append({"kind": "git_history", "ref": initial_commit, "digest_domain": "canonical_json",
                           "digest": raw_file_digest(canonical_json(entries)), "bytes": 0,
                           "reason": "bounded recent history", "authority": "repository",
-                          "metadata": {"type": "git_history", "ref": "HEAD", "note": "8 commits maximum"}})
+                          "metadata": {"type": "git_history", "ref": initial_commit, "note": "8 commits maximum; immutable commit snapshot"}})
         stale: list[str] = []
         if parsed.include["memory"]:
             if self.memory is None: raise _error("MEMORY_UNAVAILABLE", "Memory recall boundary unavailable", retryable=True)

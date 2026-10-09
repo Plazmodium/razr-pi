@@ -554,7 +554,7 @@ class HerdrProviderTests(unittest.TestCase):
             ledger = AttemptLedger(base / "attempts.jsonl"); calls = []
             provider = HerdrProvider(runner=lambda argv, **kwargs: calls.append(argv), ledger=ledger, private_root=private)
             reads = {"count": 0}
-            def slow_final(_request):
+            def slow_final(_request, **_kwargs):
                 reads["count"] += 1
                 if reads["count"] == 2: time.sleep(.06)
                 return current
@@ -565,6 +565,38 @@ class HerdrProviderTests(unittest.TestCase):
             self.assertEqual(calls, [])
             self.assertEqual([row["event"] for row in ledger.records()], ["STARTED", "SETTLED"])
 
+    def test_concurrent_launches_keep_distinct_explicit_deadlines(self):
+        observed = []
+        lock = threading.Lock()
+        barrier = threading.Barrier(2)
+        def runner(argv, **kwargs):
+            with lock: observed.append((argv[-1], kwargs["timeout"]))
+            return subprocess.CompletedProcess(argv, 0, b"ok", b"")
+        provider = HerdrProvider(runner=runner)
+        def bounded_launch(request, _started, deadline_at):
+            barrier.wait(timeout=2)
+            provider._exec(["herdr", "deadline", request["request_id"]], timeout_ms=10_000,
+                           deadline_at=deadline_at)
+            return {"request_id": request["request_id"]}
+        provider._launch = bounded_launch  # type: ignore[method-assign]
+        requests = [
+            {"request_id": "short", "limits": {"deadline_ms": 800}},
+            {"request_id": "long", "limits": {"deadline_ms": 5000}},
+        ]
+        results = []; failures = []
+        def run(request):
+            try: results.append(provider.launch(request))
+            except Exception as exc: failures.append(exc)
+        threads = [threading.Thread(target=run, args=(request,)) for request in requests]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join(3)
+        self.assertFalse(failures)
+        self.assertEqual({row["request_id"] for row in results}, {"short", "long"})
+        bounds = dict(observed)
+        self.assertLessEqual(bounds["short"], .8)
+        self.assertGreater(bounds["long"] - bounds["short"], 3.5)
+        self.assertFalse(hasattr(provider, "_operation_deadline_at"))
+
     def test_native_command_boundary_streams_kills_groups_and_rejects_symlinks(self):
         python = str(Path(sys.executable).resolve())
         provider = HerdrProvider(herdr=python, pi=python)
@@ -574,12 +606,18 @@ class HerdrProviderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             pidfile = Path(tmp) / "child.pid"
             script = ("import os,subprocess,sys,time; subprocess.Popen([sys.executable,'-c',"
-                      "'import os,sys,time; open(sys.argv[1],\"w\").write(str(os.getpid())); time.sleep(10)',sys.argv[1]]); time.sleep(10)")
+                      "'import os,sys,time; p=sys.argv[1]; t=p+\".tmp\"; f=open(t,\"w\"); f.write(str(os.getpid())); f.flush(); os.fsync(f.fileno()); f.close(); os.replace(t,p); time.sleep(10)',sys.argv[1]]); time.sleep(10)")
             with self.assertRaises(ProtocolError) as caught:
                 provider._exec([python, "-c", script, str(pidfile)], timeout_ms=100, max_output=1024)
             self.assertEqual(caught.exception.code, "TIMEOUT")
-            if pidfile.exists():
-                pid = int(pidfile.read_text())
+            pid = None
+            for _ in range(50):
+                try:
+                    candidate = int(pidfile.read_text().strip())
+                    if candidate > 1: pid = candidate; break
+                except (FileNotFoundError, ValueError):
+                    time.sleep(.01)
+            if pid is not None:
                 for _ in range(50):
                     try: os.kill(pid, 0)
                     except ProcessLookupError: break
@@ -588,12 +626,18 @@ class HerdrProviderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             pidfile = Path(tmp) / "orphan.pid"
             script = ("import subprocess,sys; subprocess.Popen([sys.executable,'-c',"
-                      "'import os,sys,time; os.close(1); os.close(2); open(sys.argv[1],\"w\").write(str(os.getpid())); time.sleep(10)',sys.argv[1]])")
+                      "'import os,sys,time; os.close(1); os.close(2); p=sys.argv[1]; t=p+\".tmp\"; f=open(t,\"w\"); f.write(str(os.getpid())); f.flush(); os.fsync(f.fileno()); f.close(); os.replace(t,p); time.sleep(10)',sys.argv[1]])")
             with self.assertRaises(ProtocolError) as caught:
                 provider._exec([python, "-c", script, str(pidfile)], timeout_ms=1000, max_output=1024)
             self.assertEqual(caught.exception.code, "CLEANUP_UNKNOWN")
-            if pidfile.exists():
-                pid = int(pidfile.read_text())
+            pid = None
+            for _ in range(50):
+                try:
+                    candidate = int(pidfile.read_text().strip())
+                    if candidate > 1: pid = candidate; break
+                except (FileNotFoundError, ValueError):
+                    time.sleep(.01)
+            if pid is not None:
                 for _ in range(50):
                     try: os.kill(pid, 0)
                     except ProcessLookupError: break

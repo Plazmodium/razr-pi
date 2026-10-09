@@ -565,7 +565,6 @@ class HerdrProvider:
         self.ledger = ledger
         self.private_root = private_root
         self.core_request = core_request
-        self._operation_deadline_at: float | None = None
         self._settled: set[str] = set()  # cache only; durable ledger remains authoritative
         self._attempt_paths: dict[str, Path] = {}
         self._attempt_sessions: dict[str, Path] = {}
@@ -625,10 +624,11 @@ class HerdrProvider:
             time.sleep(0.01)
         raise _fail("CLEANUP_UNKNOWN", "Herdr process-group cleanup could not be verified")
 
-    def _exec(self, argv: Sequence[str], *, timeout_ms: int, cwd: Path | None = None, max_output: int = 1_048_576) -> bytes:
+    def _exec(self, argv: Sequence[str], *, timeout_ms: int, cwd: Path | None = None,
+              max_output: int = 1_048_576, deadline_at: float | None = None) -> bytes:
         if not argv or any(not isinstance(arg, str) or not arg or "\x00" in arg for arg in argv): raise _fail("INVALID_REQUEST", "invalid argv")
         if timeout_ms <= 0 or max_output <= 0: raise _fail("INVALID_REQUEST", "bounds must be positive")
-        timeout_ms = self._remaining_ms(self._operation_deadline_at, timeout_ms)
+        timeout_ms = self._remaining_ms(deadline_at, timeout_ms)
         command_argv = list(argv)
         if not self._resolved:
             old_herdr, old_pi = self.herdr, self.pi
@@ -719,7 +719,7 @@ class HerdrProvider:
         return getattr(self._handle, "__func__", None) is HerdrProvider._handle and getattr(self._inspect_handle, "__func__", None) is HerdrProvider._inspect_handle
 
     def _model(self, deadline_at: float | None = None) -> str:
-        try: output = self._exec([self.pi, "--list-models", "gpt-5.6-luna"], timeout_ms=self._remaining_ms(deadline_at, 10_000), max_output=262_144).decode("utf-8", "strict")
+        try: output = self._exec([self.pi, "--list-models", "gpt-5.6-luna"], timeout_ms=10_000, max_output=262_144, deadline_at=deadline_at).decode("utf-8", "strict")
         except UnicodeDecodeError as exc: raise _fail("UNSUPPORTED_CAPABILITY", "Pi model table is not UTF-8") from exc
         lines = [line.strip() for line in output.splitlines() if line.strip()]
         if len(lines) < 2: raise _fail("UNSUPPORTED_CAPABILITY", "Pi model table is malformed")
@@ -757,14 +757,14 @@ class HerdrProvider:
         if runtime["provider"] != "openai-codex" or runtime["model"] != _MODEL or runtime["thinking"] != "medium": raise _fail("UNSUPPORTED_CAPABILITY", "exact Pi runtime required")
         _host()
         if any(cap not in _CAPABILITIES for cap in caps): raise _fail("UNSUPPORTED_CAPABILITY", "unknown capability")
-        herdr_help = self._exec([self.herdr, "--help"], timeout_ms=self._remaining_ms(deadline_at, 10_000), max_output=262_144).decode("utf-8", "replace")
-        agent_help = self._exec([self.herdr, "agent", "--help"], timeout_ms=self._remaining_ms(deadline_at, 10_000), max_output=262_144).decode("utf-8", "replace")
-        read_help = self._exec([self.herdr, "agent", "read", "--help"], timeout_ms=self._remaining_ms(deadline_at, 10_000), max_output=262_144).decode("utf-8", "replace")
-        worktree_help = self._exec([self.herdr, "worktree", "--help"], timeout_ms=self._remaining_ms(deadline_at, _CLI_TIMEOUT_MS), max_output=_CLI_MAX_OUTPUT).decode("utf-8", "replace")
-        worktree_open_help = self._exec([self.herdr, "worktree", "open", "--help"], timeout_ms=self._remaining_ms(deadline_at, _CLI_TIMEOUT_MS), max_output=_CLI_MAX_OUTPUT).decode("utf-8", "replace")
-        pane_help = self._exec([self.herdr, "pane", "--help"], timeout_ms=self._remaining_ms(deadline_at, _CLI_TIMEOUT_MS), max_output=_CLI_MAX_OUTPUT).decode("utf-8", "replace")
-        pane_get_help = self._exec([self.herdr, "pane", "get", "--help"], timeout_ms=self._remaining_ms(deadline_at, _CLI_TIMEOUT_MS), max_output=_CLI_MAX_OUTPUT).decode("utf-8", "replace")
-        pi_help = self._exec([self.pi, "--help"], timeout_ms=self._remaining_ms(deadline_at, 10_000), max_output=262_144).decode("utf-8", "replace")
+        herdr_help = self._exec([self.herdr, "--help"], timeout_ms=10_000, max_output=262_144, deadline_at=deadline_at).decode("utf-8", "replace")
+        agent_help = self._exec([self.herdr, "agent", "--help"], timeout_ms=10_000, max_output=262_144, deadline_at=deadline_at).decode("utf-8", "replace")
+        read_help = self._exec([self.herdr, "agent", "read", "--help"], timeout_ms=10_000, max_output=262_144, deadline_at=deadline_at).decode("utf-8", "replace")
+        worktree_help = self._exec([self.herdr, "worktree", "--help"], timeout_ms=_CLI_TIMEOUT_MS, max_output=_CLI_MAX_OUTPUT, deadline_at=deadline_at).decode("utf-8", "replace")
+        worktree_open_help = self._exec([self.herdr, "worktree", "open", "--help"], timeout_ms=_CLI_TIMEOUT_MS, max_output=_CLI_MAX_OUTPUT, deadline_at=deadline_at).decode("utf-8", "replace")
+        pane_help = self._exec([self.herdr, "pane", "--help"], timeout_ms=_CLI_TIMEOUT_MS, max_output=_CLI_MAX_OUTPUT, deadline_at=deadline_at).decode("utf-8", "replace")
+        pane_get_help = self._exec([self.herdr, "pane", "get", "--help"], timeout_ms=_CLI_TIMEOUT_MS, max_output=_CLI_MAX_OUTPUT, deadline_at=deadline_at).decode("utf-8", "replace")
+        pi_help = self._exec([self.pi, "--help"], timeout_ms=10_000, max_output=262_144, deadline_at=deadline_at).decode("utf-8", "replace")
         self._model(deadline_at)
         capabilities = set()
         if "--no-session" in pi_help and "--session" in pi_help and "--continue" in pi_help and "--resume" in pi_help:
@@ -814,13 +814,14 @@ class HerdrProvider:
         normalized = self._parse_worktree_response(response, None)
         return {**response, "result": normalized}
 
-    def worktree_open(self, *, path: str) -> dict[str, object]:
+    def worktree_open(self, *, path: str, deadline_at: float | None = None) -> dict[str, object]:
         root = _canonical_dir(path, "worktree")
-        response = _envelope(self._exec([self.herdr, "worktree", "open", "--path", str(root), "--no-focus"], timeout_ms=120_000), "worktree", {"cli:worktree:open"})
+        response = _envelope(self._exec([self.herdr, "worktree", "open", "--path", str(root), "--no-focus"], timeout_ms=120_000, deadline_at=deadline_at), "worktree", {"cli:worktree:open"})
         return {**response, "result": self._parse_worktree_response(response, root)}
 
-    def _resolve_existing_worktree(self, path: Path, expected_host: Mapping[str, object] | None = None) -> dict[str, str] | None:
-        response = _envelope(self._exec([self.herdr, "worktree", "list", "--cwd", str(path)], timeout_ms=_CLI_TIMEOUT_MS), "worktree list", {"cli:worktree:list"})
+    def _resolve_existing_worktree(self, path: Path, expected_host: Mapping[str, object] | None = None,
+                                   *, deadline_at: float | None = None) -> dict[str, str] | None:
+        response = _envelope(self._exec([self.herdr, "worktree", "list", "--cwd", str(path)], timeout_ms=_CLI_TIMEOUT_MS, deadline_at=deadline_at), "worktree list", {"cli:worktree:list"})
         result = _closed(response["result"], {"source", "type", "worktrees"}, "worktree list result")
         _closed(result["source"], {"repo_key", "repo_name", "repo_root", "source_checkout_path", "source_workspace_id"}, "worktree list source")
         if result["type"] != "worktree_list" or not isinstance(result["worktrees"], list): raise _fail("HERDR_IDENTITY_INCOMPLETE", "worktree list is malformed")
@@ -837,7 +838,7 @@ class HerdrProvider:
         if len(matches) > 1: raise _fail("IDENTITY_MISMATCH", "duplicate worktree paths are listed")
         if not matches or "open_workspace_id" not in matches[0]: return None
         workspace_id = matches[0]["open_workspace_id"]; _id(workspace_id, "workspace_id")
-        panes_response = _envelope(self._exec([self.herdr, "pane", "list", "--workspace", workspace_id], timeout_ms=_CLI_TIMEOUT_MS), "pane list", {"cli:pane:list"})
+        panes_response = _envelope(self._exec([self.herdr, "pane", "list", "--workspace", workspace_id], timeout_ms=_CLI_TIMEOUT_MS, deadline_at=deadline_at), "pane list", {"cli:pane:list"})
         panes_result = _closed(panes_response["result"], {"panes", "type"}, "pane list result")
         if panes_result["type"] != "pane_list" or not isinstance(panes_result["panes"], list): raise _fail("HERDR_IDENTITY_INCOMPLETE", "pane list is malformed")
         roots = []
@@ -856,33 +857,35 @@ class HerdrProvider:
         elif len(roots) != 1: raise _fail("IDENTITY_MISMATCH", "open worktree root pane is ambiguous")
         return {"workspace_id": roots[0]["workspace_id"], "tab_id": roots[0]["tab_id"], "pane_id": roots[0]["pane_id"]}
 
-    def _verify_candidate(self, request: ProviderRequest) -> None:
+    def _verify_candidate(self, request: ProviderRequest, *, deadline_at: float | None = None) -> None:
         value = request.value
         root = _canonical_dir(value["worktree"], "worktree")
         target = _target(value["host"])
-        existing = self._resolve_existing_worktree(root, target)
-        opened = {**existing, "path": str(root)} if existing is not None else self.worktree_open(path=str(root))["result"]
+        existing = self._resolve_existing_worktree(root, target, deadline_at=deadline_at)
+        opened = ({**existing, "path": str(root)} if existing is not None
+                  else self.worktree_open(path=str(root), deadline_at=deadline_at)["result"])
         if any(opened[key] != target[key] for key in ("workspace_id", "tab_id", "pane_id")):
             raise _fail("IDENTITY_MISMATCH", "dedicated worktree workspace differs from request host")
         root = _canonical_dir(value["worktree"], "worktree")
         # Provider-side re-verification confirms the checkout; candidate read-back remains foundation caller authority.
         verify_candidate_identity(root, branch=value["candidate"]["branch"], commit=value["candidate"]["commit"],
-                                  source_digest=value["candidate"]["source_digest"],
-                                  deadline_at=self._operation_deadline_at)
+                                  source_digest=value["candidate"]["source_digest"], deadline_at=deadline_at)
 
-    def _read_current_work(self, request: ProviderRequest) -> WorkflowRead:
+    def _read_current_work(self, request: ProviderRequest, *, deadline_at: float | None = None) -> WorkflowRead:
         if self.core_request is None:
             raise _fail("STALE_GENERATION", "authority-owned core readback is required before dispatch")
         value = request.value
         root = _canonical_dir(value["worktree"], "worktree")
         if self.core_request.repository_root != root or self.core_request.cwd != root:
             raise _fail("IDENTITY_MISMATCH", "core readback root differs from dispatch worktree")
-        remaining = self._remaining_ms(self._operation_deadline_at, self.core_request.timeout_ms)
+        remaining = self._remaining_ms(deadline_at, self.core_request.timeout_ms)
         bounded_core = dataclasses.replace(self.core_request, timeout_ms=remaining)
         try:
             read = read_workflow(bounded_core, value["work"]["work_id"], value["work"]["node_id"],
-                                 deadline_at=self._operation_deadline_at)
+                                 deadline_at=deadline_at)
         except ProtocolError as exc:
+            if exc.code == "TIMEOUT":
+                raise
             if exc.code in {"SOURCE_CHANGED", "IDENTITY_MISMATCH", "DIGEST_MISMATCH"}:
                 raise _fail("CANDIDATE_CHANGED", "core candidate readback changed", cause=exc.code) from exc
             raise _fail("STALE_GENERATION", "current core work readback failed", cause=exc.code) from exc
@@ -1027,17 +1030,15 @@ class HerdrProvider:
         limits = request.get("limits") if isinstance(request, Mapping) else None
         raw_deadline = limits.get("deadline_ms") if isinstance(limits, Mapping) else None
         provisional = raw_deadline if isinstance(raw_deadline, int) and not isinstance(raw_deadline, bool) and raw_deadline > 0 else 600_000
-        self._operation_deadline_at = operation_started + min(provisional, 600_000) / 1000
-        try:
-            return self._launch(request, operation_started)
-        finally:
-            self._operation_deadline_at = None
+        deadline_at = operation_started + min(provisional, 600_000) / 1000
+        return self._launch(request, operation_started, deadline_at)
 
-    def _launch(self, request: Mapping[str, object], operation_started: float) -> dict[str, object]:
+    def _launch(self, request: Mapping[str, object], operation_started: float, deadline_at: float) -> dict[str, object]:
         parsed = ProviderRequest(request)
         value = parsed.value
         deadline = value["limits"]["deadline_ms"]
-        deadline_at = operation_started + deadline / 1000
+        if abs(deadline_at - (operation_started + deadline / 1000)) > 0.001:
+            deadline_at = operation_started + deadline / 1000
         probe_report = self.probe({"schema_version": 1, "request_id": request["request_id"], "required_capabilities": request["required_capabilities"], "runtime": request["runtime"]}, deadline_at=deadline_at)
         if self.ledger is None: raise _fail("INVALID_REQUEST", "append-only attempt ledger is required")
         if self.private_root is None: raise _fail("INVALID_REQUEST", "provider-approved private root is required")
@@ -1048,8 +1049,8 @@ class HerdrProvider:
         with self._dispatch_lock():
             self.ledger.assert_start_available(attempt_id=value["attempt_id"], allowance_id=value["allowance_id"],
                                                output_root_id=value["output_root_id"], session_root_id=value["session_root_id"])
-            self._verify_candidate(parsed)
-            current = self._read_current_work(parsed)
+            self._verify_candidate(parsed, deadline_at=deadline_at)
+            current = self._read_current_work(parsed, deadline_at=deadline_at)
             evidence = self._claim_roots(parsed, probe_report["result"]["report_digest"], current)
             started = {"schema_version": 1, "event": "STARTED", "attempt_id": value["attempt_id"], "work_id": value["work"]["work_id"], "node_id": value["work"]["node_id"], "observed_generation": value["work"]["generation"], "observed_ordinal": value["work"]["ordinal"], "worker_id": value["worker_id"], "branch": value["branch"], "worktree_ref": ".", "allowance_id": value["allowance_id"], "provider_id": self.provider_id, "started_at": _now(), "started_at_source": "adapter_observed", "candidate": {"commit": value["candidate"]["commit"], "source_digest": value["candidate"]["source_digest"]}, "candidate_evidence": evidence["candidate"], "request_packet": evidence["packet"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"], "request_digest": evidence["request_digest"], "herdr": _ledger_host(value["host"]), "prev_digest": "sha256:" + "0" * 64}
             try:
@@ -1061,12 +1062,12 @@ class HerdrProvider:
             self._attempt_sessions[value["attempt_id"]] = _canonical_dir(value["session_root"], "session_root")
             self._attempt_roots[value["attempt_id"]] = (_canonical_dir(value["output_root"], "output_root"), _canonical_dir(value["session_root"], "session_root"))
             try:
-                final = self._read_current_work(parsed)
+                final = self._read_current_work(parsed, deadline_at=deadline_at)
                 if (final.raw_state_digest != current.raw_state_digest or final.raw_state_core_identity != current.raw_state_core_identity):
                     raise _fail("STALE_GENERATION", "core state changed at final launch fence")
-                self._verify_candidate(parsed)
+                self._verify_candidate(parsed, deadline_at=deadline_at)
                 remaining = self._remaining_ms(deadline_at, deadline)
-                response = self._exec([self.herdr, "agent", "start", value["worker_id"], "--kind", "pi", "--pane", _target(value["host"])["pane_id"], "--timeout", str(remaining), "--", "--model", _MODEL, "--thinking", "medium", "--session-dir", value["session_root"], "--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve"], timeout_ms=remaining, cwd=_canonical_dir(value["cwd"], "cwd"), max_output=value["limits"]["max_output_bytes"])
+                response = self._exec([self.herdr, "agent", "start", value["worker_id"], "--kind", "pi", "--pane", _target(value["host"])["pane_id"], "--timeout", str(remaining), "--", "--model", _MODEL, "--thinking", "medium", "--session-dir", value["session_root"], "--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve"], timeout_ms=remaining, cwd=_canonical_dir(value["cwd"], "cwd"), max_output=value["limits"]["max_output_bytes"], deadline_at=deadline_at)
             except ProtocolError as exc:
                 failure = _canonical_dir(value["worktree"], "worktree") / ".razr" / "evidence" / ("launch-failure-" + value["attempt_id"] + ".json")
                 launch_code = exc.code if exc.code in _LAUNCH_EVIDENCE_CODES else "LAUNCH_FAILED"
@@ -1111,7 +1112,7 @@ class HerdrProvider:
             canonical_session_path = path_session(agent) or path_session(result)
             if canonical_session_path is None:
                 for _ in range(3):
-                    observed = _envelope(self._exec([self.herdr, "agent", "get", value["worker_id"]], timeout_ms=_CLI_TIMEOUT_MS), "agent get", {"cli:agent:get"})["result"]
+                    observed = _envelope(self._exec([self.herdr, "agent", "get", value["worker_id"]], timeout_ms=_CLI_TIMEOUT_MS, deadline_at=deadline_at), "agent get", {"cli:agent:get"})["result"]
                     observed_agent = observed.get("agent") if isinstance(observed, dict) and isinstance(observed.get("agent"), dict) else observed
                     canonical_session_path = path_session(observed_agent) or path_session(observed)
                     if canonical_session_path is not None: break
@@ -1119,7 +1120,7 @@ class HerdrProvider:
             if canonical_session_path is not None: opaque_session = "pi-session-" + hashlib.sha256(str(canonical_session_path).encode("utf-8")).hexdigest()
             result = {"agent_id": agent_id, "workspace_id": agent["workspace_id"], "tab_id": agent["tab_id"], "pane_id": agent["pane_id"], "pi_session_id": opaque_session}
             if any(result[key] != target[key] for key in ("workspace_id", "tab_id", "pane_id")): raise _fail("IDENTITY_MISMATCH", "agent target identity differs")
-            pane = _envelope(self._exec([self.herdr, "pane", "get", target["pane_id"]], timeout_ms=10_000), "pane", {"cli:pane:get"})
+            pane = _envelope(self._exec([self.herdr, "pane", "get", target["pane_id"]], timeout_ms=10_000, deadline_at=deadline_at), "pane", {"cli:pane:get"})
             pane_result = pane["result"]
             if not isinstance(pane_result, dict) or not isinstance(pane_result.get("pane"), dict): raise _fail("IDENTITY_MISMATCH", "pane response lacks nested pane")
             pane_result = pane_result["pane"]
