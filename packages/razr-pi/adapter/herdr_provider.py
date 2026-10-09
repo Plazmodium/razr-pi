@@ -285,26 +285,79 @@ def _evidence_ref_bytes(root: Path, ref: Mapping[str, object], maximum: int = 1_
         return _read_evidence_at(dirfd, name, maximum)
 
 
-def _marker(root: Path, root_id: str, digest: str, *, create: bool) -> None:
-    marker = root / ".razr-herdr-root.json"
-    if marker.exists():
-        try:
-            value = _strict_json(marker.read_bytes())
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
-            raise _fail("RESOURCE_REUSED", "root ownership marker is malformed") from exc
-        if value != {"schema_version": 1, "root_id": root_id, "manifest_digest": digest}:
+_MARKER_NAME = ".razr-herdr-root.json"
+
+
+def _marker_bytes(root: Path) -> bytes | None:
+    """Read a root marker relative to one pinned root descriptor, never by pathname."""
+    root = _canonical_dir(str(root), "provider root"); rootfd = markerfd = -1
+    try:
+        rootfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        root_info = os.fstat(rootfd); path_info = os.stat(root, follow_symlinks=False)
+        if (not stat.S_ISDIR(root_info.st_mode) or (root_info.st_dev, root_info.st_ino) != (path_info.st_dev, path_info.st_ino)):
+            raise _fail("PATH_ESCAPE", "provider root identity changed")
+        try: markerfd = os.open(_MARKER_NAME, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=rootfd)
+        except FileNotFoundError: return None
+        except OSError as exc: raise _fail("PATH_ESCAPE", "root ownership marker is linked or unavailable") from exc
+        before = os.fstat(markerfd); marker_path = os.stat(_MARKER_NAME, dir_fd=rootfd, follow_symlinks=False)
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_mode & 0o077
+                or (before.st_dev, before.st_ino) != (marker_path.st_dev, marker_path.st_ino)):
+            raise _fail("PATH_ESCAPE", "root ownership marker identity is unsafe")
+        data = os.read(markerfd, 65_537); after = os.fstat(markerfd)
+        if len(data) > 65_536 or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            raise _fail("PATH_ESCAPE", "root ownership marker changed during read")
+        return data
+    except ProtocolError: raise
+    except OSError as exc: raise _fail("PATH_ESCAPE", "root ownership marker cannot be inspected") from exc
+    finally:
+        if markerfd >= 0:
+            try: os.close(markerfd)
+            except OSError: pass
+        if rootfd >= 0:
+            try: os.close(rootfd)
+            except OSError: pass
+
+
+def _marker_present(root: Path, root_id: str | None = None, digest: str | None = None) -> bool:
+    data = _marker_bytes(root)
+    if data is None: return False
+    if root_id is not None or digest is not None:
+        if root_id is None or digest is None or data != canonical_json({"schema_version": 1, "root_id": root_id, "manifest_digest": digest}):
             raise _fail("RESOURCE_REUSED", "root ownership identity differs")
+    return True
+
+
+def _marker(root: Path, root_id: str, digest: str, *, create: bool) -> None:
+    expected = canonical_json({"schema_version": 1, "root_id": root_id, "manifest_digest": digest})
+    if _marker_present(root, root_id, digest):
         if not create: return
         raise _fail("RESOURCE_REUSED", "root identity was already used")
-    if not create:
-        raise _fail("RESOURCE_REUSED", "root ownership marker is missing")
+    if not create: raise _fail("RESOURCE_REUSED", "root ownership marker is missing")
+    root = _canonical_dir(str(root), "provider root"); rootfd = fd = -1
     try:
-        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump({"schema_version": 1, "root_id": root_id, "manifest_digest": digest}, stream, sort_keys=True, separators=(",", ":"))
-            stream.flush(); os.fsync(stream.fileno())
-    except FileExistsError as exc:
-        raise _fail("RESOURCE_REUSED", "root ownership raced with another attempt") from exc
+        rootfd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        root_info = os.fstat(rootfd); path_info = os.stat(root, follow_symlinks=False)
+        if (not stat.S_ISDIR(root_info.st_mode) or (root_info.st_dev, root_info.st_ino) != (path_info.st_dev, path_info.st_ino)):
+            raise _fail("PATH_ESCAPE", "provider root identity changed")
+        try: fd = os.open(_MARKER_NAME, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=rootfd)
+        except FileExistsError as exc: raise _fail("RESOURCE_REUSED", "root ownership raced with another attempt") from exc
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            fd = -1; stream.write(expected); stream.flush(); os.fsync(stream.fileno())
+            info = os.fstat(stream.fileno()); marker_path = os.stat(_MARKER_NAME, dir_fd=rootfd, follow_symlinks=False)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & 0o077
+                    or (info.st_dev, info.st_ino) != (marker_path.st_dev, marker_path.st_ino)):
+                raise _fail("PATH_ESCAPE", "created root ownership marker identity is unsafe")
+        os.fsync(rootfd)
+    except ProtocolError: raise
+    except OSError as exc: raise _fail("PATH_ESCAPE", "root ownership marker cannot be created safely") from exc
+    finally:
+        if fd >= 0:
+            try: os.close(fd)
+            except OSError: pass
+        if rootfd >= 0:
+            try: os.close(rootfd)
+            except OSError: pass
 
 
 class AttemptLedger:
@@ -1255,11 +1308,10 @@ class HerdrProvider:
         values = request.value
         for root_key, id_key in (("output_root", "output_root_id"), ("session_root", "session_root_id")):
             root = _canonical_dir(values[root_key], root_key)
+            if _marker_present(root): raise _fail("RESOURCE_REUSED", f"{root_key} was previously claimed")
             digest, entries = _manifest(root)
             if digest != values[root_key + "_digest"] or entries:
                 raise _fail("RESOURCE_REUSED", f"{root_key} manifest differs or is non-empty")
-            if (root / ".razr-herdr-root.json").exists():
-                raise _fail("RESOURCE_REUSED", f"{root_key} was previously claimed")
             _id(values[id_key], id_key)
         packet = {key: values[key] for key in ("schema_version", "request_id", "attempt_id", "role", "work", "worker_id", "branch", "candidate", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "fresh_context", "neutral_input_digest", "environment_policy_digest", "tool_policy_digest", "required_capabilities", "runtime", "limits", "allowance_id")}
         _digest(capability_report_digest, "capability_report_digest")
@@ -1401,15 +1453,13 @@ class HerdrProvider:
                 raise _fail("LEDGER_CORRUPT", "prepared root claim is malformed")
             root = _canonical_dir(item["path"], f"prepared root {index}")
             root_id = _id(item["root_id"], "root_id"); digest = _digest(item["root_digest"], "root_digest")
-            marker = root / ".razr-herdr-root.json"
-            if marker.exists():
-                _marker(root, root_id, digest, create=False)
-            else:
+            marker_present = _marker_present(root, root_id, digest)
+            if not marker_present:
                 actual, entries = _manifest(root)
                 if actual != digest or entries:
                     raise _fail("RESOURCE_REUSED", "prepared root changed before claim materialization")
             self._claim_root_identity(root, root_id, digest, attempt_id, request_digest)
-            if not marker.exists(): _marker(root, root_id, digest, create=True)
+            if not marker_present: _marker(root, root_id, digest, create=True)
 
     def _materialize_root_claims(self, request: ProviderRequest, request_digest: str) -> None:
         """Materialize private path claims only after STARTED is durable; replay is idempotent."""
@@ -1798,9 +1848,8 @@ class HerdrProvider:
                 if not found: raise _fail("IDENTITY_MISMATCH", "root claim identity is missing")
             except (OSError, UnicodeDecodeError) as exc: raise _fail("IDENTITY_MISMATCH", "root claim cannot be read") from exc
         finally: os.close(dirfd)
-        marker = root / ".razr-herdr-root.json"
-        if not marker.is_file() or marker.is_symlink(): raise _fail("IDENTITY_MISMATCH", "root ownership marker is unavailable")
-        _marker(root, root_id, root_digest, create=False)
+        try: _marker(root, root_id, root_digest, create=False)
+        except ProtocolError as exc: raise _fail("IDENTITY_MISMATCH", "root ownership marker is unavailable", cause=exc.code) from exc
 
     def _handle(self, handle: Mapping[str, object]) -> dict[str, object]:
         fields = {"provider_id", "handle_id", "request_digest", "attempt_id", "host", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest"}
