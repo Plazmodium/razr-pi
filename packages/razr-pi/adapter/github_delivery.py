@@ -133,8 +133,9 @@ def read_pr(root: Path, url: str) -> dict[str, Any]:
         if not isinstance(value.get(key), list):
             raise DeliveryError("PR collection read-back is invalid")
     try:
-        checks = json.loads(_run("gh", ["pr", "checks", url, "--json", "name,state,bucket"], root,
-                                 accepted_codes={0, 1, 8}))
+        checks_raw = _run("gh", ["pr", "checks", url, "--json", "name,state,bucket"], root,
+                          accepted_codes={0, 1, 8})
+        checks = [] if not checks_raw else json.loads(checks_raw)
     except json.JSONDecodeError as exc:
         raise DeliveryError("check read-back is malformed") from exc
     if not isinstance(checks, list) or any(not isinstance(row, dict) for row in checks):
