@@ -189,15 +189,17 @@ Role-specific packet construction and semantic audit remain caller responsibilit
 
 ## M04 implemented Herdr proof scope
 
-The M04 Herdr provider:
+The M04/M09 Herdr provider:
 
-1. verify the installed Herdr API capabilities and select an explicitly owned pane/session topology;
-2. start a fresh Pi session with the same reviewed cwd, runtime constraints, resource policy, and neutral input contract;
-3. retain Herdr pane/agent identity only as operational provenance;
-4. obtain a stable Pi session identity and machine-readable result artifacts through an explicit protocol, not terminal scraping alone;
-5. translate Herdr observations only into provider `ExecutionStatus` values with source and timestamp;
-6. use Herdr interruption controls, then inspect and report whether the process/session actually settled or disappeared; and
-7. collect the same provider-neutral result fields as headless Pi.
+1. verifies the installed Herdr API capabilities and selects an explicitly owned pane/session topology;
+2. uses the Python core readback to fence current generation, node ordinal and candidate; rejects duplicate attempts before claims; transactionally stages evidence, makes STARTED the durable attempt/resource-ID claim, and materializes replayable private path claims only afterward; then repeats current-state and candidate verification immediately before start;
+3. starts a fresh Pi session with explicit `--no-session`, the same reviewed cwd, runtime constraints, resource policy, and neutral input contract under one end-to-end deadline;
+4. streams independently bounded stdout/stderr in a dedicated process group and verifies cleanup on timeout/overflow; linked executable paths refuse;
+5. retains Herdr pane/agent identity only as operational provenance;
+6. obtains a stable Pi session identity and machine-readable result artifacts through an explicit protocol, not terminal scraping alone;
+7. translates Herdr observations only into provider `ExecutionStatus` values with source and timestamp;
+8. uses Herdr interruption controls, then inspects and reports whether the process/session actually settled or disappeared; and
+9. collects the same provider-neutral result fields as headless Pi.
 
 Herdr `blocked` may indicate an interactive UI requiring human attention, but it is not a Razr blocked transition. `idle` or `done` means ready for input, not successful completion. A prompt submission acknowledgment does not prove a turn started, and a wait timeout does not prove it was not delivered; therefore automatic resubmission is prohibited.
 

@@ -191,18 +191,16 @@ def _terminate_group(process: subprocess.Popen[bytes]) -> None:
         except PermissionError as exc:
             raise DeliveryError("process-group cleanup could not be verified") from exc
         if group_alive:
-            try:
-                process.wait(timeout=0.25)
-            except subprocess.TimeoutExpired:
-                pass
-            try:
-                os.killpg(process.pid, 0)
-            except ProcessLookupError:
-                group_alive = False
-            except PermissionError as exc:
-                raise DeliveryError("process-group cleanup could not be verified") from exc
-        if group_alive:
-            raise DeliveryError("process-group cleanup timed out")
+            # The leader may already be reaped while a killed descendant is briefly
+            # still visible as an orphan/zombie. Poll the group itself rather than
+            # repeatedly waiting on the already-reaped leader.
+            reap_deadline = time.monotonic() + 0.75
+            while group_alive and time.monotonic() < reap_deadline:
+                time.sleep(0.01)
+                try: os.killpg(process.pid, 0)
+                except ProcessLookupError: group_alive = False
+                except PermissionError as exc: raise DeliveryError("process-group cleanup could not be verified") from exc
+        if group_alive: raise DeliveryError("process-group cleanup timed out")
     for stream in (process.stdout, process.stderr):
         if stream is not None:
             stream.close()

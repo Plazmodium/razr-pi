@@ -9,7 +9,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
-from typing import Iterator
+from typing import Callable, Iterator
 
 from .protocol import ProtocolError, canonical_json, raw_file_digest, validate_source_digest
 
@@ -22,8 +22,17 @@ EVIDENCE_TYPES = frozenset(("path", "test", "commit", "config", "work_item", "ex
 DIGEST_DOMAINS = frozenset(("raw_file", "canonical_json", "core_source", "executable", "git_object"))
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$")
+# This is intentionally a conservative heuristic, not a confidentiality proof.
+# Memory callers must still avoid supplying secrets or arbitrary sensitive data.
 SECRET_RE = re.compile(
-    r"(?i)(?:authorization:\s*bearer\s+\S+|(?:api[_-]?key|access[_-]?token|auth[_-]?token|token|secret|password)\s*[:=]\s*\S+|-----BEGIN [A-Z ]*PRIVATE KEY-----|cookie\s*[:=])"
+    r"(?is)(?:authorization:\s*bearer\s+\S+|"
+    r"(?:api[_-]?key|access[_-]?token|auth[_-]?token|token|secret|password|client[_-]?secret|secret[_-]?b64)\s*[:=]\s*\S+|"
+    r"-----BEGIN [A-Z0-9 ]*(?:PRIVATE KEY|OPENSSH PRIVATE KEY)-----|"
+    r"(?:https?|ssh)://[^\s/:]+:[^\s/@]+@|"
+    r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b|"
+    r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b|"
+    r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,})\b|"
+    r"cookie\s*[:=])"
 )
 MAX_LIMIT = 100
 MAX_SUMMARY = 2000
@@ -36,6 +45,9 @@ MAX_RELATED_BYTES = 4096
 MAX_EVIDENCE_CONTENT_BYTES = 1_048_576
 MAX_SCOPE_PATHS = 64
 MAX_SCOPE_BYTES = 8192
+MAX_LEDGER_BYTES = 16 * 1024 * 1024
+MAX_LEDGER_RECORDS = 10_000
+MAX_LEDGER_LINE_BYTES = 65_536
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", None)
 _O_DIRECTORY = getattr(os, "O_DIRECTORY", None)
 
@@ -146,6 +158,13 @@ def _parse_record_line(line: bytes) -> dict[str, object]:
     return value
 
 
+def _live_repository_identity(root: Path) -> str:
+    """Resolve current core source identity; constructor values are expectations only."""
+    from .core_subprocess import _git_head, _source_digest
+    commit = _git_head(root)
+    return _source_digest(root, commit)
+
+
 def _valid_timestamp(value: object) -> bool:
     if not isinstance(value, str) or not UTC_RE.fullmatch(value):
         return False
@@ -158,7 +177,9 @@ def _valid_timestamp(value: object) -> bool:
 
 class MemoryStore:
     """Stable M03/M05 surface: remember, recall, inspect, retire, supersede, validate."""
-    def __init__(self, repository_root: Path | str, *, now=_now, limit: int = 20):
+    def __init__(self, repository_root: Path | str, *, repository: str | None = None,
+                 repository_identity: Callable[[], str] | None = None,
+                 now=_now, limit: int = 20):
         root = Path(repository_root)
         if not root.is_absolute() or root.resolve() != root or not root.is_dir() or root.is_symlink():
             raise _fail("INVALID_REQUEST", "repository root must be canonical")
@@ -166,8 +187,23 @@ class MemoryStore:
             raise _fail("INVALID_REQUEST", "invalid memory limit")
         if _O_NOFOLLOW is None or _O_DIRECTORY is None:
             raise _fail("UNSUPPORTED_CAPABILITY", "descriptor-safe storage is unavailable")
+        try:
+            current_repository = validate_source_digest(_live_repository_identity(root))
+            if repository_identity is not None and validate_source_digest(repository_identity()) != current_repository:
+                raise _fail("SOURCE_CHANGED", "repository identity observer disagrees with live core identity")
+        except (OSError, ProtocolError, TypeError, ValueError) as exc:
+            if isinstance(exc, ProtocolError) and exc.code == "SOURCE_CHANGED":
+                raise
+            raise _fail("INVALID_REQUEST", "current repository identity is required") from exc
+        expected_repository = current_repository if repository is None else validate_source_digest(repository)
+        if current_repository != expected_repository:
+            raise _fail("SOURCE_CHANGED", "repository does not match expected identity",
+                        expected=expected_repository, actual=current_repository)
+        self.repository = expected_repository
+        self._repository_identity_observer = repository_identity
         self.root = root
         self.path = root / ".razr/memory.jsonl"
+        self.lock_path = root / ".razr/memory.jsonl.lock"
         try:
             self._root_fd = os.open(root, os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW)
             self._root_identity = _identity(_regular(self._root_fd, "repository", directory=True))
@@ -220,6 +256,21 @@ class MemoryStore:
         if _identity(path_info)[:2] != self._root_identity[:2]:
             raise _fail("PATH_ESCAPE", "repository root was replaced")
 
+    def _verify_repository_identity(self, expected: str | None = None) -> str:
+        try:
+            current = validate_source_digest(_live_repository_identity(self.root))
+            if (self._repository_identity_observer is not None
+                    and validate_source_digest(self._repository_identity_observer()) != current):
+                raise _fail("SOURCE_CHANGED", "repository identity observer disagrees with live core identity")
+        except (OSError, ProtocolError, TypeError, ValueError) as exc:
+            if isinstance(exc, ProtocolError) and exc.code == "SOURCE_CHANGED":
+                raise
+            raise _fail("SOURCE_CHANGED", "current repository identity is unavailable") from exc
+        wanted = self.repository if expected is None else validate_source_digest(expected)
+        if current != self.repository or current != wanted:
+            raise _fail("SOURCE_CHANGED", "repository identity changed", expected=wanted, actual=current)
+        return current
+
     def _verify_storage(self, storage_fd: int) -> None:
         self._verify_root()
         try:
@@ -246,17 +297,23 @@ class MemoryStore:
 
     def _storage_dir(self) -> int:
         self._verify_root()
+        created = False
         try:
-            os.mkdir(".razr", 0o755, dir_fd=self._root_fd)
+            os.mkdir(".razr", 0o700, dir_fd=self._root_fd)
+            created = True
+            os.fsync(self._root_fd)
         except FileExistsError:
             pass
         except OSError as exc:
-            raise _fail("LEDGER_CORRUPT", "memory directory unavailable") from exc
+            raise _fail("LEDGER_CORRUPT", "memory directory unavailable or not durable") from exc
         fd = -1
         success = False
         try:
             fd = os.open(".razr", os.O_RDONLY | _O_DIRECTORY | _O_NOFOLLOW, dir_fd=self._root_fd)
             self._verify_storage(fd)
+            os.fchmod(fd, 0o700)
+            if created:
+                os.fsync(fd)
             success = True
             return fd
         except ProtocolError:
@@ -273,33 +330,58 @@ class MemoryStore:
     @contextmanager
     def _locked(self) -> Iterator[int]:
         self._verify_root()
-        storage_fd = -1
+        observed_repository = self._verify_repository_identity(self.repository)
+        storage_fd = lock_fd = -1
         locked = False
         try:
-            try:
-                fcntl.flock(self._root_fd, fcntl.LOCK_EX)
-                locked = True
-            except OSError as exc:
-                raise _fail("LOCK_UNAVAILABLE", "repository flock unavailable", retryable=True) from exc
-            self._verify_root()
             storage_fd = self._storage_dir()
             self._verify_storage(storage_fd)
+            created = False
+            try:
+                lock_fd = os.open("memory.jsonl.lock", os.O_RDWR | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW,
+                                  0o600, dir_fd=storage_fd)
+                created = True
+            except FileExistsError:
+                lock_fd = os.open("memory.jsonl.lock", os.O_RDWR | _O_NOFOLLOW, dir_fd=storage_fd)
+            lock_info = self._verify_entry(storage_fd, "memory.jsonl.lock", lock_fd, "memory lock")
+            os.fchmod(lock_fd, 0o600)
+            if created:
+                os.fsync(lock_fd)
+                os.fsync(storage_fd)
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                locked = True
+            except OSError as exc:
+                raise _fail("LOCK_UNAVAILABLE", "memory lock unavailable", retryable=True) from exc
+            current = self._verify_entry(storage_fd, "memory.jsonl.lock", lock_fd, "memory lock")
+            if _identity(current)[:2] != _identity(lock_info)[:2]:
+                raise _fail("LOCK_UNAVAILABLE", "memory lock identity changed", retryable=True)
+            self._verify_repository_identity(observed_repository)
             yield storage_fd
+            self._verify_repository_identity(observed_repository)
+            current = self._verify_entry(storage_fd, "memory.jsonl.lock", lock_fd, "memory lock")
+            if _identity(current)[:2] != _identity(lock_info)[:2]:
+                raise _fail("LOCK_UNAVAILABLE", "memory lock identity changed", retryable=True)
             self._verify_storage(storage_fd)
             self._verify_root()
         except ProtocolError:
             raise
         except OSError as exc:
-            raise _fail("LOCK_UNAVAILABLE", "repository flock unavailable", retryable=True) from exc
+            raise _fail("LOCK_UNAVAILABLE", "memory lock unavailable", retryable=True) from exc
         finally:
+            if locked:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            if lock_fd >= 0:
+                try:
+                    os.close(lock_fd)
+                except OSError:
+                    pass
             if storage_fd >= 0:
                 try:
                     os.close(storage_fd)
-                except OSError:
-                    pass
-            if locked:
-                try:
-                    fcntl.flock(self._root_fd, fcntl.LOCK_UN)
                 except OSError:
                     pass
 
@@ -313,7 +395,9 @@ class MemoryStore:
             raise _fail("LEDGER_CORRUPT", "memory ledger is linked or unavailable") from exc
         try:
             before = self._verify_entry(storage_fd, "memory.jsonl", ledger_fd, "memory ledger")
-            raw = _read_fd(ledger_fd, "memory ledger")
+            if before.st_size > MAX_LEDGER_BYTES:
+                raise _fail("LIMIT_EXCEEDED", "memory ledger exceeds total byte bound")
+            raw = _read_fd(ledger_fd, "memory ledger", max_bytes=MAX_LEDGER_BYTES)
             after = self._verify_entry(storage_fd, "memory.jsonl", ledger_fd, "memory ledger")
             if _identity(before) != _identity(after):
                 raise _fail("LEDGER_CORRUPT", "memory ledger identity changed")
@@ -325,7 +409,12 @@ class MemoryStore:
         previous = GENESIS
         ids: set[str] = set()
         successors: set[str] = set()
-        for line in raw.splitlines(keepends=True):
+        lines = raw.splitlines(keepends=True)
+        if len(lines) > MAX_LEDGER_RECORDS:
+            raise _fail("LIMIT_EXCEEDED", "memory ledger exceeds record bound")
+        for line in lines:
+            if len(line) > MAX_LEDGER_LINE_BYTES:
+                raise _fail("LIMIT_EXCEEDED", "memory ledger line exceeds bound")
             value = _parse_record_line(line)
             self._validate_record(value, corruption=True)
             if value["id"] in ids or value["prev_digest"] != previous:
@@ -439,15 +528,28 @@ class MemoryStore:
         record["record_digest"] = _record_digest(record)
         self._validate_record(record)
         payload = canonical_json(record) + b"\n"
+        if len(payload) > MAX_LEDGER_LINE_BYTES or len(records) >= MAX_LEDGER_RECORDS:
+            raise _fail("LIMIT_EXCEEDED", "memory append exceeds ledger bounds")
         try:
             self._verify_storage(storage_fd)
-            fd = os.open("memory.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND | _O_NOFOLLOW, 0o644, dir_fd=storage_fd)
+            created = False
+            try:
+                fd = os.open("memory.jsonl", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND | _O_NOFOLLOW,
+                             0o600, dir_fd=storage_fd)
+                created = True
+            except FileExistsError:
+                fd = os.open("memory.jsonl", os.O_WRONLY | os.O_APPEND | _O_NOFOLLOW, dir_fd=storage_fd)
             try:
                 before = self._verify_entry(storage_fd, "memory.jsonl", fd, "memory ledger")
+                os.fchmod(fd, 0o600)
+                if before.st_size + len(payload) > MAX_LEDGER_BYTES:
+                    raise _fail("LIMIT_EXCEEDED", "memory append exceeds total byte bound")
                 self._write_all(fd, payload)
                 after = self._verify_entry(storage_fd, "memory.jsonl", fd, "memory ledger")
                 if _identity(before)[:2] != _identity(after)[:2]:
                     raise _fail("LEDGER_CORRUPT", "memory ledger identity changed")
+                if created:
+                    os.fsync(storage_fd)
             finally:
                 os.close(fd)
         except ProtocolError:
@@ -467,6 +569,8 @@ class MemoryStore:
         if kind not in KINDS or confidence not in CONFIDENCES:
             raise _fail("INVALID_REQUEST", "invalid memory kind or confidence")
         validate_source_digest(repository)
+        if repository != self._verify_repository_identity():
+            raise _fail("SOURCE_CHANGED", "memory scope does not match the current repository")
         scope_paths = [] if paths is None else [_repo_path(path) for path in paths]
         if len(scope_paths) > MAX_SCOPE_PATHS or len(canonical_json(scope_paths)) > MAX_SCOPE_BYTES:
             raise _fail("INVALID_REQUEST", "scope paths exceed bounds")
@@ -576,6 +680,7 @@ class MemoryStore:
         record.pop("tags", None) if not logical["tags"] else None
         record.pop("related_ids", None) if not logical["related_ids"] else None
         with self._locked() as storage_fd:
+            self._verify_repository_identity(repository)
             rows = self._read_locked(storage_fd)
             existing = next((row for row in rows if row["id"] == requested_id), None)
             if existing is not None:
@@ -591,13 +696,15 @@ class MemoryStore:
     def inspect(self) -> list[dict[str, object]]:
         return self.records()
 
-    def recall(self, query: str = "", *, paths: list[str] | None = None, limit: int | None = None) -> dict[str, object]:
+    def recall(self, query: str = "", *, paths: list[str] | None = None, limit: int | None = None,
+               repository: str | None = None) -> dict[str, object]:
         if not isinstance(query, str) or len(query) > MAX_SUMMARY:
             raise _fail("INVALID_REQUEST", "invalid memory query")
         limit = self.default_limit if limit is None else limit
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_LIMIT:
             raise _fail("INVALID_REQUEST", "invalid memory limit")
         wanted = set(_repo_path(path) for path in (paths or []))
+        current_repository = self._verify_repository_identity(repository)
         all_records = self.records()
         superseded = {row["supersedes"] for row in all_records if "supersedes" in row}
         candidates: list[dict[str, object]] = []
@@ -605,6 +712,9 @@ class MemoryStore:
         needle = query.casefold()
         for row in all_records:
             if row["id"] in superseded or row["status"] in {"retired", "superseded"}:
+                continue
+            if row["scope"]["repository"] != current_repository:
+                stale_ids.append(row["id"])
                 continue
             stale = self._is_stale(row)
             view = dict(row)
@@ -619,7 +729,8 @@ class MemoryStore:
         candidates.sort(key=lambda row: (row["status"] != "active", row["id"]))
         return {"records": candidates[:limit], "omitted_count": max(0, len(candidates) - limit),
                 "stale_ids": sorted(stale_ids),
-                "query_digest": raw_file_digest(canonical_json({"query": query, "paths": sorted(wanted), "limit": limit}))}
+                "query_digest": raw_file_digest(canonical_json({"query": query, "paths": sorted(wanted), "limit": limit,
+                                                                  "repository": current_repository}))}
 
     def _is_stale(self, row: dict[str, object]) -> bool:
         for item in row["evidence"]:
@@ -655,6 +766,8 @@ class MemoryStore:
                 raise _fail("LEDGER_CORRUPT", "multiple memory successors")
             if old is None or old["status"] in {"retired", "superseded"}:
                 raise _fail("INVALID_REQUEST", "memory record is unavailable")
+            if old["scope"]["repository"] != self._verify_repository_identity():
+                raise _fail("SOURCE_CHANGED", "foreign memory cannot be transitioned")
             new_summary = old["summary"] if summary is None else summary
             _safe_text(new_summary, "summary", MAX_SUMMARY)
             new_evidence = old["evidence"] if evidence is None else self._prepare_evidence(evidence)

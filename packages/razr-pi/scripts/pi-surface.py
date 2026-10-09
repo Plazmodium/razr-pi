@@ -83,11 +83,14 @@ def memory(root: Path, operation: str, raw: str = "") -> object:
     if operation == "inspect" and not memory_path.exists():
         return []
     if operation == "recall" and not memory_path.exists():
+        from adapter.core_subprocess import _git_head, _source_digest
         from adapter.protocol import canonical_json, raw_file_digest
         value = _object(raw, "recall") if raw else {}
         query, paths, limit = value.get("query", ""), value.get("paths", []), value.get("limit", 20)
+        repository = _source_digest(root, _git_head(root))
         return {"records": [], "omitted_count": 0, "stale_ids": [],
-                "query_digest": raw_file_digest(canonical_json({"query": query, "paths": sorted(paths), "limit": limit}))}
+                "query_digest": raw_file_digest(canonical_json({"query": query, "paths": sorted(paths), "limit": limit,
+                                                                  "repository": repository}))}
     with MemoryStore(root) as store:
         if operation == "inspect":
             return store.inspect()

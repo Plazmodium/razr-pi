@@ -2,7 +2,7 @@
 
 This source baseline is intended for explicit adoption/discovery, no-model package loading, read-only inspection and contract preflight, and selected synthetic regression tests. Acceptance is pending until the commands in docs/testing.md pass on the exact reviewed tree and a fresh post-import clone.
 
-The deterministic core and five templates are byte-identical snapshots identified by packages/razr-pi/runtime/provenance.json. Routing, skills and helpers are adapter-owned. Provenance hashes establish byte identity, not execution, human approval or independent review.
+The deterministic Python core and five templates are pinned by `packages/razr-pi/runtime/provenance.json`. M09 applies one narrow core hardening change: ready/merged delivery requires exact equality of PR head, candidate commit, and both critic reviewed commits, independently of source-digest equality. Routing, skills and helpers remain adapter-owned. Provenance hashes establish byte identity, not execution, human approval or independent review.
 
 Historical workshop artifacts, lab-bound critique/recovery/local-history helpers, private sessions and factory drafts are not distributed. Their omission does not establish equivalent portable capabilities. Automated PR factory work, live critique, recovery and delivery remain deferred. No past approval or model allowance transfers to this baseline.
 

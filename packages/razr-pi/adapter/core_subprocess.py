@@ -29,6 +29,21 @@ def _fail(code: str, message: str, **details: object) -> ProtocolError:
     return ProtocolError(code, message, details=details)
 
 
+def _bounded_timeout(deadline_at: float | None, maximum: float = 10.0) -> float:
+    if deadline_at is None:
+        return maximum
+    remaining = deadline_at - time.monotonic()
+    if remaining <= 0:
+        raise _fail("TIMEOUT", "operation deadline expired during identity preflight")
+    return min(maximum, remaining)
+
+
+def _git_failure(exc: BaseException, code: str, message: str, deadline_at: float | None) -> ProtocolError:
+    if isinstance(exc, subprocess.TimeoutExpired) and deadline_at is not None:
+        return _fail("TIMEOUT", "operation deadline expired during Git identity preflight")
+    return _fail(code, message)
+
+
 def _canonical(path: Path, *, directory: bool | None = None) -> Path:
     if not path.is_absolute():
         raise _fail("INVALID_REQUEST", "operational paths must be absolute")
@@ -47,7 +62,7 @@ def _canonical(path: Path, *, directory: bool | None = None) -> Path:
     return value
 
 
-def _validate_request(request: CoreRequest) -> tuple[Path, Path, Path]:
+def _validate_request(request: CoreRequest, deadline_at: float | None = None) -> tuple[Path, Path, Path]:
     forbidden_git = sorted(name for name in os.environ if name.startswith("GIT_") and name not in {
         "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_OPTIONAL_LOCKS", "GIT_TERMINAL_PROMPT"})
     if forbidden_git:
@@ -112,17 +127,17 @@ def _validate_request(request: CoreRequest) -> tuple[Path, Path, Path]:
     except (OSError, UnicodeDecodeError, UnicodeError, json.JSONDecodeError, TypeError, KeyError, ValueError) as exc:
         raise _fail("PROVENANCE_MISMATCH", "provenance declaration unavailable") from exc
     validate_git_object_id(request.expected_commit)
-    _verify_git_identity(root)
-    if not _git_commit_exists(root, request.expected_commit):
+    _verify_git_identity(root, deadline_at)
+    if not _git_commit_exists(root, request.expected_commit, deadline_at):
         raise _fail("IDENTITY_MISMATCH", "expected commit is not present")
-    committed_work_root = _core_work_root(root, request.expected_commit)
-    if _git_head(root) != request.expected_commit:
+    committed_work_root = _core_work_root(root, request.expected_commit, deadline_at)
+    if _git_head(root, deadline_at) != request.expected_commit:
         raise _fail("SOURCE_CHANGED", "repository HEAD differs from expected commit")
-    _reject_dirty_checkout(root, committed_work_root)
+    _reject_dirty_checkout(root, committed_work_root, deadline_at)
     return root, package, runtime
 
 
-def _verify_git_identity(root: Path) -> None:
+def _verify_git_identity(root: Path, deadline_at: float | None = None) -> None:
     git_entry = root / ".git"
     if not git_entry.exists() or git_entry.is_symlink() or not (git_entry.is_dir() or git_entry.is_file()):
         raise _fail("IDENTITY_MISMATCH", "ambiguous or missing Git administration")
@@ -154,9 +169,9 @@ def _verify_git_identity(root: Path) -> None:
         result = subprocess.run(["git", "-C", str(root), "rev-parse", "--path-format=absolute",
                                  "--show-toplevel", "--git-dir", "--git-common-dir",
                                  "--is-inside-work-tree", "--is-bare-repository"], env=env, cwd=root,
-                                capture_output=True, check=False, timeout=10)
+                                capture_output=True, check=False, timeout=_bounded_timeout(deadline_at))
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise _fail("IDENTITY_MISMATCH", "Git identity query unavailable") from exc
+        raise _git_failure(exc, "IDENTITY_MISMATCH", "Git identity query unavailable", deadline_at) from exc
     values = result.stdout.decode("utf-8", "replace").splitlines()
     if result.returncode or result.stderr or len(values) != 5 or values[0] != str(root) or values[3:] != ["true", "false"]:
         raise _fail("IDENTITY_MISMATCH", "ambiguous Git administration")
@@ -166,7 +181,7 @@ def _verify_git_identity(root: Path) -> None:
         raise _fail("IDENTITY_MISMATCH", "ambiguous Git administration")
     try:
         listed = subprocess.run(["git", "-C", str(root), "worktree", "list", "--porcelain", "-z"],
-                                env=env, cwd=root, capture_output=True, check=False, timeout=10)
+                                env=env, cwd=root, capture_output=True, check=False, timeout=_bounded_timeout(deadline_at))
         if listed.returncode or listed.stderr:
             raise ValueError("worktree query failed")
         locations = []
@@ -182,32 +197,32 @@ def _verify_git_identity(root: Path) -> None:
         if len(locations) != len(set(locations)) or locations.count(str(root)) != 1 or locations.count(str(common_dir.parent)) != 1:
             raise ValueError("ambiguous worktree registration")
     except (OSError, UnicodeError, subprocess.TimeoutExpired, ValueError) as exc:
-        raise _fail("IDENTITY_MISMATCH", "ambiguous Git worktree registration") from exc
+        raise _git_failure(exc, "IDENTITY_MISMATCH", "ambiguous Git worktree registration", deadline_at) from exc
 
 
-def _git_head(root: Path) -> str:
+def _git_head(root: Path, deadline_at: float | None = None) -> str:
     try:
         result = subprocess.run(["git", "-C", str(root), "rev-parse", "--verify", "HEAD"],
-                                env=_environment(), cwd=root, capture_output=True, check=False, timeout=10)
+                                env=_environment(), cwd=root, capture_output=True, check=False, timeout=_bounded_timeout(deadline_at))
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise _fail("IDENTITY_MISMATCH", "Git HEAD query unavailable") from exc
+        raise _git_failure(exc, "IDENTITY_MISMATCH", "Git HEAD query unavailable", deadline_at) from exc
     head = result.stdout.decode("ascii", "ignore").strip()
     if result.returncode or result.stderr or not re.fullmatch(r"[0-9a-f]{40}", head):
         raise _fail("IDENTITY_MISMATCH", "Git HEAD is unavailable or ambiguous")
     return head
 
 
-def _reject_dirty_checkout(root: Path, work_root: str) -> None:
+def _reject_dirty_checkout(root: Path, work_root: str, deadline_at: float | None = None) -> None:
     env = _environment()
     try:
         status = subprocess.run(["git", "-C", str(root), "status", "--porcelain=v1", "-z", "--untracked-files=all"],
-                                env=env, cwd=root, capture_output=True, check=False, timeout=10)
+                                env=env, cwd=root, capture_output=True, check=False, timeout=_bounded_timeout(deadline_at))
         untracked = subprocess.run(["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z"],
-                                   env=env, cwd=root, capture_output=True, check=False, timeout=10)
+                                   env=env, cwd=root, capture_output=True, check=False, timeout=_bounded_timeout(deadline_at))
         ignored = subprocess.run(["git", "-C", str(root), "ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
-                                 env=env, cwd=root, capture_output=True, check=False, timeout=10)
+                                 env=env, cwd=root, capture_output=True, check=False, timeout=_bounded_timeout(deadline_at))
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise _fail("IDENTITY_MISMATCH", "Git dirtiness query unavailable") from exc
+        raise _git_failure(exc, "IDENTITY_MISMATCH", "Git dirtiness query unavailable", deadline_at) from exc
     if any(result.returncode or result.stderr for result in (status, untracked, ignored)):
         raise _fail("IDENTITY_MISMATCH", "Git dirtiness query failed")
     # The only owned private output/cache policy is the configured work_root.
@@ -224,52 +239,65 @@ def _reject_dirty_checkout(root: Path, work_root: str) -> None:
             path = raw_path.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise _fail("IDENTITY_MISMATCH", "Git returned an invalid dirty path") from exc
-        if not path.startswith(prefix):
+        adapter_private = (path in {".razr/memory.jsonl", ".razr/memory.jsonl.lock", ".razr/attempts.jsonl"}
+                           or path.startswith(".razr/evidence/"))
+        if not path.startswith(prefix) and not adapter_private:
             raise _fail("SOURCE_CHANGED", "checkout has dirty or untracked path", path=path)
 
 
-def verify_candidate_identity(root: Path, *, branch: str, commit: str, source_digest: str) -> None:
+def verify_checkout_snapshot(root: Path, *, commit: str, source_digest: str,
+                             deadline_at: float | None = None) -> None:
+    """Verify one clean live checkout against an exact committed source identity."""
+    root = _canonical(root, directory=True)
+    validate_git_object_id(commit)
+    validate_source_digest(source_digest)
+    _verify_git_identity(root, deadline_at)
+    if not _git_commit_exists(root, commit, deadline_at):
+        raise _fail("IDENTITY_MISMATCH", "expected commit is not present")
+    if _git_head(root, deadline_at) != commit:
+        raise _fail("SOURCE_CHANGED", "repository HEAD differs from expected commit")
+    _reject_dirty_checkout(root, _core_work_root(root, commit, deadline_at), deadline_at)
+    if _source_digest(root, commit, deadline_at) != source_digest:
+        raise _fail("SOURCE_CHANGED", "source digest differs")
+
+
+def verify_candidate_identity(root: Path, *, branch: str, commit: str, source_digest: str,
+                              deadline_at: float | None = None) -> None:
     """Verify checkout identity; callers remain responsible for candidate read-back/state authority."""
     root = _canonical(root, directory=True)
     if not isinstance(branch, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", branch) or ".." in PurePosixPath(branch).parts:
         raise _fail("INVALID_REQUEST", "invalid candidate branch")
-    validate_git_object_id(commit)
-    _verify_git_identity(root)
-    if not _git_commit_exists(root, commit):
-        raise _fail("IDENTITY_MISMATCH", "expected commit is not present")
-    if _git_head(root) != commit:
-        raise _fail("SOURCE_CHANGED", "repository HEAD differs from expected commit")
-    _reject_dirty_checkout(root, _core_work_root(root, commit))
+    verify_checkout_snapshot(root, commit=commit, source_digest=source_digest, deadline_at=deadline_at)
     try:
-        result = subprocess.run(["git", "-C", str(root), "rev-parse", "--verify", f"refs/heads/{branch}"], env=_environment(), cwd=root, capture_output=True, check=False, timeout=10)
+        result = subprocess.run(["git", "-C", str(root), "rev-parse", "--verify", f"refs/heads/{branch}"], env=_environment(), cwd=root, capture_output=True, check=False, timeout=_bounded_timeout(deadline_at))
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise _fail("IDENTITY_MISMATCH", "Git branch query unavailable") from exc
+        raise _git_failure(exc, "IDENTITY_MISMATCH", "Git branch query unavailable", deadline_at) from exc
     actual_commit = result.stdout.decode("ascii", "ignore").strip()
     if result.returncode or result.stderr or actual_commit != commit:
         raise _fail("CANDIDATE_CHANGED", "candidate branch does not point to commit")
-    if _source_digest(root, commit) != source_digest:
+    if _source_digest(root, commit, deadline_at) != source_digest:
         raise _fail("CANDIDATE_CHANGED", "worktree source digest differs")
 
 
-def _git_commit_exists(root: Path, commit: str) -> bool:
+def _git_commit_exists(root: Path, commit: str, deadline_at: float | None = None) -> bool:
     try:
         result = subprocess.run(["git", "-C", str(root), "cat-file", "-e", commit + "^{commit}"],
-                                env=_environment(), cwd=root, capture_output=True, check=False, timeout=10)
+                                env=_environment(), cwd=root, capture_output=True, check=False, timeout=_bounded_timeout(deadline_at))
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise _fail("IDENTITY_MISMATCH", "Git commit identity query unavailable") from exc
+        raise _git_failure(exc, "IDENTITY_MISMATCH", "Git commit identity query unavailable", deadline_at) from exc
     return result.returncode == 0 and not result.stdout and not result.stderr
 
 
-def _source_digest(root: Path, commit: str) -> str:
+def _source_digest(root: Path, commit: str, deadline_at: float | None = None) -> str:
     try:
         result = subprocess.run(["git", "-C", str(root), "ls-tree", "-r", "-z", "--full-tree", commit],
-                                env=_environment(), cwd=root, capture_output=True, check=False, timeout=10)
+                                env=_environment(), cwd=root, capture_output=True, check=False, timeout=_bounded_timeout(deadline_at))
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise _fail("SOURCE_CHANGED", "cannot inspect source tree") from exc
+        raise _git_failure(exc, "SOURCE_CHANGED", "cannot inspect source tree", deadline_at) from exc
     if result.returncode != 0:
         raise _fail("SOURCE_CHANGED", "source tree inspection failed")
     # Match core load_json/validate_config/safe_work_root from the requested tree.
-    work_root = _core_work_root(root, commit)
+    work_root = _core_work_root(root, commit, deadline_at)
     prefix = work_root.rstrip("/") + "/"
     entries = []
     for raw in result.stdout.split(b"\0"):
@@ -298,12 +326,12 @@ def _extract_work_root(value: object) -> str:
     return work
 
 
-def _core_work_root(root: Path, commit: str) -> str:
+def _core_work_root(root: Path, commit: str, deadline_at: float | None = None) -> str:
     try:
         result = subprocess.run(["git", "-C", str(root), "show", f"{commit}:razr.yaml"],
-                                env=_environment(), cwd=root, capture_output=True, check=False, timeout=10)
+                                env=_environment(), cwd=root, capture_output=True, check=False, timeout=_bounded_timeout(deadline_at))
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise _fail("SOURCE_CHANGED", "committed razr.yaml unavailable") from exc
+        raise _git_failure(exc, "SOURCE_CHANGED", "committed razr.yaml unavailable", deadline_at) from exc
     if result.returncode != 0 or not result.stdout or result.stderr:
         raise _fail("SOURCE_CHANGED", "committed razr.yaml is missing")
     committed = result.stdout
@@ -461,15 +489,23 @@ def _workflow_projection(status_row: object, state: object, work_id: str, node_i
                         raw.bytes, root, response.core_identity, response.source_digest, response.provenance)
 
 
-def read_workflow(request: CoreRequest, work_id: str, node_id: str) -> WorkflowRead:
+def read_workflow(request: CoreRequest, work_id: str, node_id: str,
+                  *, deadline_at: float | None = None) -> WorkflowRead:
     """Perform the frozen status → validate → raw state read-back sequence."""
     import dataclasses
+    def bounded(candidate: CoreRequest) -> CoreRequest:
+        if deadline_at is None:
+            return candidate
+        remaining = max(1, int((deadline_at - time.monotonic()) * 1000))
+        if deadline_at <= time.monotonic():
+            raise _fail("TIMEOUT", "workflow readback deadline expired")
+        return dataclasses.replace(candidate, timeout_ms=min(candidate.timeout_ms, remaining))
     if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", work_id) or (node_id != "*" and not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", node_id)):
         raise _fail("INVALID_REQUEST", "invalid core work or node ID")
     status_id = _child_request_id(request.request_id, "status")
     validate_id = _child_request_id(request.request_id, "validate")
     state_id = _child_request_id(request.request_id, "state")
-    status_request = dataclasses.replace(request, request_id=status_id, argv=("status", work_id, "--json"), expected_readback=())
+    status_request = bounded(dataclasses.replace(request, request_id=status_id, argv=("status", work_id, "--json"), expected_readback=()))
     status_response = invoke_core(status_request)
     _require_response_id(status_response, status_id)
     try:
@@ -478,7 +514,7 @@ def read_workflow(request: CoreRequest, work_id: str, node_id: str) -> WorkflowR
         raise _fail("MALFORMED_RESPONSE", "status JSON is malformed") from exc
     if not isinstance(rows, list) or len(rows) != 1:
         raise _fail("READBACK_FAILED", "status row count differs")
-    validate_request = dataclasses.replace(request, request_id=validate_id, argv=("validate", work_id), expected_readback=())
+    validate_request = bounded(dataclasses.replace(request, request_id=validate_id, argv=("validate", work_id), expected_readback=()))
     validation = invoke_core(validate_request)
     _require_response_id(validation, validate_id)
     try:
@@ -488,10 +524,10 @@ def read_workflow(request: CoreRequest, work_id: str, node_id: str) -> WorkflowR
     if validation.returncode != 0 or lines != [f"PASS {work_id}"]:
         raise _fail("READBACK_FAILED", "core validation did not pass")
     root = _canonical(request.repository_root, directory=True)
-    work_root = _core_work_root(root, request.expected_commit)
+    work_root = _core_work_root(root, request.expected_commit, deadline_at)
     state_path = f"{work_root}/{work_id}/state.yaml"
     state_specs = (ReadbackSpec(state_path, True, 1_048_576, "bytes"),)
-    state_request = dataclasses.replace(request, request_id=state_id, argv=("status", work_id, "--json"), expected_readback=state_specs)
+    state_request = bounded(dataclasses.replace(request, request_id=state_id, argv=("status", work_id, "--json"), expected_readback=state_specs))
     state_response = invoke_core(state_request)
     _require_response_id(state_response, state_id)
     if len(state_response.readback) != 1 or state_response.readback[0].digest_domain != "raw_file":
@@ -515,13 +551,15 @@ def read_workflow_context(request: CoreRequest, work_id: str) -> WorkflowRead:
 
 
 def invoke_core(request: CoreRequest) -> CoreResponse:
-    root, package, runtime = _validate_request(request)
-    source = _source_digest(root, request.expected_commit)
+    started = time.monotonic()
+    provisional = request.timeout_ms if isinstance(request.timeout_ms, int) and not isinstance(request.timeout_ms, bool) and request.timeout_ms > 0 else DEFAULT_TIMEOUT_MS
+    deadline_at = started + min(provisional, DEFAULT_TIMEOUT_MS) / 1000
+    root, package, runtime = _validate_request(request, deadline_at)
+    source = _source_digest(root, request.expected_commit, deadline_at)
     validate_source_digest(request.expected_source_digest)
     if source != request.expected_source_digest:
         raise _fail("SOURCE_CHANGED", "source digest differs")
     command = [str(request.python_executable), "-B", str(runtime), *request.argv]
-    started = time.monotonic()
     try:
         process = subprocess.Popen(command, cwd=root, env=_environment(), stdin=subprocess.DEVNULL,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False,
@@ -537,7 +575,7 @@ def invoke_core(request: CoreRequest) -> CoreResponse:
     timed_out = False
     exceeded: str | None = None
     while selector.get_map() or process.poll() is None:
-        remaining = request.timeout_ms / 1000 - (time.monotonic() - started)
+        remaining = deadline_at - time.monotonic()
         if remaining <= 0:
             timed_out = True
             break

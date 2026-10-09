@@ -3,6 +3,8 @@
 /ephemeral/
 /.elixir-tools/
 /.test-output/
+/.razr/memory.jsonl
+/.razr/memory.jsonl.lock
 /erl_crash.dump
 node_modules/
 __pycache__/

@@ -14,7 +14,7 @@ Razr-Pi treats the checked-out repository as the project brain; it does not requ
 
 Use human-provided Python, Git, Node and Pi. Never install or configure them implicitly. There is no npm build or third-party Python dependency. Validation and executable integration tests constitute the source build.
 
-Repository-native source, tests, configuration, and Git are durable project truth. Razr Memory stores bounded experience and rationale, while workflow artifacts preserve intent and provenance as needed. Comments explain non-obvious local intent or invariants; they do not narrate bug history. Regression tests carry behavioral memory, and Git plus Razr Memory carry historical context.
+Repository-native source, tests, configuration, and Git are durable project truth. Razr Memory stores repository-scoped, ledger-bounded experience and rationale, while workflow artifacts preserve intent and provenance as needed. Memory secret filtering is heuristic and does not make it a confidentiality boundary. Comments explain non-obvious local intent or invariants; they do not narrate bug history. Regression tests carry behavioral memory, and Git plus Razr Memory carry historical context.
 
 ## Prospective checks
 

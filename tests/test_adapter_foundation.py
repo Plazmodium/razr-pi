@@ -214,11 +214,12 @@ class AdapterFoundationTests(unittest.TestCase):
             try:
                 for mode, code in (("timeout", "TIMEOUT"), ("stdout", "OUTPUT_LIMIT"),
                                    ("stderr", "OUTPUT_LIMIT"), ("exit", "CORE_EXIT"), ("signal", "INTERRUPTED")):
-                    kwargs = {"timeout": 5000, "stdout": 10, "stderr": 10} if mode in {"stdout", "stderr"} else {}
+                    kwargs = ({"timeout": 5000, "stdout": 10, "stderr": 10} if mode in {"stdout", "stderr"}
+                              else {} if mode == "timeout" else {"timeout": 5000})
                     with self.assertRaises(ProtocolError) as caught:
                         invoke_core(request(mode, **kwargs))
                     self.assertEqual(caught.exception.code, code)
-                response = invoke_core(request("malformed"))
+                response = invoke_core(request("malformed", timeout=5000))
                 self.assertEqual(response.stdout, b"not-json\n")
                 duplicate = dataclasses.replace(request("malformed"), expected_provenance=pins + (pins[0],))
                 with self.assertRaises(ProtocolError) as caught:
