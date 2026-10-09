@@ -16,6 +16,11 @@ from adapter.herdr_provider import AttemptLedger, HerdrProvider, ProviderRequest
 from adapter.protocol import canonical_json, raw_file_digest
 
 
+def execution_host(*, workspace="w", tab="t", pane="p"):
+    return {"mode": "herdr", "caller": {"workspace_id": "w", "tab_id": "t", "pane_id": "p"},
+            "target": {"workspace_id": workspace, "tab_id": tab, "pane_id": pane}}
+
+
 class HerdrProviderTests(unittest.TestCase):
     def setUp(self):
         self.env = patch.dict(os.environ, {"HERDR_ENV": "1", "HERDR_WORKSPACE_ID": "w", "HERDR_TAB_ID": "t", "HERDR_PANE_ID": "p"})
@@ -30,14 +35,14 @@ class HerdrProviderTests(unittest.TestCase):
                 HerdrProvider().probe({"schema_version": 1, "request_id": "probe-1", "required_capabilities": [], "runtime": {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "thinking": "medium"}})
         self.assertEqual(caught.exception.code, "FANOUT_UNAVAILABLE")
 
-    def test_orchestrator_may_target_a_distinct_verified_herdr_pane(self):
+    def test_cross_pane_request_preserves_caller_and_binds_target_worktree(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve(); work = root / "work"; work.mkdir()
             output = root / "output"; output.mkdir(); session = root / "session"; session.mkdir()
             digest = "sha256:" + "a" * 64
+            host = execution_host(workspace="target-workspace", tab="target-tab", pane="target-pane")
             request = {"schema_version": 1, "request_id": "exec-cross-pane", "attempt_id": "att-cross-pane", "role": "worker",
-                       "host": {"mode": "herdr", "workspace_id": "target-workspace", "tab_id": "target-tab", "pane_id": "target-pane"},
-                       "work": {"work_id": "work", "node_id": "node", "generation": 1, "ordinal": 1},
+                       "host": host, "work": {"work_id": "work", "node_id": "node", "generation": 1, "ordinal": 1},
                        "worker_id": "worker-cross-pane", "branch": "feature/x",
                        "candidate": {"repository": "fixture", "branch": "feature/x", "commit": "0" * 40, "source_digest": digest},
                        "worktree": str(work), "cwd": str(work), "output_root": str(output), "output_root_id": "out-cross-pane", "output_root_digest": digest,
@@ -46,7 +51,20 @@ class HerdrProviderTests(unittest.TestCase):
                        "required_capabilities": ["runtime_identity"],
                        "runtime": {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "thinking": "medium"},
                        "limits": {"deadline_ms": 1000, "max_output_bytes": 1000}, "allowance_id": "allow-cross-pane"}
-            self.assertEqual(ProviderRequest(request).value["host"]["pane_id"], "target-pane")
+            parsed = ProviderRequest(request)
+            self.assertEqual(parsed.value["host"], host)
+            provider = HerdrProvider()
+            target = {"workspace_id": "target-workspace", "tab_id": "target-tab", "pane_id": "target-pane"}
+            with patch.object(provider, "_resolve_existing_worktree", return_value=target), patch("adapter.herdr_provider.verify_candidate_identity"):
+                provider._verify_candidate(parsed)
+            with patch.object(provider, "_resolve_existing_worktree", return_value={**target, "pane_id": "wrong-pane"}), patch("adapter.herdr_provider.verify_candidate_identity"):
+                with self.assertRaises(ProtocolError) as caught:
+                    provider._verify_candidate(parsed)
+            self.assertEqual(caught.exception.code, "IDENTITY_MISMATCH")
+            with patch.dict(os.environ, {"HERDR_PANE_ID": "different-caller"}):
+                with self.assertRaises(ProtocolError) as caught:
+                    ProviderRequest(request)
+            self.assertEqual(caught.exception.code, "IDENTITY_MISMATCH")
 
     def test_scoped_worktree_resolution_ignores_closed_historical_entries(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -234,7 +252,7 @@ class HerdrProviderTests(unittest.TestCase):
                 if argv[:3] == ["git", "-C", str(worktree)] and argv[3] == "ls-tree":
                     return subprocess.CompletedProcess(argv, 0, tree, b"")
                 raise AssertionError(argv)
-            request = {"schema_version": 1, "request_id": "exec-1", "attempt_id": "att-1", "role": "worker", "host": {"mode": "herdr", "workspace_id": "w", "tab_id": "t", "pane_id": "p"}, "work": {"work_id": "work", "node_id": "node", "generation": 1, "ordinal": 1}, "worker_id": "worker-1", "branch": "feature/x", "candidate": {"repository": "owner/repo", "branch": "feature/x", "commit": "0" * 40, "source_digest": source_digest}, "worktree": str(worktree), "cwd": str(worktree), "output_root": str(output), "output_root_id": "out-1", "output_root_digest": empty_digest, "session_root": str(session), "session_root_id": "sess-1", "session_root_digest": empty_digest, "fresh_context": True, "neutral_input_digest": "sha256:" + "a" * 64, "environment_policy_digest": "sha256:" + "b" * 64, "tool_policy_digest": "sha256:" + "c" * 64, "required_capabilities": ["runtime_identity"], "runtime": {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "thinking": "medium"}, "limits": {"deadline_ms": 1000, "max_output_bytes": 1000}, "allowance_id": "allow-1"}
+            request = {"schema_version": 1, "request_id": "exec-1", "attempt_id": "att-1", "role": "worker", "host": execution_host(), "work": {"work_id": "work", "node_id": "node", "generation": 1, "ordinal": 1}, "worker_id": "worker-1", "branch": "feature/x", "candidate": {"repository": "owner/repo", "branch": "feature/x", "commit": "0" * 40, "source_digest": source_digest}, "worktree": str(worktree), "cwd": str(worktree), "output_root": str(output), "output_root_id": "out-1", "output_root_digest": empty_digest, "session_root": str(session), "session_root_id": "sess-1", "session_root_digest": empty_digest, "fresh_context": True, "neutral_input_digest": "sha256:" + "a" * 64, "environment_policy_digest": "sha256:" + "b" * 64, "tool_policy_digest": "sha256:" + "c" * 64, "required_capabilities": ["runtime_identity"], "runtime": {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "thinking": "medium"}, "limits": {"deadline_ms": 1000, "max_output_bytes": 1000}, "allowance_id": "allow-1"}
             ledger = AttemptLedger(base / "attempts.jsonl")
             provider = HerdrProvider(runner=run, ledger=ledger, private_root=private)
             for bad_schema in (True, 1.0):
@@ -244,6 +262,11 @@ class HerdrProviderTests(unittest.TestCase):
             handle = response["result"]["handle"]
             self.assertEqual(open_calls, [])
             self.assertEqual(set(handle), {"provider_id", "handle_id", "request_digest", "attempt_id", "host", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest"})
+            self.assertEqual(handle["host"], execution_host())
+            started = json.loads(ledger.path.read_text().splitlines()[0])
+            self.assertEqual(started["herdr"], {"caller": execution_host()["caller"], "target": execution_host()["target"]})
+            private_handle = json.loads((private / "handles" / "handle-worker-1.json").read_text())
+            self.assertEqual(private_handle["handle"]["host"], execution_host())
             self.assertEqual(response["result"]["capability_report_digest"], provider.probe({"schema_version": 1, "request_id": "probe-after-launch", "required_capabilities": ["runtime_identity"], "runtime": request["runtime"]})["result"]["report_digest"])
             self.assertEqual(provider.inspect({"schema_version": 1, "request_id": "inspect-unique", "handle": handle})["request_id"], "inspect-unique")
             collected = HerdrProvider(runner=run, ledger=ledger, private_root=private)
@@ -265,7 +288,7 @@ class HerdrProviderTests(unittest.TestCase):
 
     def test_interrupt_request_id_is_echoed_and_closed(self):
         provider = HerdrProvider(runner=lambda *args, **kwargs: subprocess.CompletedProcess([], 0, b"", b""))
-        with patch.object(provider, "_interrupt_handle", return_value={"result": {"attempt_id": "att-1", "host": {"mode": "herdr", "workspace_id": "w", "tab_id": "t", "pane_id": "p"}, "requested": True, "observed": "TERMINATED", "cleanup": "confirmed"}}):
+        with patch.object(provider, "_interrupt_handle", return_value={"result": {"attempt_id": "att-1", "host": execution_host(), "requested": True, "observed": "TERMINATED", "cleanup": "confirmed"}}):
             result = provider.interrupt({"schema_version": 1, "request_id": "interrupt-unique", "handle": {}, "reason": "cancel"})
         self.assertEqual(result["request_id"], "interrupt-unique")
         with self.assertRaises(ProtocolError): provider.interrupt({"schema_version": 1, "request_id": "interrupt-unique", "handle": {}, "reason": "cancel", "extra": True})
@@ -273,7 +296,7 @@ class HerdrProviderTests(unittest.TestCase):
     def test_interrupt_repeat_is_idempotent_and_conflict_refuses_reuse(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); session = root / "session"; session.mkdir()
-            value = {"attempt_id": "att-repeat", "handle_id": "agent-repeat", "request_digest": "sha256:" + "a" * 64, "host": {"mode": "herdr", "workspace_id": "w", "tab_id": "t", "pane_id": "p"}}
+            value = {"attempt_id": "att-repeat", "handle_id": "agent-repeat", "request_digest": "sha256:" + "a" * 64, "host": execution_host()}
             provider = HerdrProvider(runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, b"", b""))
             provider._attempt_sessions[value["attempt_id"]] = session; provider._attempt_paths[value["attempt_id"]] = root
             with patch.object(provider, "_handle", return_value=value), patch.object(provider, "_inspect_handle", return_value={"result": {"status": "TERMINATED"}}), patch.object(provider, "_settle") as settle:
@@ -291,7 +314,7 @@ class HerdrProviderTests(unittest.TestCase):
             digest = "sha256:" + "a" * 64; ref = {"ref": ".razr/evidence/candidate.json", "digest_domain": "canonical_json", "digest": raw_file_digest(b"{}")}; packet_ref = {"ref": ".razr/request.json", "digest_domain": "canonical_json", "digest": raw_file_digest(b"{}")}
             started = {"schema_version": 1, "event": "STARTED", "attempt_id": "att-real-int", "work_id": "work", "node_id": "node", "worker_id": "worker", "observed_generation": 1, "observed_ordinal": 0, "provider_id": "herdr", "worktree_ref": ".", "branch": "feature/x", "allowance_id": "allow", "started_at": "2026-01-01T00:00:00Z", "started_at_source": "adapter_observed", "candidate": {"commit": "0" * 40, "source_digest": digest}, "candidate_evidence": ref, "request_packet": packet_ref, "output_root_id": "out", "output_root_digest": digest, "session_root_id": "sess", "session_root_digest": digest, "request_digest": digest, "herdr": {"workspace_id": "w", "tab_id": "t", "pane_id": "p"}, "prev_digest": "sha256:" + "0" * 64}
             started["record_digest"] = raw_file_digest(canonical_json(started)); ledger = AttemptLedger(root / "attempts.jsonl"); ledger.append(started)
-            value = {"attempt_id": "att-real-int", "handle_id": "agent-real", "request_digest": digest, "host": {"mode": "herdr", "workspace_id": "w", "tab_id": "t", "pane_id": "p"}, "output_root_id": "out", "output_root_digest": digest, "session_root_id": "sess", "session_root_digest": digest}
+            value = {"attempt_id": "att-real-int", "handle_id": "agent-real", "request_digest": digest, "host": execution_host(), "output_root_id": "out", "output_root_digest": digest, "session_root_id": "sess", "session_root_digest": digest}
             provider = HerdrProvider(ledger=ledger, runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, b"", b"")); provider._attempt_paths[value["attempt_id"]] = root; provider._attempt_sessions[value["attempt_id"]] = session
             with patch.object(provider, "_handle", return_value=value), patch.object(provider, "_inspect_handle", return_value={"result": {"status": "TERMINATED"}}):
                 result = provider._interrupt_handle(value, "cancel", "interrupt-real")
@@ -300,7 +323,7 @@ class HerdrProviderTests(unittest.TestCase):
     def test_failing_interrupt_replays_same_protocol_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); session = root / "session"; session.mkdir()
-            value = {"attempt_id": "att-fail", "handle_id": "agent-fail", "request_digest": "sha256:" + "a" * 64, "host": {"mode": "herdr", "workspace_id": "w", "tab_id": "t", "pane_id": "p"}}
+            value = {"attempt_id": "att-fail", "handle_id": "agent-fail", "request_digest": "sha256:" + "a" * 64, "host": execution_host()}
             calls = []
             def fail(argv, **kwargs): calls.append(argv); raise ProtocolError("INTERRUPT_FAILED", "signal failed", retryable=True, details={"source": "fake"})
             provider = HerdrProvider(runner=fail); provider._attempt_sessions[value["attempt_id"]] = session; provider._attempt_paths[value["attempt_id"]] = root
@@ -321,7 +344,7 @@ class HerdrProviderTests(unittest.TestCase):
             self.assertTrue((session / "collect-failure-att-corrupt.json").exists())
 
     def test_agent_get_nested_status_projection_maps_all_telemetry(self):
-        value = {"attempt_id": "att-status", "handle_id": "worker-status", "request_digest": "sha256:" + "a" * 64, "host": {"mode": "herdr", "workspace_id": "w", "tab_id": "t", "pane_id": "p"}, "output_root_id": "out", "output_root_digest": "sha256:" + "b" * 64, "session_root_id": "sess", "session_root_digest": "sha256:" + "c" * 64}
+        value = {"attempt_id": "att-status", "handle_id": "worker-status", "request_digest": "sha256:" + "a" * 64, "host": execution_host(), "output_root_id": "out", "output_root_digest": "sha256:" + "b" * 64, "session_root_id": "sess", "session_root_digest": "sha256:" + "c" * 64}
         provider = HerdrProvider(); provider._private_handles[value["handle_id"]] = {"session_status": "pending"}
         for telemetry, expected in (("starting", "STARTING"), ("working", "ACTIVE"), ("idle", "ACTIVE"), ("done", "ACTIVE"), ("blocked", "ACTIVE"), ("unknown", "UNKNOWN")):
             raw = {"id": "cli:agent:get", "result": {"agent": {"name": "worker-status", "agent_status": telemetry, "workspace_id": "w", "tab_id": "t", "pane_id": "p", "extra": True}}}
@@ -357,7 +380,7 @@ class HerdrProviderTests(unittest.TestCase):
             out = (Path(tmp) / "out").resolve(); out.mkdir()
             session = (Path(tmp) / "session").resolve(); session.mkdir()
             base = {"schema_version": 1, "request_id": "exec-1", "attempt_id": "att-1", "role": "technical",
-                    "host": {"mode": "herdr", "workspace_id": "w", "tab_id": "t", "pane_id": "p"},
+                    "host": execution_host(),
                     "work": {"work_id": "work", "node_id": "node", "generation": 1, "ordinal": 1},
                     "worker_id": "worker-1", "branch": "feature/x", "candidate": {"repository": "owner/repo", "branch": "feature/x", "commit": "0" * 40, "source_digest": "sha256:" + "f" * 64}, "worktree": str(root), "cwd": str(root),
                     "output_root": str(out), "output_root_id": "out-1", "output_root_digest": "sha256:" + "a" * 64,

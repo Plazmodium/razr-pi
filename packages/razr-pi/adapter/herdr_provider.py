@@ -104,15 +104,31 @@ def _host() -> dict[str, str]:
             "tab_id": _id(result["HERDR_TAB_ID"], "tab_id"), "pane_id": _id(result["HERDR_PANE_ID"], "pane_id")}
 
 
-def _target_host(value: object) -> dict[str, str]:
-    # The caller identity proves this is an in-Herdr orchestration request; the
-    # target pane is independently bound to the requested worktree before launch.
-    _host()
-    target = _closed(value, {"mode", "workspace_id", "tab_id", "pane_id"}, "target host")
-    if target["mode"] != "herdr":
-        raise _fail("IDENTITY_MISMATCH", "target host mode differs")
-    return {"mode": "herdr", "workspace_id": _id(target["workspace_id"], "workspace_id"),
-            "tab_id": _id(target["tab_id"], "tab_id"), "pane_id": _id(target["pane_id"], "pane_id")}
+def _identity(value: object, name: str) -> dict[str, str]:
+    identity = _closed(value, {"workspace_id", "tab_id", "pane_id"}, name)
+    return {key: _id(identity[key], key) for key in ("workspace_id", "tab_id", "pane_id")}
+
+
+def _execution_host(value: object) -> dict[str, object]:
+    host = _closed(value, {"mode", "caller", "target"}, "execution host")
+    if host["mode"] != "herdr":
+        raise _fail("IDENTITY_MISMATCH", "execution host mode differs")
+    caller = _identity(host["caller"], "caller host")
+    current = _host()
+    expected_caller = {key: current[key] for key in ("workspace_id", "tab_id", "pane_id")}
+    if caller != expected_caller:
+        raise _fail("IDENTITY_MISMATCH", "caller Herdr identity differs")
+    return {"mode": "herdr", "caller": caller, "target": _identity(host["target"], "target host")}
+
+
+def _target(value: Mapping[str, object]) -> Mapping[str, object]:
+    """Return target identity; legacy test/evidence values remain replayable only."""
+    target = value.get("target")
+    return target if isinstance(target, dict) else value
+
+
+def _ledger_host(value: Mapping[str, object]) -> dict[str, object]:
+    return {"caller": dict(value["caller"]), "target": dict(value["target"])}
 
 
 def _closed(value: object, fields: set[str], name: str) -> dict[str, object]:
@@ -278,8 +294,12 @@ class AttemptLedger:
             if "cleanup" in event and event["cleanup"] not in {"confirmed", "uncertain", "not_applicable"}:
                 raise _fail("LEDGER_CORRUPT", "invalid cleanup")
         if "herdr" in event:
-            host = _closed(event["herdr"], {"workspace_id", "tab_id", "pane_id"}, "herdr")
-            _id(host["workspace_id"], "workspace_id"); _id(host["tab_id"], "tab_id"); _id(host["pane_id"], "pane_id")
+            host = event["herdr"]
+            if isinstance(host, dict) and set(host) == {"caller", "target"}:
+                _identity(host["caller"], "ledger caller"); _identity(host["target"], "ledger target")
+            else:
+                # Retained revision-3 records used one overloaded target identity.
+                _identity(host, "legacy ledger target")
         expected = raw_file_digest(canonical_json({key: value for key, value in event.items() if key != "record_digest"}))
         if event["record_digest"] != expected: raise _fail("LEDGER_CORRUPT", "record digest differs")
         return event
@@ -453,7 +473,7 @@ class ProviderRequest:
         if not isinstance(self.value["schema_version"], int) or isinstance(self.value["schema_version"], bool) or self.value["schema_version"] != 1 or self.value["fresh_context"] is not True: raise _fail("INVALID_REQUEST", "invalid request version/context")
         _id(self.value["request_id"], "request_id"); _id(self.value["attempt_id"], "attempt_id"); _id(self.value["worker_id"], "worker_id"); _branch(self.value["branch"], "branch"); _id(self.value["allowance_id"], "allowance_id")
         if self.value["role"] not in {"technical", "contract", "worker"}: raise _fail("INVALID_REQUEST", "invalid role")
-        if self.value["host"] != _target_host(self.value["host"]): raise _fail("IDENTITY_MISMATCH", "Herdr target identity differs")
+        if self.value["host"] != _execution_host(self.value["host"]): raise _fail("IDENTITY_MISMATCH", "Herdr execution identity differs")
         work = _closed(self.value["work"], {"work_id", "node_id", "generation", "ordinal"}, "work")
         _id(work["work_id"], "work_id"); _id(work["node_id"], "node_id")
         if not isinstance(work["generation"], int) or isinstance(work["generation"], bool) or work["generation"] < 1 or not isinstance(work["ordinal"], int) or isinstance(work["ordinal"], bool) or work["ordinal"] < 0: raise _fail("STALE_GENERATION", "invalid generation/ordinal")
@@ -664,9 +684,10 @@ class HerdrProvider:
     def _verify_candidate(self, request: ProviderRequest) -> None:
         value = request.value
         root = _canonical_dir(value["worktree"], "worktree")
-        existing = self._resolve_existing_worktree(root, value["host"])
+        target = _target(value["host"])
+        existing = self._resolve_existing_worktree(root, target)
         opened = {**existing, "path": str(root)} if existing is not None else self.worktree_open(path=str(root))["result"]
-        if any(opened[key] != value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")):
+        if any(opened[key] != target[key] for key in ("workspace_id", "tab_id", "pane_id")):
             raise _fail("IDENTITY_MISMATCH", "dedicated worktree workspace differs from request host")
         root = _canonical_dir(value["worktree"], "worktree")
         # Provider-side re-verification confirms the checkout; candidate read-back remains foundation caller authority.
@@ -775,7 +796,7 @@ class HerdrProvider:
         self._verify_candidate(parsed)
         evidence = self._claim_roots(parsed, probe_report["result"]["report_digest"])
         value = parsed.value; deadline = value["limits"]["deadline_ms"]
-        started = {"schema_version": 1, "event": "STARTED", "attempt_id": value["attempt_id"], "work_id": value["work"]["work_id"], "node_id": value["work"]["node_id"], "observed_generation": value["work"]["generation"], "observed_ordinal": value["work"]["ordinal"], "worker_id": value["worker_id"], "branch": value["branch"], "worktree_ref": ".", "allowance_id": value["allowance_id"], "provider_id": self.provider_id, "started_at": _now(), "started_at_source": "adapter_observed", "candidate": {"commit": value["candidate"]["commit"], "source_digest": value["candidate"]["source_digest"]}, "candidate_evidence": evidence["candidate"], "request_packet": evidence["packet"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"], "request_digest": evidence["request_digest"], "herdr": {key: value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")}, "prev_digest": "sha256:" + "0" * 64}
+        started = {"schema_version": 1, "event": "STARTED", "attempt_id": value["attempt_id"], "work_id": value["work"]["work_id"], "node_id": value["work"]["node_id"], "observed_generation": value["work"]["generation"], "observed_ordinal": value["work"]["ordinal"], "worker_id": value["worker_id"], "branch": value["branch"], "worktree_ref": ".", "allowance_id": value["allowance_id"], "provider_id": self.provider_id, "started_at": _now(), "started_at_source": "adapter_observed", "candidate": {"commit": value["candidate"]["commit"], "source_digest": value["candidate"]["source_digest"]}, "candidate_evidence": evidence["candidate"], "request_packet": evidence["packet"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"], "request_digest": evidence["request_digest"], "herdr": _ledger_host(value["host"]), "prev_digest": "sha256:" + "0" * 64}
         # The ledger computes no authority: this is a durable observation only.
         # Its predecessor is supplied by the ledger caller/chain; STARTED must
         # be appended before the provider launch below.
@@ -788,7 +809,7 @@ class HerdrProvider:
         self._attempt_sessions[value["attempt_id"]] = _canonical_dir(value["session_root"], "session_root")
         self._attempt_roots[value["attempt_id"]] = (_canonical_dir(value["output_root"], "output_root"), _canonical_dir(value["session_root"], "session_root"))
         try:
-            response = self._exec([self.herdr, "agent", "start", value["worker_id"], "--kind", "pi", "--pane", value["host"]["pane_id"], "--timeout", str(deadline), "--", "--model", _MODEL, "--thinking", "medium", "--session-dir", value["session_root"], "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve"], timeout_ms=deadline, cwd=_canonical_dir(value["cwd"], "cwd"), max_output=value["limits"]["max_output_bytes"])
+            response = self._exec([self.herdr, "agent", "start", value["worker_id"], "--kind", "pi", "--pane", _target(value["host"])["pane_id"], "--timeout", str(deadline), "--", "--model", _MODEL, "--thinking", "medium", "--session-dir", value["session_root"], "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve"], timeout_ms=deadline, cwd=_canonical_dir(value["cwd"], "cwd"), max_output=value["limits"]["max_output_bytes"])
         except ProtocolError as exc:
             failure = _canonical_dir(value["worktree"], "worktree") / ".razr" / "evidence" / ("launch-failure-" + value["attempt_id"] + ".json")
             launch_code = exc.code if exc.code in {"LAUNCH_FAILED", "TIMEOUT", "OUTPUT_LIMIT", "PROVIDER_UNAVAILABLE"} else "LAUNCH_FAILED"
@@ -812,8 +833,9 @@ class HerdrProvider:
                 if not isinstance(agent["name"], str) or agent["name"] != value["worker_id"]: raise _fail("IDENTITY_MISMATCH", "agent name differs")
             elif "agent" not in agent or not isinstance(agent["agent"], str) or agent["agent"] != value["worker_id"]:
                 raise _fail("IDENTITY_MISMATCH", "agent name is missing")
+            target = _target(value["host"])
             for key in ("workspace_id", "tab_id", "pane_id"):
-                if not isinstance(agent.get(key), str) or agent[key] != value["host"][key]: raise _fail("IDENTITY_MISMATCH", "agent host identity differs")
+                if not isinstance(agent.get(key), str) or agent[key] != target[key]: raise _fail("IDENTITY_MISMATCH", "agent target identity differs")
             agent_id = agent["name"] if "name" in agent else agent["agent"]
             _id(agent_id, "agent_id")
             session_root = _canonical_dir(value["session_root"], "session_root")
@@ -839,8 +861,8 @@ class HerdrProvider:
             opaque_session = "pending"
             if canonical_session_path is not None: opaque_session = "pi-session-" + hashlib.sha256(str(canonical_session_path).encode("utf-8")).hexdigest()
             result = {"agent_id": agent_id, "workspace_id": agent["workspace_id"], "tab_id": agent["tab_id"], "pane_id": agent["pane_id"], "pi_session_id": opaque_session}
-            if any(result[key] != value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")): raise _fail("IDENTITY_MISMATCH", "agent host identity differs")
-            pane = _envelope(self._exec([self.herdr, "pane", "get", value["host"]["pane_id"]], timeout_ms=10_000), "pane", {"cli:pane:get"})
+            if any(result[key] != target[key] for key in ("workspace_id", "tab_id", "pane_id")): raise _fail("IDENTITY_MISMATCH", "agent target identity differs")
+            pane = _envelope(self._exec([self.herdr, "pane", "get", target["pane_id"]], timeout_ms=10_000), "pane", {"cli:pane:get"})
             pane_result = pane["result"]
             if not isinstance(pane_result, dict) or not isinstance(pane_result.get("pane"), dict): raise _fail("IDENTITY_MISMATCH", "pane response lacks nested pane")
             pane_result = pane_result["pane"]
@@ -1008,7 +1030,7 @@ class HerdrProvider:
         value = _closed(handle, fields, "handle")
         if value["provider_id"] != "herdr": raise _fail("IDENTITY_MISMATCH", "foreign provider handle")
         _id(value["handle_id"], "handle_id"); _id(value["attempt_id"], "attempt_id"); _digest(value["request_digest"], "request_digest"); _digest(value["output_root_digest"], "output_root_digest"); _digest(value["session_root_digest"], "session_root_digest")
-        if value["host"] != _target_host(value["host"]): raise _fail("IDENTITY_MISMATCH", "foreign Herdr target")
+        if value["host"] != _execution_host(value["host"]): raise _fail("IDENTITY_MISMATCH", "foreign Herdr execution identity")
         if self.private_root is None: raise _fail("IDENTITY_MISMATCH", "provider private root is unavailable")
         private_path = _canonical_dir(str(self.private_root), "private_root") / "handles" / ("handle-" + value["handle_id"] + ".json")
         try: private = _strict_json(_read_private_bytes(private_path, _canonical_dir(str(self.private_root), "private_root")))
@@ -1097,7 +1119,7 @@ class HerdrProvider:
             raise _fail("DIGEST_MISMATCH", "request packet digest differs")
         if not isinstance(packet, dict) or packet.get("capability_report_digest") != private["capability_report_digest"] or packet.get("request_digest") != started.get("request_digest"):
             raise _fail("IDENTITY_MISMATCH", "capability report/request packet identity differs")
-        if started is None or any(started.get(key) != value.get(key) for key in ("attempt_id", "provider_id", "request_digest", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest")) or started.get("herdr") != {key: value["host"][key] for key in ("workspace_id", "tab_id", "pane_id")}:
+        if started is None or any(started.get(key) != value.get(key) for key in ("attempt_id", "provider_id", "request_digest", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest")) or started.get("herdr") != _ledger_host(value["host"]):
             raise _fail("IDENTITY_MISMATCH", "handle does not match STARTED identity")
         return value
 
@@ -1173,8 +1195,9 @@ class HerdrProvider:
         if not isinstance(result, dict) or not isinstance(result.get("agent"), dict): raise _fail("ARTIFACT_UNAVAILABLE", "agent status lacks nested agent")
         agent = result["agent"]
         if not isinstance(agent.get("name"), str) or agent["name"] != value["handle_id"]: raise _fail("IDENTITY_MISMATCH", "agent status name differs")
+        target = _target(value["host"])
         for key in ("workspace_id", "tab_id", "pane_id"):
-            if not isinstance(agent.get(key), str) or agent[key] != value["host"][key]: raise _fail("IDENTITY_MISMATCH", "agent status host differs")
+            if not isinstance(agent.get(key), str) or agent[key] != target[key]: raise _fail("IDENTITY_MISMATCH", "agent status target differs")
         telemetry = agent.get("agent_status")
         if not isinstance(telemetry, str) or telemetry not in {"starting", "working", "idle", "done", "blocked", "unknown"}: raise _fail("ARTIFACT_UNAVAILABLE", "agent status is absent or malformed")
         status = {"starting": "STARTING", "working": "ACTIVE", "idle": "ACTIVE", "done": "ACTIVE", "blocked": "ACTIVE", "unknown": "UNKNOWN"}[telemetry]
@@ -1348,13 +1371,14 @@ class HerdrProvider:
         status = self._inspect_handle(value)["result"]["status"]
         try:
             worktree_root = _canonical_dir(str(self._attempt_paths[value["attempt_id"]]), "worktree")
-            self._exec([self.herdr, "worktree", "remove", "--workspace", value["host"]["workspace_id"], "--force"], timeout_ms=120_000)
+            target = _target(value["host"])
+            self._exec([self.herdr, "worktree", "remove", "--workspace", target["workspace_id"], "--force"], timeout_ms=120_000)
             workspace_response = _envelope(self._exec([self.herdr, "workspace", "list"], timeout_ms=10_000), "workspace list", {"cli:workspace:list"})
             workspace_result = workspace_response["result"]
             if not isinstance(workspace_result, dict) or workspace_result.get("type") != "workspace_list" or not isinstance(workspace_result.get("workspaces"), list): raise _fail("CLEANUP_UNKNOWN", "workspace list is malformed")
             for workspace in workspace_result["workspaces"]:
                 if not isinstance(workspace, dict) or not isinstance(workspace.get("workspace_id"), str): raise _fail("CLEANUP_UNKNOWN", "workspace identity is malformed")
-                if workspace["workspace_id"] == value["host"]["workspace_id"]: raise _fail("CLEANUP_UNKNOWN", "workspace remains after cleanup")
+                if workspace["workspace_id"] == target["workspace_id"]: raise _fail("CLEANUP_UNKNOWN", "workspace remains after cleanup")
             worktree_response = _envelope(self._exec([self.herdr, "worktree", "list"], timeout_ms=10_000), "worktree list", {"cli:worktree:list"})
             worktree_result = worktree_response["result"]
             if not isinstance(worktree_result, dict) or worktree_result.get("type") != "worktree_list" or not isinstance(worktree_result.get("worktrees"), list): raise _fail("CLEANUP_UNKNOWN", "worktree list is malformed")
