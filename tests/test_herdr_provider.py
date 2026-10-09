@@ -899,6 +899,32 @@ class HerdrProviderTests(unittest.TestCase):
             self.assertEqual(len(starts), 1); self.assertEqual(list(private.glob("dispatch-prepared-*.json")), [])
             self.assertEqual([row["event"] for row in ledger.records()], ["STARTED", "SETTLED"])
 
+    def test_post_started_tampered_prepared_bytes_refuse_before_claim_mutation(self):
+        for tamper in ("paths", "bytes"):
+            with self.subTest(tamper=tamper), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp).resolve(); request, current, probe, private, _, output, session = request_fixture(base, "att-prepared-tamper-" + tamper)
+                ledger = AttemptLedger(base / "attempts.jsonl"); starts = []
+                provider = HerdrProvider(runner=lambda argv, **kwargs: starts.append(argv), ledger=ledger, private_root=private)
+                with patch.object(provider, "probe", return_value=probe), patch.object(provider, "_verify_candidate"), \
+                     patch.object(provider, "_read_current_work", return_value=current), patch.object(provider, "_materialize_root_claims", side_effect=KeyboardInterrupt("crash after STARTED")):
+                    with self.assertRaises(KeyboardInterrupt): provider.launch(request)
+                prepared = private / ("dispatch-prepared-" + request["attempt_id"] + ".json"); original = prepared.read_bytes()
+                self.assertEqual(ledger.records()[0]["prepared_record_digest"], raw_file_digest(original))
+                rogue_output = private / ("rogue-output-" + tamper); rogue_session = private / ("rogue-session-" + tamper); rogue_output.mkdir(); rogue_session.mkdir()
+                if tamper == "paths":
+                    value = json.loads(original); value["roots"][0]["path"] = str(rogue_output); value["roots"][1]["path"] = str(rogue_session)
+                    prepared.write_bytes(canonical_json(value))
+                else:
+                    prepared.write_bytes(original + b" ")
+                restarted = HerdrProvider(runner=lambda argv, **kwargs: starts.append(argv), ledger=ledger, private_root=private)
+                with patch.object(restarted, "probe", return_value=probe), patch.object(restarted, "_read_current_work") as authority, \
+                     patch.object(restarted, "_verify_candidate") as candidate:
+                    with self.assertRaises(ProtocolError) as caught: restarted.launch(request)
+                self.assertEqual(caught.exception.code, "LEDGER_CORRUPT"); authority.assert_not_called(); candidate.assert_not_called()
+                self.assertEqual(starts, []); self.assertEqual([row["event"] for row in ledger.records()], ["STARTED"])
+                self.assertFalse((private / "root-claims.jsonl").exists()); self.assertFalse((private / "root-claims.state.json").exists())
+                for root in (output, session, rogue_output, rogue_session): self.assertFalse((root / ".razr-herdr-root.json").exists())
+
     def test_post_started_crash_is_reconciled_and_explicitly_recoverable(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp).resolve(); request, current, probe, private, worktree, output, session = request_fixture(base, "att-crash-window")

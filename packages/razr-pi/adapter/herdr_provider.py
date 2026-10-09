@@ -319,8 +319,8 @@ class AttemptLedger:
                "candidate_evidence", "request_packet", "output_root_id", "output_root_digest",
                "session_root_id", "session_root_digest", "outcome", "request_digest", "evidence_refs",
                "prev_digest", "record_digest"}
-    OPTIONAL_STARTED = {"herdr"}
-    OPTIONAL_SETTLED = {"herdr", "exit_code", "cleanup"}
+    OPTIONAL_STARTED = {"herdr", "prepared_record_digest"}
+    OPTIONAL_SETTLED = {"herdr", "exit_code", "cleanup", "prepared_record_digest"}
 
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -369,6 +369,7 @@ class AttemptLedger:
             raise _fail("LEDGER_CORRUPT", "invalid observed ordinal")
         _digest(event["output_root_digest"], "output_root_digest"); _digest(event["session_root_digest"], "session_root_digest")
         _digest(event["request_digest"], "request_digest"); _digest(event["prev_digest"], "prev_digest"); _digest(event["record_digest"], "record_digest")
+        if "prepared_record_digest" in event: _digest(event["prepared_record_digest"], "prepared_record_digest")
         candidate = event.get("candidate")
         if not isinstance(candidate, dict) or set(candidate) != {"commit", "source_digest"}:
             raise _fail("LEDGER_CORRUPT", "invalid candidate record")
@@ -427,7 +428,7 @@ class AttemptLedger:
                     roots[root_id] = attempt
             elif attempts[attempt] == "STARTED" and row["event"] == "SETTLED":
                 started = next(item for item in records if item["attempt_id"] == attempt and item["event"] == "STARTED")
-                for key in ("work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "branch", "worktree_ref", "candidate", "candidate_evidence", "request_packet", "request_digest", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "herdr"):
+                for key in ("work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "branch", "worktree_ref", "candidate", "candidate_evidence", "request_packet", "request_digest", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "prepared_record_digest", "herdr"):
                     if row.get(key) != started.get(key): raise _fail("IDENTITY_MISMATCH", f"settlement {key} differs")
                 attempts[attempt] = "SETTLED"
             else: raise _fail("LEDGER_CORRUPT", "invalid per-attempt event order")
@@ -662,7 +663,7 @@ class AttemptLedger:
             if event["event"] == "SETTLED" and (len(same) != 1 or same[0]["event"] != "STARTED"): raise _fail("INVALID_ORDER", "SETTLED requires one prior STARTED")
             if event["event"] == "SETTLED":
                 started = same[0]
-                for key in ("work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "branch", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest"):
+                for key in ("work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "branch", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest", "prepared_record_digest"):
                     if event.get(key) != started.get(key): raise _fail("IDENTITY_MISMATCH", f"settlement {key} differs")
                 if event.get("herdr") != started.get("herdr"): raise _fail("IDENTITY_MISMATCH", "settlement Herdr identity differs")
             journal = self._read_attempt_journal(dirfd); info = journal[0] if journal is not None else None
@@ -1114,17 +1115,19 @@ class HerdrProvider:
             elif observed[attempt_id] != expected_ids:
                 raise _fail("LEDGER_CORRUPT", "durable STARTED root claim history is missing")
 
-    def _prepared_authorizes_claims(self, attempt_id: str, request_digest: str, started: Mapping[str, object]) -> bool:
-        if self.ledger is None: return False
+    def _prepared_authorizes_claims(self, attempt_id: str, request_digest: str, started: Mapping[str, object], *, prepared_bytes: bytes | None = None) -> bool:
+        if self.ledger is None or not isinstance(started.get("prepared_record_digest"), str): return False
         records = self.ledger.records()
         matching_starts = [row for row in records if row["event"] == "STARTED" and row["attempt_id"] == attempt_id]
         if len(matching_starts) != 1 or matching_starts[0] != started or any(row["event"] == "SETTLED" and row["attempt_id"] == attempt_id for row in records):
             return False
         path = self._prepared_path(attempt_id)
         try:
-            if path.is_symlink() or not path.is_file(): return False
-            value = _strict_json(path.read_bytes())
-        except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError): return False
+            data = prepared_bytes if prepared_bytes is not None else _read_private_bytes(path, _canonical_dir(str(self.private_root), "private_root"))
+            if raw_file_digest(data) != started["prepared_record_digest"]: return False
+            value = _strict_json(data)
+            if canonical_json(value) != data: return False
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError, ProtocolError): return False
         expected = {"schema_version", "kind", "attempt_id", "request_digest", "worktree", "roots", "evidence"}
         if not isinstance(value, dict) or set(value) != expected or value["schema_version"] != 1 or value["kind"] != "dispatch_prepared" or value["attempt_id"] != attempt_id or value["request_digest"] != request_digest:
             return False
@@ -1424,8 +1427,10 @@ class HerdrProvider:
         records = self.ledger.records()
         for path in paths:
             if path.is_symlink() or not path.is_file(): raise _fail("LEDGER_CORRUPT", "prepared dispatch path is unsafe")
-            try: value = _strict_json(path.read_bytes())
-            except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+            try:
+                prepared_bytes = _read_private_bytes(path, private); value = _strict_json(prepared_bytes)
+                if canonical_json(value) != prepared_bytes: raise ValueError("noncanonical prepared record")
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError, ProtocolError) as exc:
                 raise _fail("LEDGER_CORRUPT", "prepared dispatch record is malformed") from exc
             expected = {"schema_version", "kind", "attempt_id", "request_digest", "worktree", "roots", "evidence"}
             if not isinstance(value, dict) or set(value) != expected or value["schema_version"] != 1 or value["kind"] != "dispatch_prepared":
@@ -1436,7 +1441,7 @@ class HerdrProvider:
             if started is not None and not settled:
                 # Only an unmatched STARTED may use its exact prepared crash record
                 # to complete path claims; settled attempts cannot recreate history.
-                if not self._prepared_authorizes_claims(attempt_id, request_digest, started):
+                if not self._prepared_authorizes_claims(attempt_id, request_digest, started, prepared_bytes=prepared_bytes):
                     raise _fail("LEDGER_CORRUPT", "prepared dispatch does not authorize unmatched STARTED recovery")
                 self._materialize_claim_values(attempt_id=attempt_id, request_digest=request_digest, roots=value["roots"])
             elif started is None:
@@ -1528,12 +1533,13 @@ class HerdrProvider:
             self._verify_candidate(parsed, deadline_at=deadline_at)
             evidence = self._prepare_launch_material(parsed, probe_report["result"]["report_digest"], current)
             prepared = self._stage_prepared(parsed, evidence)
+            prepared_record_digest = raw_file_digest(_read_private_bytes(prepared, private_root))
             try:
                 self._stage_attempt_evidence(evidence)
             except BaseException:
                 self._remove_prepared(prepared)
                 raise
-            started = {"schema_version": 1, "event": "STARTED", "attempt_id": value["attempt_id"], "work_id": value["work"]["work_id"], "node_id": value["work"]["node_id"], "observed_generation": value["work"]["generation"], "observed_ordinal": value["work"]["ordinal"], "worker_id": value["worker_id"], "branch": value["branch"], "worktree_ref": ".", "allowance_id": value["allowance_id"], "provider_id": self.provider_id, "started_at": _now(), "started_at_source": "adapter_observed", "candidate": {"commit": value["candidate"]["commit"], "source_digest": value["candidate"]["source_digest"]}, "candidate_evidence": evidence["candidate"], "request_packet": evidence["packet"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"], "request_digest": evidence["request_digest"], "herdr": _ledger_host(value["host"]), "prev_digest": "sha256:" + "0" * 64}
+            started = {"schema_version": 1, "event": "STARTED", "attempt_id": value["attempt_id"], "work_id": value["work"]["work_id"], "node_id": value["work"]["node_id"], "observed_generation": value["work"]["generation"], "observed_ordinal": value["work"]["ordinal"], "worker_id": value["worker_id"], "branch": value["branch"], "worktree_ref": ".", "allowance_id": value["allowance_id"], "provider_id": self.provider_id, "started_at": _now(), "started_at_source": "adapter_observed", "candidate": {"commit": value["candidate"]["commit"], "source_digest": value["candidate"]["source_digest"]}, "candidate_evidence": evidence["candidate"], "request_packet": evidence["packet"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"], "request_digest": evidence["request_digest"], "prepared_record_digest": prepared_record_digest, "herdr": _ledger_host(value["host"]), "prev_digest": "sha256:" + "0" * 64}
             try:
                 started = self.ledger.append(started)
             except ProtocolError as exc:
@@ -1563,7 +1569,7 @@ class HerdrProvider:
                                    "digest_domain": "raw_file", "digest": raw_file_digest(data), "kind": "launch_failure", "error_code": launch_code}
                 except (OSError, ProtocolError):
                     failure_ref = dict(evidence["launch_boundary"]); failure_ref.update({"kind": "launch_failure", "error_code": "LAUNCH_FAILED"})
-                settled = {key: started[key] for key in ("schema_version", "attempt_id", "work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "worktree_ref", "branch", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest", "herdr")}
+                settled = {key: started[key] for key in ("schema_version", "attempt_id", "work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "worktree_ref", "branch", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest", "prepared_record_digest", "herdr")}
                 settled.update({"event": "SETTLED", "settled_at": _now(), "outcome": "UNKNOWN" if exc.code in {"TIMEOUT", "CLEANUP_UNKNOWN"} else "FAILED", "evidence_refs": [failure_ref], "prev_digest": started["record_digest"], "cleanup": "uncertain" if exc.code == "CLEANUP_UNKNOWN" else "not_applicable"})
                 self.ledger._verify_settlement_evidence(settled, _canonical_dir(value["worktree"], "worktree"))
                 settled["record_digest"] = raw_file_digest(canonical_json(settled)); self.ledger.append(settled)
@@ -1673,6 +1679,7 @@ class HerdrProvider:
         started = next((row for row in durable if row["attempt_id"] == handle["attempt_id"] and row["event"] == "STARTED"), None)
         if started is None: raise _fail("INVALID_ORDER", "settlement has no STARTED event")
         settled = {key: started[key] for key in ("schema_version", "attempt_id", "work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "worktree_ref", "branch", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest", "herdr")}
+        if "prepared_record_digest" in started: settled["prepared_record_digest"] = started["prepared_record_digest"]
         supplemental = [{"ref": ".razr/evidence/" + artifact_name, "digest_domain": "raw_file", "digest": raw_file_digest(data), "kind": "result"}] if synthetic else []
         settled.update({"event": "SETTLED", "settled_at": _now(), "outcome": outcome, "evidence_refs": collected + supplemental, "prev_digest": started["record_digest"], "cleanup": cleanup})
         self.ledger._verify_settlement_evidence(settled, root)
