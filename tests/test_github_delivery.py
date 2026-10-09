@@ -531,6 +531,17 @@ class GithubDeliveryTests(unittest.TestCase):
         bound_read = {"schema_version": 1, "operation": "read", "url": URL,
                       "repository": "o/r", "base": "campaign/razr-pi-next", "branch": "feature",
                       "base_sha": "b" * 40, "head_sha": SHA, "source_digest": DIGEST}
+        contradictory = dict(bound_read); contradictory["repository"] = "other/repo"
+        with patch.object(cli.delivery, "auth_preflight") as auth, \
+             patch.object(cli.delivery, "remote_identity") as remote, patch.object(cli.delivery, "_json") as query, \
+             patch.object(cli.delivery, "pushed_head") as refs, patch.object(cli.delivery, "source_identity") as source, \
+             patch.object(cli.delivery, "_required_checks") as checks, patch.object(cli.delivery, "_threads") as threads, \
+             patch.object(cli.delivery, "read_pr") as read, patch.object(sys, "stdin", io.StringIO(json.dumps(contradictory))), \
+             patch.object(sys, "stdout", io.StringIO()) as stream:
+            self.assertEqual(cli.main(), 1)
+            self.assertIn('"code": "INVALID_REQUEST"', stream.getvalue())
+            for provider in (auth, remote, query, refs, source, checks, threads, read):
+                provider.assert_not_called()
         for missing in ("url", "repository", "base", "branch", "base_sha", "head_sha", "source_digest"):
             request = dict(bound_read); request.pop(missing)
             with self.subTest(missing=missing), patch.object(cli.delivery, "auth_preflight") as auth, \
@@ -557,6 +568,15 @@ class GithubDeliveryTests(unittest.TestCase):
                  patch.object(sys, "stdout", io.StringIO()) as stream:
                 self.assertEqual(cli.main(), 1)
                 self.assertIn('"code": "' + code + '"', stream.getvalue())
+
+    def test_adapter_rejects_contradictory_url_repository_before_provider(self):
+        with patch.object(delivery, "remote_identity") as remote, patch.object(delivery, "_json") as query, \
+             patch.object(delivery, "pushed_head") as refs, patch.object(delivery, "source_identity") as source, \
+             patch.object(delivery, "_required_checks") as checks, patch.object(delivery, "_threads") as threads:
+            with self.assertRaises(delivery.IdentityMismatch):
+                delivery.read_pr(Path("."), URL, **{**READ_EXPECTATIONS, "expected_repository": "other/repo"})
+            for provider in (remote, query, refs, source, checks, threads):
+                provider.assert_not_called()
 
     def test_thread_comment_pagination_reads_multiple_pages(self):
         first = {"data": {"repository": {"pullRequest": {"reviewThreads": {

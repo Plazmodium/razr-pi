@@ -58,7 +58,9 @@ def _validate_request(request: object) -> dict:
         if key in request and (not re.fullmatch(r"[A-Za-z0-9._/-]{1,255}", request[key]) or ".." in request[key]):
             raise ValueError(f"invalid {key}")
     if operation == "read":
-        delivery._pr_url(request["url"])
+        owner, repo, _ = delivery._pr_url(request["url"])
+        if f"{owner}/{repo}".lower() != request["repository"].lower():
+            raise ValueError("read URL repository contradicts repository expectation")
     for key in ("base_sha", "head_sha"):
         if key in request and not delivery.SHA_RE.fullmatch(request[key]):
             raise ValueError(f"invalid {key}")

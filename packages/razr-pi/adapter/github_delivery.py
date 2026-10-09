@@ -650,6 +650,8 @@ def read_pr(root: Path, url: str, *, expected_repository: str,
         raise InvalidRequest("read requires a valid source_digest expectation")
     owner, repo, number = _pr_url(url)
     repository = f"{owner}/{repo}"
+    if repository.lower() != expected_repository.lower():
+        raise IdentityMismatch("PR URL repository contradicts repository expectation")
     actual_repository = remote_identity(root)
     if repository.lower() != actual_repository.lower():
         raise IdentityMismatch("PR repository differs from configured remote")
