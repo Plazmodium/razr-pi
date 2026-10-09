@@ -61,7 +61,7 @@ class GithubDeliveryTests(unittest.TestCase):
     def test_realistic_populated_pr_schema_validates(self):
         realistic = pr_value(
             reviewDecision="APPROVED",
-            reviews=[{"id": "rv1", "author": {"login": "reviewer"}, "body": "ok", "commit": {"oid": SHA},
+            reviews=[{"id": "rv1", "author": {"login": "reviewer"}, "authorAssociation": "MEMBER", "body": "ok", "commit": {"oid": SHA},
                       "createdAt": "2026-01-01T00:00:00Z", "includesCreatedEdit": False,
                       "reactionGroups": [], "state": "APPROVED", "submittedAt": "2026-01-01T00:00:01Z", "updatedAt": "2026-01-01T00:00:01Z"}],
             comments=[{"id": "cm1", "author": {"login": "reviewer"}, "body": "note", "createdAt": "2026-01-01T00:00:00Z",

@@ -261,12 +261,14 @@ def _validate_pr(value: Any, url: str, owner: str, repo: str, number: int) -> di
                         or not isinstance(row.get("name"), str):
                     raise DeliveryError("malformed review request")
             elif field == "reviews":
-                allowed = {"id", "author", "body", "commit", "createdAt", "includesCreatedEdit",
+                allowed = {"id", "author", "authorAssociation", "body", "commit", "createdAt", "includesCreatedEdit",
                            "reactionGroups", "state", "submittedAt", "updatedAt"}
                 if set(row) - allowed or not isinstance(row.get("id"), str) or not row["id"] \
                         or not isinstance(row.get("state"), str) or row["state"] not in {"APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING"}:
                     raise DeliveryError("malformed review")
                 _author(row.get("author"))
+                if row.get("authorAssociation") not in {"COLLABORATOR", "CONTRIBUTOR", "FIRST_TIMER", "FIRST_TIME_CONTRIBUTOR", "MANNEQUIN", "MEMBER", "NONE", "OWNER"}:
+                    raise DeliveryError("unknown review author association")
                 _commit(row.get("commit"))
                 _reactions(row.get("reactionGroups"))
                 for key in ("body", "createdAt", "submittedAt", "updatedAt"):
