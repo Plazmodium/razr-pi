@@ -12,7 +12,25 @@ python3 -B tests/run_public.py --phase tracer --require-pi
 python3 -B tests/run_public.py --phase full --require-pi
 ```
 
-The workflow must obtain the actual first-task human checkpoint before expanding beyond the initial tracer. This runner does not authenticate human approval or require importing private checkpoint history. The full command performs a fresh tracer followed by public regression execution, not publication or a delivery lifecycle.
+The tracer is the Pi capability probe: it uses the installed local-package resolver with network blocked and constructs no agent, client, auth store, or model runtime. It then crosses explicit adoption → discovery → status/validation read-back. The workflow must obtain the actual first-task human checkpoint before expanding a real work item beyond its initial tracer. This runner does not authenticate human approval or require importing private checkpoint history. The full command performs a fresh tracer followed by public regression execution, not publication or a delivery lifecycle.
+
+### M10 clean-room focus
+
+M10 runs the three commands above from a fresh clone of the exact pushed head, then executes focused no-model observations:
+
+```sh
+(cd tests && python3 -B -m unittest -v test_context test_memory)
+(cd tests && python3 -B -m unittest -v test_herdr_provider)
+physical_root="$(pwd -P)"
+dogfood_root="$(mktemp -d "$physical_root/.test-output/m10-dogfood.XXXXXX")"
+mkdir "$dogfood_root/fixtures"
+(cd "$physical_root/tests" && PUBLIC_TEST_ROOT="$dogfood_root/fixtures" \
+  python3 -B -m unittest -v test_pi_surface test_primary_execution test_github_delivery)
+```
+
+Run these after the full runner has created and verified the owned `.test-output` root. The first focused command is the standalone context/Memory smoke. The second is mechanical Herdr provider acceptance, including real subprocess/Git fixtures and simulated Herdr responses; it is not a new live worker/model campaign. The third is an abbreviated package → workflow read-back → delivery-boundary dogfood; its explicit fixture root is private output, not source. All three are subsets of the full public suite and are rerun separately for clear attribution.
+
+A campaign PR is also read back from GitHub with exact base/head names and SHAs, checks, mergeability, review state, comments/requests, and review threads where exposed. The shipped `github-delivery.py read` operation may be used after creation with explicit repository, URL, base/head branch, base/head SHA, and computed source digest. Its output is a bounded non-atomic observation, not approval. No command in this section merges, deploys, publishes, or invokes a model.
 
 ## Source and test isolation
 
@@ -66,6 +84,10 @@ The delivery observation is bounded and non-atomic. PR scalar identity, GitHub A
 Required checks are classified from actual `gh` exit semantics. No checks is an observed `none` status, not proof that tests ran or passed. Create requires separate explicit authority and may report `created-but-unverified` with compensation unavailable/uncertain after transport/output/recovery failures. Confirmed compensation closes only a target independently bound to the attempted repository, PR number/URL, base/head branch names, and base/head OIDs. The helper is not a PR factory and does not merge, deploy, mutate Razr lifecycle state, infer approval, launch critics, or replace final human PR review.
 
 The focused suite and authenticated product read prove only the exact source, provider observations, fixtures, and commands actually executed. They do not prove atomic GitHub snapshots, complete provider collections, human approval, tests having run remotely, merge authorization, deployment authorization, or final campaign acceptance.
+
+## Local package declaration
+
+Pi can declare this reviewed local package with `pi install --local /reviewed/path/to/packages/razr-pi`; that changes project settings and is a human-owned operation, not part of the automated suite. The clean-room probe instead loads an owned relocated package through Pi's actual resource-loader API without changing user or project settings. Package loading must leave the project unadopted.
 
 ## Proof limitations
 
