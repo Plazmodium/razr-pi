@@ -726,7 +726,7 @@ class HerdrProviderTests(unittest.TestCase):
                 self.assertEqual([row["event"] for row in ledger.records()], ["STARTED", "SETTLED"])
                 restarted = HerdrProvider(runner=lambda argv, **kwargs: starts.append(argv), ledger=ledger, private_root=private)
                 with self.assertRaises(ProtocolError) as caught: run(restarted, request, current, probe)
-                self.assertEqual(caught.exception.code, "DUPLICATE_ATTEMPT")
+                self.assertEqual(caught.exception.code, "LEDGER_CORRUPT" if failing_step == 1 else "DUPLICATE_ATTEMPT")
                 self.assertEqual(starts, [])
 
     def test_committed_root_path_remains_consumed_after_settlement_and_recreation(self):
@@ -791,6 +791,35 @@ class HerdrProviderTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, "LEDGER_CORRUPT")
                 authority.assert_not_called(); candidate.assert_not_called()
                 self.assertEqual(len(starts), 1); self.assertEqual([row["event"] for row in ledger.records()], ["STARTED", "SETTLED"])
+
+    def test_settled_stale_prepared_cannot_recreate_missing_root_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve(); request, current, probe, private, _, output, _ = request_fixture(base, "att-stale-prepared")
+            ledger = AttemptLedger(base / "attempts.jsonl"); starts = []
+            def runner(argv, **kwargs):
+                if argv[:3] == ["herdr", "agent", "start"]:
+                    starts.append(argv); return subprocess.CompletedProcess(argv, 7, b"", b"failed")
+                raise AssertionError(argv)
+            provider = HerdrProvider(runner=runner, ledger=ledger, private_root=private)
+            with patch.object(provider, "probe", return_value=probe), patch.object(provider, "_verify_candidate"), \
+                 patch.object(provider, "_read_current_work", return_value=current), patch.object(provider, "_remove_prepared"):
+                with self.assertRaises(ProtocolError): provider.launch(request)
+            prepared = private / ("dispatch-prepared-" + request["attempt_id"] + ".json")
+            self.assertTrue(prepared.is_file()); self.assertEqual([row["event"] for row in ledger.records()], ["STARTED", "SETTLED"])
+            (private / "root-claims.jsonl").unlink(); (private / "root-claims.state.json").unlink()
+            __import__("shutil").rmtree(output); output.mkdir()
+            session2 = private / "session-after-stale-prepared"; session2.mkdir()
+            second = json.loads(json.dumps(request)); second.update({"request_id": "exec-after-stale-prepared",
+                "attempt_id": "att-after-stale-prepared", "allowance_id": "allow-after-stale-prepared",
+                "worker_id": "worker-after-stale-prepared", "output_root_id": "out-after-stale-prepared",
+                "session_root": str(session2), "session_root_id": "sess-after-stale-prepared"})
+            restarted = HerdrProvider(runner=runner, ledger=ledger, private_root=private)
+            with patch.object(restarted, "probe", return_value=probe), patch.object(restarted, "_read_current_work") as authority, \
+                 patch.object(restarted, "_verify_candidate") as candidate:
+                with self.assertRaises(ProtocolError) as caught: restarted.launch(second)
+            self.assertEqual(caught.exception.code, "LEDGER_CORRUPT"); authority.assert_not_called(); candidate.assert_not_called()
+            self.assertEqual(len(starts), 1); self.assertEqual([row["event"] for row in ledger.records()], ["STARTED", "SETTLED"])
+            self.assertTrue(prepared.is_file()); self.assertFalse((private / "root-claims.jsonl").exists()); self.assertFalse((private / "root-claims.state.json").exists())
 
     def test_lost_replaced_truncated_or_reset_attempt_journal_refuses_before_dispatch(self):
         for damage in ("missing", "replaced", "truncated", "prefix-reset", "state-missing"):

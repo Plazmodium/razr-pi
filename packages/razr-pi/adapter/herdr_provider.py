@@ -1115,6 +1115,11 @@ class HerdrProvider:
                 raise _fail("LEDGER_CORRUPT", "durable STARTED root claim history is missing")
 
     def _prepared_authorizes_claims(self, attempt_id: str, request_digest: str, started: Mapping[str, object]) -> bool:
+        if self.ledger is None: return False
+        records = self.ledger.records()
+        matching_starts = [row for row in records if row["event"] == "STARTED" and row["attempt_id"] == attempt_id]
+        if len(matching_starts) != 1 or matching_starts[0] != started or any(row["event"] == "SETTLED" and row["attempt_id"] == attempt_id for row in records):
+            return False
         path = self._prepared_path(attempt_id)
         try:
             if path.is_symlink() or not path.is_file(): return False
@@ -1168,27 +1173,34 @@ class HerdrProvider:
             os.replace(temporary, "root-claims.state.json", src_dir_fd=dirfd, dst_dir_fd=dirfd); os.fsync(dirfd)
         except OSError as exc: raise _fail("LEDGER_CORRUPT", "root claim state cannot be persisted") from exc
 
-    def _verify_root_claim_history(self) -> None:
+    def _verify_root_claim_history(self, *, allow_prepared_recovery: bool = False) -> None:
         if self.private_root is None: raise _fail("INVALID_REQUEST", "private root unavailable")
         started = self._started_claim_records(); private = _canonical_dir(str(self.private_root), "private_root")
+        authorized = [attempt_id for attempt_id, event in started.items()
+                      if allow_prepared_recovery and self._prepared_authorizes_claims(attempt_id, event["request_digest"], event)]
+        incomplete = authorized[0] if len(authorized) == 1 else None
         dirfd = os.open(private, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             state = self._root_claim_state(dirfd)
             try: fd = os.open("root-claims.jsonl", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
             except FileNotFoundError:
+                if state is None and incomplete is not None and set(started) == {incomplete}: return
                 if state is not None or started: raise _fail("LEDGER_CORRUPT", "durable root claim history is missing")
                 return
             with os.fdopen(fd, "r", encoding="utf-8") as stream:
                 info = os.fstat(stream.fileno())
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1: raise _fail("LEDGER_CORRUPT", "root claims is not a private regular file")
                 fcntl.flock(stream.fileno(), fcntl.LOCK_SH); rows = self._root_claim_rows(stream)
-            self._validate_root_claim_coverage(rows, started)
+            self._validate_root_claim_coverage(rows, started, incomplete_attempt=incomplete)
             if state is None:
+                if incomplete is not None and set(started) == {incomplete}: return
                 raise _fail("LEDGER_CORRUPT", "root claim state is missing")
-            if state is not None:
-                head = rows[-1]["record_digest"] if rows else "sha256:" + "0" * 64
-                if (state["journal_device"], state["journal_inode"], state["records"], state["head_digest"]) != (info.st_dev, info.st_ino, len(rows), head):
-                    raise _fail("LEDGER_CORRUPT", "root claim journal was replaced or lost")
+            if (state["journal_device"], state["journal_inode"]) != (info.st_dev, info.st_ino) or state["records"] > len(rows):
+                raise _fail("LEDGER_CORRUPT", "root claim journal was replaced or truncated")
+            state_head = rows[state["records"] - 1]["record_digest"] if state["records"] else "sha256:" + "0" * 64
+            if state["head_digest"] != state_head: raise _fail("LEDGER_CORRUPT", "root claim journal reset differs from state")
+            if state["records"] != len(rows) and (incomplete is None or any(row["attempt_id"] != incomplete for row in rows[state["records"]:])):
+                raise _fail("LEDGER_CORRUPT", "root claim history exceeds authenticated state")
         except OSError as exc: raise _fail("LEDGER_CORRUPT", "root claims cannot be read") from exc
         finally: os.close(dirfd)
 
@@ -1419,12 +1431,15 @@ class HerdrProvider:
             if not isinstance(value, dict) or set(value) != expected or value["schema_version"] != 1 or value["kind"] != "dispatch_prepared":
                 raise _fail("LEDGER_CORRUPT", "prepared dispatch record is not closed")
             attempt_id = _id(value["attempt_id"], "attempt_id"); request_digest = _digest(value["request_digest"], "request_digest")
-            started = any(row["attempt_id"] == attempt_id and row["event"] == "STARTED" for row in records)
-            if started:
-                # STARTED permanently owns both root identities and canonical paths,
-                # even when a post-START materialization failure was already settled.
+            started = next((row for row in records if row["attempt_id"] == attempt_id and row["event"] == "STARTED"), None)
+            settled = any(row["attempt_id"] == attempt_id and row["event"] == "SETTLED" for row in records)
+            if started is not None and not settled:
+                # Only an unmatched STARTED may use its exact prepared crash record
+                # to complete path claims; settled attempts cannot recreate history.
+                if not self._prepared_authorizes_claims(attempt_id, request_digest, started):
+                    raise _fail("LEDGER_CORRUPT", "prepared dispatch does not authorize unmatched STARTED recovery")
                 self._materialize_claim_values(attempt_id=attempt_id, request_digest=request_digest, roots=value["roots"])
-            else:
+            elif started is None:
                 try: worktree = _canonical_dir(value["worktree"], "prepared worktree")
                 except ProtocolError:
                     # No STARTED means no durable claim; an unavailable staging
@@ -1503,6 +1518,7 @@ class HerdrProvider:
             root = _canonical_dir(parsed.value[key], key)
             if root == private_root or not root.is_relative_to(private_root): raise _fail("PATH_ESCAPE", f"{key} is outside provider private root")
         with self._dispatch_lock():
+            self._verify_root_claim_history(allow_prepared_recovery=True)
             self._reconcile_prepared()
             self._verify_root_claim_history()
             self.ledger.assert_start_available(attempt_id=value["attempt_id"], allowance_id=value["allowance_id"],
