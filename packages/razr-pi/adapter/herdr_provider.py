@@ -609,16 +609,19 @@ class HerdrProvider:
     def _terminate_group(process: subprocess.Popen[bytes], grace: float = 0.5) -> None:
         try: os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError: pass
+        except PermissionError as exc: raise _fail("CLEANUP_UNKNOWN", "Herdr process group cannot be signalled") from exc
         try: process.wait(timeout=grace)
         except subprocess.TimeoutExpired:
             try: os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError: pass
+            except PermissionError as exc: raise _fail("CLEANUP_UNKNOWN", "Herdr process group cannot be killed") from exc
             try: process.wait(timeout=grace)
             except subprocess.TimeoutExpired as exc:
                 raise _fail("CLEANUP_UNKNOWN", "Herdr process group could not be reaped") from exc
         for _ in range(20):
             try: os.killpg(process.pid, 0)
             except ProcessLookupError: return
+            except PermissionError as exc: raise _fail("CLEANUP_UNKNOWN", "Herdr process-group cleanup cannot be observed") from exc
             time.sleep(0.01)
         raise _fail("CLEANUP_UNKNOWN", "Herdr process-group cleanup could not be verified")
 
@@ -681,6 +684,8 @@ class HerdrProvider:
                     os.killpg(process.pid, 0)
                 except ProcessLookupError:
                     pass
+                except PermissionError as exc:
+                    raise _fail("CLEANUP_UNKNOWN", "Herdr process-group state cannot be observed") from exc
                 else:
                     self._terminate_group(process)
                     reason = "ORPHANED_DESCENDANT"
@@ -861,7 +866,9 @@ class HerdrProvider:
             raise _fail("IDENTITY_MISMATCH", "dedicated worktree workspace differs from request host")
         root = _canonical_dir(value["worktree"], "worktree")
         # Provider-side re-verification confirms the checkout; candidate read-back remains foundation caller authority.
-        verify_candidate_identity(root, branch=value["candidate"]["branch"], commit=value["candidate"]["commit"], source_digest=value["candidate"]["source_digest"])
+        verify_candidate_identity(root, branch=value["candidate"]["branch"], commit=value["candidate"]["commit"],
+                                  source_digest=value["candidate"]["source_digest"],
+                                  deadline_at=self._operation_deadline_at)
 
     def _read_current_work(self, request: ProviderRequest) -> WorkflowRead:
         if self.core_request is None:
@@ -871,9 +878,10 @@ class HerdrProvider:
         if self.core_request.repository_root != root or self.core_request.cwd != root:
             raise _fail("IDENTITY_MISMATCH", "core readback root differs from dispatch worktree")
         remaining = self._remaining_ms(self._operation_deadline_at, self.core_request.timeout_ms)
-        bounded_core = dataclasses.replace(self.core_request, timeout_ms=max(1, remaining // 3))
+        bounded_core = dataclasses.replace(self.core_request, timeout_ms=remaining)
         try:
-            read = read_workflow(bounded_core, value["work"]["work_id"], value["work"]["node_id"])
+            read = read_workflow(bounded_core, value["work"]["work_id"], value["work"]["node_id"],
+                                 deadline_at=self._operation_deadline_at)
         except ProtocolError as exc:
             if exc.code in {"SOURCE_CHANGED", "IDENTITY_MISMATCH", "DIGEST_MISMATCH"}:
                 raise _fail("CANDIDATE_CHANGED", "core candidate readback changed", cause=exc.code) from exc
