@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import runpy
 from pathlib import Path
 import re
 import selectors
@@ -273,8 +274,8 @@ def _configured_work_root(root: Path, commit: str) -> str:
             return _core_work_root(root, commit)
         except Exception as exc:
             raise DeliveryError("validated Razr work root is unavailable") from exc
-    from runtime.scripts.razr import DEFAULT_CONFIG
-    work_root = DEFAULT_CONFIG.get("work_root")
+    core_namespace = runpy.run_path(str(Path(__file__).resolve().parents[1] / "runtime/scripts/razr.py"))
+    work_root = core_namespace.get("DEFAULT_CONFIG", {}).get("work_root")
     if not isinstance(work_root, str) or not work_root:
         raise DeliveryError("core default work root is unavailable")
     return work_root
