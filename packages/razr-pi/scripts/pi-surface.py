@@ -118,8 +118,14 @@ def context(root: Path, raw: str = "") -> object:
         "limits": {"max_files": 40, "max_bytes": 200000, "max_memory_records": 20},
     }
     value["request_id"] = "ctx-" + uuid.uuid4().hex
+    core_request = None
+    if isinstance(value.get("include"), dict) and value["include"].get("workflow") is True:
+        work_id = value.get("work_id")
+        if not isinstance(work_id, str) or not work_id:
+            raise ValueError("workflow context requires work_id")
+        core_request = _request(root, ("status", work_id, "--json"))
     with MemoryStore(root) as store:
-        return ContextEngine(root, memory=store).context(value)
+        return ContextEngine(root, memory=store, core_request=core_request).context(value)
 
 
 def main() -> int:

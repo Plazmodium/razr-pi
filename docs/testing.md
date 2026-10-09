@@ -41,6 +41,7 @@ The selected public modules are:
 | test_provenance | Six immutable core/template hashes, retained helper/provenance pins, relocation, missing/drifted files, unchanged license and file modes |
 | test_public_boundary | Exact tree, ignored private extras, missing fixtures before execution, synthetic privacy patterns, links, traversal, output ownership, imports, resources and fixture drift; genuine normal/linked repository identity, ambient-Git override isolation, malformed/outside/missing/linked administration and query-error refusals |
 | test_context | M03 tracer and deterministic bounded selector: source/tests/config/Git selection, omission limits, stale Memory labels and closed safe-path requests |
+| test_pi_surface | Pi-facing typed workflow context/status readback and standalone Herdr refusal |
 | test_named_regressions | Actual callback outcomes, subcases, fixture errors, skips/failures and explicit coverage mappings |
 | test_github_delivery | Bounded GitHub snapshot/read/create boundary: exact repository/base/head/source identity, host-pinned refs, required-check vocabulary/exits, provider schemas, two-pass stability, explicit incomplete collection metadata, candidate-bound recovery/compensation, and subprocess cleanup |
 
@@ -50,7 +51,7 @@ The public contract is newly authored, synthetic and unapproved. Test-owned copi
 
 ### M04 Herdr proof scope
 
-M04 is implemented and covered by focused provider regressions plus the full public runner. The proof includes structured capability/model/worktree/agent parsing, exact host identity, pending/bound private session evidence, append-only attempt settlement, bounded artifact collection, idempotent interruption, delegated cleanup, equal empty-root manifest digests with distinct root IDs/paths, and truthful UNKNOWN handling. It does not certify live Herdr/two-worker acceptance, execution of a model turn, human approval, independent critique, or campaign release gates.
+M04 is implemented and covered by focused provider regressions plus the full public runner. The proof includes structured capability/model/worktree/agent parsing, exact caller and target host identities, cross-pane orchestration, pending/bound private session evidence, append-only attempt settlement, bounded artifact collection, idempotent interruption, delegated cleanup, equal empty-root manifest digests with distinct root IDs/paths, and truthful UNKNOWN handling. The automated suite does not itself certify a live model turn, human approval, independent critique, or campaign release gates. The separate M08 campaign observation in `docs/campaigns/razr-pi-next.md` records the bounded live two-slice dogfood and its limitations.
 
 ## M07 GitHub delivery proof scope
 

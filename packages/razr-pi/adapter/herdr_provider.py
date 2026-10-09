@@ -104,6 +104,17 @@ def _host() -> dict[str, str]:
             "tab_id": _id(result["HERDR_TAB_ID"], "tab_id"), "pane_id": _id(result["HERDR_PANE_ID"], "pane_id")}
 
 
+def _target_host(value: object) -> dict[str, str]:
+    # The caller identity proves this is an in-Herdr orchestration request; the
+    # target pane is independently bound to the requested worktree before launch.
+    _host()
+    target = _closed(value, {"mode", "workspace_id", "tab_id", "pane_id"}, "target host")
+    if target["mode"] != "herdr":
+        raise _fail("IDENTITY_MISMATCH", "target host mode differs")
+    return {"mode": "herdr", "workspace_id": _id(target["workspace_id"], "workspace_id"),
+            "tab_id": _id(target["tab_id"], "tab_id"), "pane_id": _id(target["pane_id"], "pane_id")}
+
+
 def _closed(value: object, fields: set[str], name: str) -> dict[str, object]:
     if not isinstance(value, dict) or set(value) != fields:
         raise _fail("ARTIFACT_UNAVAILABLE", f"{name} has unknown or missing fields")
@@ -442,7 +453,7 @@ class ProviderRequest:
         if not isinstance(self.value["schema_version"], int) or isinstance(self.value["schema_version"], bool) or self.value["schema_version"] != 1 or self.value["fresh_context"] is not True: raise _fail("INVALID_REQUEST", "invalid request version/context")
         _id(self.value["request_id"], "request_id"); _id(self.value["attempt_id"], "attempt_id"); _id(self.value["worker_id"], "worker_id"); _branch(self.value["branch"], "branch"); _id(self.value["allowance_id"], "allowance_id")
         if self.value["role"] not in {"technical", "contract", "worker"}: raise _fail("INVALID_REQUEST", "invalid role")
-        if self.value["host"] != _host(): raise _fail("IDENTITY_MISMATCH", "Herdr host identity differs")
+        if self.value["host"] != _target_host(self.value["host"]): raise _fail("IDENTITY_MISMATCH", "Herdr target identity differs")
         work = _closed(self.value["work"], {"work_id", "node_id", "generation", "ordinal"}, "work")
         _id(work["work_id"], "work_id"); _id(work["node_id"], "node_id")
         if not isinstance(work["generation"], int) or isinstance(work["generation"], bool) or work["generation"] < 1 or not isinstance(work["ordinal"], int) or isinstance(work["ordinal"], bool) or work["ordinal"] < 0: raise _fail("STALE_GENERATION", "invalid generation/ordinal")
@@ -997,7 +1008,7 @@ class HerdrProvider:
         value = _closed(handle, fields, "handle")
         if value["provider_id"] != "herdr": raise _fail("IDENTITY_MISMATCH", "foreign provider handle")
         _id(value["handle_id"], "handle_id"); _id(value["attempt_id"], "attempt_id"); _digest(value["request_digest"], "request_digest"); _digest(value["output_root_digest"], "output_root_digest"); _digest(value["session_root_digest"], "session_root_digest")
-        if value["host"] != _host(): raise _fail("IDENTITY_MISMATCH", "foreign Herdr host")
+        if value["host"] != _target_host(value["host"]): raise _fail("IDENTITY_MISMATCH", "foreign Herdr target")
         if self.private_root is None: raise _fail("IDENTITY_MISMATCH", "provider private root is unavailable")
         private_path = _canonical_dir(str(self.private_root), "private_root") / "handles" / ("handle-" + value["handle_id"] + ".json")
         try: private = _strict_json(_read_private_bytes(private_path, _canonical_dir(str(self.private_root), "private_root")))

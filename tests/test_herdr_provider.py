@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "packages/razr-pi"))
-from adapter.herdr_provider import AttemptLedger, HerdrProvider, ProtocolError
+from adapter.herdr_provider import AttemptLedger, HerdrProvider, ProviderRequest, ProtocolError
 from adapter.protocol import canonical_json, raw_file_digest
 
 
@@ -29,6 +29,24 @@ class HerdrProviderTests(unittest.TestCase):
             with self.assertRaises(ProtocolError) as caught:
                 HerdrProvider().probe({"schema_version": 1, "request_id": "probe-1", "required_capabilities": [], "runtime": {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "thinking": "medium"}})
         self.assertEqual(caught.exception.code, "FANOUT_UNAVAILABLE")
+
+    def test_orchestrator_may_target_a_distinct_verified_herdr_pane(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve(); work = root / "work"; work.mkdir()
+            output = root / "output"; output.mkdir(); session = root / "session"; session.mkdir()
+            digest = "sha256:" + "a" * 64
+            request = {"schema_version": 1, "request_id": "exec-cross-pane", "attempt_id": "att-cross-pane", "role": "worker",
+                       "host": {"mode": "herdr", "workspace_id": "target-workspace", "tab_id": "target-tab", "pane_id": "target-pane"},
+                       "work": {"work_id": "work", "node_id": "node", "generation": 1, "ordinal": 1},
+                       "worker_id": "worker-cross-pane", "branch": "feature/x",
+                       "candidate": {"repository": "fixture", "branch": "feature/x", "commit": "0" * 40, "source_digest": digest},
+                       "worktree": str(work), "cwd": str(work), "output_root": str(output), "output_root_id": "out-cross-pane", "output_root_digest": digest,
+                       "session_root": str(session), "session_root_id": "sess-cross-pane", "session_root_digest": digest, "fresh_context": True,
+                       "neutral_input_digest": digest, "environment_policy_digest": digest, "tool_policy_digest": digest,
+                       "required_capabilities": ["runtime_identity"],
+                       "runtime": {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "thinking": "medium"},
+                       "limits": {"deadline_ms": 1000, "max_output_bytes": 1000}, "allowance_id": "allow-cross-pane"}
+            self.assertEqual(ProviderRequest(request).value["host"]["pane_id"], "target-pane")
 
     def test_scoped_worktree_resolution_ignores_closed_historical_entries(self):
         with tempfile.TemporaryDirectory() as tmp:
