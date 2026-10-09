@@ -21,9 +21,10 @@ M10 runs the three commands above from a fresh clone of the exact pushed head, t
 ```sh
 (cd tests && python3 -B -m unittest -v test_context test_memory)
 (cd tests && python3 -B -m unittest -v test_herdr_provider)
-dogfood_root="$(mktemp -d "$PWD/.test-output/m10-dogfood.XXXXXX")"
+physical_root="$(pwd -P)"
+dogfood_root="$(mktemp -d "$physical_root/.test-output/m10-dogfood.XXXXXX")"
 mkdir "$dogfood_root/fixtures"
-(cd tests && PUBLIC_TEST_ROOT="$dogfood_root/fixtures" \
+(cd "$physical_root/tests" && PUBLIC_TEST_ROOT="$dogfood_root/fixtures" \
   python3 -B -m unittest -v test_pi_surface test_primary_execution test_github_delivery)
 ```
 
