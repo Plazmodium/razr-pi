@@ -43,6 +43,22 @@ class PiSurfaceTests(FixtureTest):
         self.assertEqual(result["fanout"], {"availability": "unavailable", "code": "FANOUT_UNAVAILABLE"})
         self.assertTrue(all(value is None for value in result["candidate"].values()))
 
+    def test_context_includes_typed_workflow_readback_when_requested(self):
+        root, item = self.approved_item()
+        self.commit_adopted_root(root)
+        request = {"schema_version": 1, "request_id": "caller-replaced", "objective": "inspect active workflow",
+                   "repository_root": ".", "work_id": "public-probe", "paths": [],
+                   "include": {"workflow": True, "source": False, "tests": False, "config": False, "git": False, "memory": False},
+                   "limits": {"max_files": 4, "max_bytes": 1000, "max_memory_records": 1}}
+        before = surface(root)
+        response = json.loads(self.surface(root, "context", json.dumps(request)).stdout)
+        self.assertEqual(surface(root), before)
+        workflow = [entry for entry in response["result"]["items"] if entry["kind"] == "workflow"]
+        self.assertEqual(len(workflow), 1)
+        self.assertEqual(workflow[0]["ref"], "public-probe")
+        self.assertEqual(workflow[0]["authority"], "repository")
+        self.assertEqual(workflow[0]["metadata"]["type"], "core_readback")
+
     def test_status_requires_materialized_work_and_refuses_unknown_or_malformed(self):
         root = self.repo("unadopted")
         before = surface(root)
