@@ -64,8 +64,8 @@ class GithubDeliveryTests(unittest.TestCase):
             reviews=[{"id": "rv1", "author": {"login": "reviewer"}, "authorAssociation": "MEMBER", "body": "ok", "commit": {"oid": SHA},
                       "createdAt": "2026-01-01T00:00:00Z", "includesCreatedEdit": False,
                       "reactionGroups": [], "state": "APPROVED", "submittedAt": "2026-01-01T00:00:01Z", "updatedAt": "2026-01-01T00:00:01Z"}],
-            comments=[{"id": "cm1", "author": {"login": "reviewer"}, "body": "note", "createdAt": "2026-01-01T00:00:00Z",
-                       "isMinimized": False, "reactions": {"totalCount": 0}, "updatedAt": "2026-01-01T00:00:00Z", "url": "https://github.com/o/r/pull/1#issuecomment-1"}],
+            comments=[{"id": "cm1", "author": {"login": "reviewer"}, "authorAssociation": "MEMBER", "body": "note", "createdAt": "2026-01-01T00:00:00Z",
+                       "includesCreatedEdit": False, "isMinimized": False, "minimizedReason": None, "reactionGroups": [], "updatedAt": "2026-01-01T00:00:00Z", "url": "https://github.com/o/r/pull/1#issuecomment-1", "viewerDidAuthor": False}],
             statusCheckRollup=[{"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS",
                                 "completedAt": "2026-01-01T00:00:00Z", "detailsUrl": "https://example.invalid/ci", "workflowName": "CI"}])
         delivery._validate_pr(realistic, URL, "o", "r", 1)
@@ -87,6 +87,10 @@ class GithubDeliveryTests(unittest.TestCase):
                 with self.assertRaises(delivery.DeliveryError):
                     delivery.read_pr(Path("."), URL, **kwargs)
 
+    def test_hostile_gh_host_is_overridden(self):
+        with patch.dict(delivery.os.environ, {"GH_HOST": "evil.invalid"}):
+            self.assertEqual(delivery._env()["GH_HOST"], "github.com")
+
     def test_auth_output_is_not_returned(self):
         with patch.object(delivery, "_run", return_value="secret-looking status") as run:
             self.assertIsNone(delivery.auth_preflight(Path(".")))
@@ -101,24 +105,67 @@ class GithubDeliveryTests(unittest.TestCase):
              patch.object(delivery, "read_pr", return_value=existing) as read, \
              patch.object(delivery, "_run") as run:
             self.assertEqual(delivery.create_pr(Path("."), base="campaign/razr-pi-next", head="feature",
-                                                title="candidate", body="body"), existing)
+                                                title="candidate", body="body", expected_repository="o/r",
+                                                expected_base_sha="b" * 40, expected_head_sha=SHA,
+                                                expected_source_digest=DIGEST), existing)
             run.assert_not_called()
             read.assert_called_once()
+
+    def test_create_source_mismatch_prevents_mutation(self):
+        with patch.object(delivery, "remote_identity", return_value="o/r"), \
+             patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA]), \
+             patch.object(delivery, "source_identity", return_value="sha256:" + "d" * 64), \
+             patch.object(delivery, "_json") as query, patch.object(delivery, "_run") as mutate:
+            with self.assertRaises(delivery.InvalidRequest):
+                delivery.create_pr(Path("."), base="base", head="feature", title="t", body="b",
+                                   expected_repository="o/r", expected_base_sha="b" * 40,
+                                   expected_head_sha=SHA, expected_source_digest=DIGEST)
+            query.assert_not_called()
+            mutate.assert_not_called()
 
     def test_create_refuses_remote_expectation_override(self):
         with patch.object(delivery, "remote_identity", return_value="o/r"):
             with self.assertRaisesRegex(delivery.DeliveryError, "repository expectation"):
                 delivery.create_pr(Path("."), base="base", head="feature", title="t", body="b",
-                                   expected_repository="other/repo")
+                                   expected_repository="other/repo", expected_base_sha="b" * 40,
+                                   expected_head_sha=SHA, expected_source_digest=DIGEST)
 
     def test_create_recovers_one_racing_server_pr(self):
         with patch.object(delivery, "remote_identity", return_value="o/r"), \
-             patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA]), \
-             patch.object(delivery, "source_identity", return_value=DIGEST), \
+             patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA, "b" * 40, SHA]), \
+             patch.object(delivery, "source_identity", side_effect=[DIGEST, DIGEST]), \
              patch.object(delivery, "_json", side_effect=[[], [{"url": URL}]]), \
              patch.object(delivery, "_run", side_effect=delivery.DeliveryError("create failed")), \
              patch.object(delivery, "read_pr", return_value={"number": 1}):
-            self.assertEqual(delivery.create_pr(Path("."), base="base", head="feature", title="t", body="b")["number"], 1)
+            self.assertEqual(delivery.create_pr(Path("."), base="base", head="feature", title="t", body="b",
+                                                 expected_repository="o/r", expected_base_sha="b" * 40,
+                                                 expected_head_sha=SHA, expected_source_digest=DIGEST)["number"], 1)
+
+    def test_create_refuses_branch_movement_before_mutation(self):
+        moved = "d" * 40
+        with patch.object(delivery, "remote_identity", return_value="o/r"), \
+             patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA, "b" * 40, moved]), \
+             patch.object(delivery, "source_identity", side_effect=[DIGEST, DIGEST]), \
+             patch.object(delivery, "_json", return_value=[]), patch.object(delivery, "_run") as mutate:
+            with self.assertRaises(delivery.CandidateChanged):
+                delivery.create_pr(Path("."), base="base", head="feature", title="t", body="b",
+                                   expected_repository="o/r", expected_base_sha="b" * 40,
+                                   expected_head_sha=SHA, expected_source_digest=DIGEST)
+            mutate.assert_not_called()
+
+    def test_new_mismatched_pr_is_closed_but_race_recovery_is_not(self):
+        with patch.object(delivery, "remote_identity", return_value="o/r"), \
+             patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA, "b" * 40, SHA]), \
+             patch.object(delivery, "source_identity", side_effect=[DIGEST, DIGEST]), \
+             patch.object(delivery, "_json", return_value=[]), \
+             patch.object(delivery, "_run", side_effect=[URL, ""]) as run, \
+             patch.object(delivery, "read_pr", side_effect=delivery.CandidateChanged("moved")):
+            with self.assertRaises(delivery.CandidateChanged):
+                delivery.create_pr(Path("."), base="base", head="feature", title="t", body="b",
+                                   expected_repository="o/r", expected_base_sha="b" * 40,
+                                   expected_head_sha=SHA, expected_source_digest=DIGEST)
+            self.assertIn("close", run.call_args_list[-1].args[1])
+            self.assertNotIn("--delete-branch", run.call_args_list[-1].args[1])
 
     def test_create_refuses_ambiguous_existing_prs(self):
         with patch.object(delivery, "remote_identity", return_value="o/r"), \
@@ -127,10 +174,13 @@ class GithubDeliveryTests(unittest.TestCase):
              patch.object(delivery, "_json", return_value=[{"url": URL}, {"url": URL.replace("/1", "/2")}]):
             with self.assertRaisesRegex(delivery.DeliveryError, "ambiguous"):
                 delivery.create_pr(Path("."), base="campaign/razr-pi-next", head="feature",
-                                   title="candidate", body="body")
+                                   title="candidate", body="body", expected_repository="o/r",
+                                   expected_base_sha="b" * 40, expected_head_sha=SHA,
+                                   expected_source_digest=DIGEST)
 
     def test_required_check_states_are_truthful(self):
-        cases = [("", "none"), ('[{"name":"ci","state":"QUEUED","bucket":"PENDING"}]', "pending"),
+        cases = [("", "none"), ('[{"name":"ci","state":"SUCCESS","bucket":"pass"}]', "passing"),
+                 ('[{"name":"ci","state":"QUEUED","bucket":"PENDING"}]', "pending"),
                  ('[{"name":"ci","state":"COMPLETED","bucket":"FAIL"}]', "failing"),
                  ('[{"name":"ci","state":"COMPLETED","bucket":"PASS"}]', "passing"),
                  ('[{"name":"ci","state":"completed","bucket":"skipping"}]', "skipping")]
@@ -217,16 +267,19 @@ class GithubDeliveryTests(unittest.TestCase):
 
     def test_create_has_no_lifecycle_flags(self):
         with patch.object(delivery, "remote_identity", return_value="o/r"), \
-             patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA]), \
-             patch.object(delivery, "source_identity", return_value=DIGEST), \
+             patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA, "b" * 40, SHA]), \
+             patch.object(delivery, "source_identity", side_effect=[DIGEST, DIGEST]), \
              patch.object(delivery, "_json", return_value=[]), \
              patch.object(delivery, "_run", return_value=URL) as run, \
              patch.object(delivery, "read_pr", return_value=pr_value()):
-            delivery.create_pr(Path("."), base="campaign/razr-pi-next", head="feature", title="t", body="b")
+            delivery.create_pr(Path("."), base="campaign/razr-pi-next", head="feature", title="t", body="b",
+                               expected_repository="o/r", expected_base_sha="b" * 40,
+                               expected_head_sha=SHA, expected_source_digest=DIGEST)
             args = run.call_args.args[1]
             self.assertIn("--repo", args)
-            self.assertIn("o/r", args)
-            self.assertNotIn("--force", args + ["--merge", "--auto", "--delete-branch"])
+            self.assertIn("github.com/o/r", args)
+            for prohibited in ("--force", "--merge", "--auto", "--delete-branch", "--admin", "--squash", "--rebase", "--deploy"):
+                self.assertNotIn(prohibited, args)
 
 
 if __name__ == "__main__":

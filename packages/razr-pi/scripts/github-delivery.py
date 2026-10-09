@@ -47,7 +47,7 @@ def _validate_request(request: object) -> dict:
     elif operation == "read":
         allowed, required = common | {"url", "repository", "base", "branch", "base_sha", "head_sha", "source_digest"}, ("url",)
     else:
-        allowed, required = common | {"base", "branch", "title", "body", "repository", "base_sha", "head_sha", "source_digest"}, ("base", "branch", "title", "body")
+        allowed, required = common | {"base", "branch", "title", "body", "repository", "base_sha", "head_sha", "source_digest"}, ("base", "branch", "title", "body", "repository", "base_sha", "head_sha", "source_digest")
     if set(request) - allowed:
         raise ValueError("unknown operation field")
     for key in required:

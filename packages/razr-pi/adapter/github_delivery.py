@@ -22,7 +22,7 @@ PR_STATES = {"OPEN", "CLOSED", "MERGED"}
 MERGEABLE = {"CONFLICTING", "MERGEABLE", "UNKNOWN"}
 MERGE_STATES = {"BEHIND", "BLOCKED", "CLEAN", "DIRTY", "DRAFT", "HAS_HOOK_ERRORS", "UNKNOWN", "UNSTABLE"}
 CHECK_BUCKETS = {"PASS", "FAIL", "PENDING", "SKIPPING"}
-CHECK_STATES = {"QUEUED", "IN_PROGRESS", "COMPLETED", "EXPECTED", "REQUESTED", "WAITING", "PENDING"}
+CHECK_STATES = {"QUEUED", "IN_PROGRESS", "COMPLETED", "EXPECTED", "REQUESTED", "WAITING", "PENDING", "SUCCESS", "FAILURE", "ERROR"}
 
 
 class DeliveryError(RuntimeError):
@@ -33,12 +33,18 @@ class InvalidRequest(DeliveryError):
     pass
 
 
+class CandidateChanged(DeliveryError):
+    pass
+
+
 def _env() -> dict[str, str]:
     names = ("PATH", "HOME", "TMPDIR", "GH_HOST", "LANG", "LC_ALL", "LC_CTYPE",
              "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_OPTIONAL_LOCKS",
              "GIT_TERMINAL_PROMPT")
     result = {key: os.environ[key] for key in names if os.environ.get(key) is not None}
     result.setdefault("PATH", os.defpath)
+    # Do not permit an ambient host to redirect verified github.com identity.
+    result["GH_HOST"] = "github.com"
     result.update({"LANG": "C.UTF-8", "LC_ALL": "C.UTF-8", "GIT_CONFIG_NOSYSTEM": "1",
                    "GIT_CONFIG_GLOBAL": os.devnull, "GIT_OPTIONAL_LOCKS": "0",
                    "GIT_TERMINAL_PROMPT": "0"})
@@ -85,7 +91,17 @@ def _capture(program: str, args: list[str], cwd: Path, *, timeout: float = 30.0,
     if overflow:
         _terminate_group(process)
         raise DeliveryError("bounded response refused")
-    code = process.wait()
+    if process.poll() is None:
+        remaining = deadline - __import__("time").monotonic()
+        if remaining <= 0:
+            _terminate_group(process)
+            raise DeliveryError(f"{program} timed out")
+        try:
+            process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            _terminate_group(process)
+            raise DeliveryError(f"{program} timed out")
+    code = process.returncode
     if code not in (accepted_codes or {0}):
         # stderr is deliberately never included: credential helpers can write there.
         raise DeliveryError(f"{program} request failed")
@@ -93,25 +109,35 @@ def _capture(program: str, args: list[str], cwd: Path, *, timeout: float = 30.0,
 
 
 def _terminate_group(process: subprocess.Popen[bytes]) -> None:
+    deadline = __import__("time").monotonic() + 0.5
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError):
-        try:
-            process.wait()
-        except subprocess.TimeoutExpired:
-            pass
-        for stream in (process.stdout, process.stderr):
-            if stream is not None:
-                stream.close()
-        return
+        pass
     try:
-        process.wait(timeout=0.25)
+        remaining = max(0.0, deadline - __import__("time").monotonic())
+        process.wait(timeout=remaining)
     except subprocess.TimeoutExpired:
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
-        process.wait()
+        try:
+            process.wait(timeout=max(0.0, deadline - __import__("time").monotonic()))
+        except subprocess.TimeoutExpired:
+            raise DeliveryError("process-group cleanup timed out")
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        pass
+    except PermissionError as exc:
+        raise DeliveryError("process-group cleanup could not be verified") from exc
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        raise DeliveryError("process-group survivor detected")
     for stream in (process.stdout, process.stderr):
         if stream is not None:
             stream.close()
@@ -257,9 +283,15 @@ def _validate_pr(value: Any, url: str, owner: str, repo: str, number: int) -> di
         rows = _validate_collection(value.get(field), field)
         for row in rows:
             if field == "reviewRequests":
-                if set(row) != {"login", "name"} or not isinstance(row.get("login"), str) \
-                        or not isinstance(row.get("name"), str):
-                    raise DeliveryError("malformed review request")
+                typename = row.get("__typename")
+                if typename == "User":
+                    if set(row) != {"__typename", "login"} or not isinstance(row.get("login"), str) or not row["login"]:
+                        raise DeliveryError("malformed user review request")
+                elif typename == "Team":
+                    if set(row) != {"__typename", "name"} or not isinstance(row.get("name"), str) or not row["name"]:
+                        raise DeliveryError("malformed team review request")
+                else:
+                    raise DeliveryError("unknown review request type")
             elif field == "reviews":
                 allowed = {"id", "author", "authorAssociation", "body", "commit", "createdAt", "includesCreatedEdit",
                            "reactionGroups", "state", "submittedAt", "updatedAt"}
@@ -276,14 +308,16 @@ def _validate_pr(value: Any, url: str, owner: str, repo: str, number: int) -> di
                 if not isinstance(row.get("includesCreatedEdit"), bool):
                     raise DeliveryError("malformed review metadata")
             elif field == "comments":
-                allowed = {"id", "author", "body", "createdAt", "isMinimized", "reactions", "updatedAt", "url"}
+                allowed = {"id", "author", "authorAssociation", "body", "createdAt", "includesCreatedEdit", "isMinimized", "minimizedReason", "reactionGroups", "updatedAt", "url", "viewerDidAuthor"}
                 if set(row) - allowed or not isinstance(row.get("id"), str) or not row["id"] \
-                        or not isinstance(row.get("body"), str) or not isinstance(row.get("isMinimized"), bool):
+                        or not isinstance(row.get("body"), str) or not isinstance(row.get("isMinimized"), bool) \
+                        or not isinstance(row.get("includesCreatedEdit"), bool) or not isinstance(row.get("viewerDidAuthor"), bool):
                     raise DeliveryError("malformed comment")
                 _author(row.get("author"))
-                if "reactions" in row:
-                    _reaction_summary(row["reactions"])
-                for key in ("createdAt", "updatedAt", "url"):
+                if row.get("authorAssociation") not in {"COLLABORATOR", "CONTRIBUTOR", "FIRST_TIMER", "FIRST_TIME_CONTRIBUTOR", "MANNEQUIN", "MEMBER", "NONE", "OWNER"}:
+                    raise DeliveryError("unknown comment author association")
+                _reactions(row.get("reactionGroups"))
+                for key in ("createdAt", "minimizedReason", "updatedAt", "url"):
                     _nullable_string(row.get(key), "comment " + key)
             else:
                 allowed = {"__typename", "completedAt", "conclusion", "context", "createdAt", "detailsUrl", "event", "group", "headSha", "name", "startedAt", "state", "status", "targetUrl", "updatedAt", "workflowName"}
@@ -310,9 +344,13 @@ def _validate_pr(value: Any, url: str, owner: str, repo: str, number: int) -> di
     return value
 
 
+def _repo_arg(repository: str) -> str:
+    return "github.com/" + repository
+
+
 def _required_checks(root: Path, url: str, repository: str) -> tuple[list[dict[str, str]], str]:
     try:
-        raw = _run("gh", ["pr", "checks", url, "--repo", repository, "--required", "--json", "name,state,bucket"], root,
+        raw = _run("gh", ["pr", "checks", url, "--repo", _repo_arg(repository), "--required", "--json", "name,state,bucket"], root,
                    accepted_codes={0, 1, 8})
         rows = [] if not raw else json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -453,11 +491,11 @@ def read_pr(root: Path, url: str, *, expected_repository: str | None = None,
     fields = ("number,url,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,"
               "mergeStateStatus,mergeable,reviewDecision,reviewRequests,reviews,comments,"
               "statusCheckRollup,mergedAt,closedAt,updatedAt")
-    value = _validate_pr(_json("gh", ["pr", "view", url, "--repo", actual_repository, "--json", fields], root), url, owner, repo, number)
+    value = _validate_pr(_json("gh", ["pr", "view", url, "--repo", _repo_arg(actual_repository), "--json", fields], root), url, owner, repo, number)
     actual_base_sha = pushed_head(root, value["baseRefName"])
     actual_head_sha = pushed_head(root, value["headRefName"])
     if value["baseRefOid"] != actual_base_sha or value["headRefOid"] != actual_head_sha:
-        raise DeliveryError("PR SHA differs from current remote branch")
+        raise CandidateChanged("PR SHA differs from current remote branch")
     if expected_repository and actual_repository.lower() != expected_repository.lower():
         raise DeliveryError("PR repository expectation mismatch")
     if expected_base is not None and value["baseRefName"] != expected_base:
@@ -481,7 +519,7 @@ def read_pr(root: Path, url: str, *, expected_repository: str | None = None,
 
 def _existing_open(root: Path, repository: str, base: str, head: str, base_sha: str,
                    head_sha: str, source_digest: str) -> dict[str, Any] | None:
-    rows = _json("gh", ["pr", "list", "--repo", repository, "--state", "open", "--base", base,
+    rows = _json("gh", ["pr", "list", "--repo", _repo_arg(repository), "--state", "open", "--base", base,
                          "--head", head, "--json", "url"], root)
     if not isinstance(rows, list) or any(not isinstance(row, dict) or set(row) != {"url"} for row in rows):
         raise DeliveryError("existing PR query schema is invalid")
@@ -495,14 +533,22 @@ def _existing_open(root: Path, repository: str, base: str, head: str, base_sha: 
                    expected_source_digest=source_digest)
 
 
+def _close_created(root: Path, repository: str, url: str) -> None:
+    # GitHub's branch-name PR create has no atomic expected-head argument. This
+    # compensates only a URL returned by this invocation, never a race-recovered PR.
+    _run("gh", ["pr", "close", url, "--repo", _repo_arg(repository)], root)
+
+
 def create_pr(root: Path, *, base: str, head: str, title: str, body: str,
               expected_repository: str | None = None, expected_base_sha: str | None = None,
               expected_head_sha: str | None = None, expected_source_digest: str | None = None) -> dict[str, Any]:
-    if not base or not head or not title or len(title) > 256 or len(body) > 100000:
-        raise InvalidRequest("invalid PR request")
+    if not base or not head or not title or len(title) > 256 or len(body) > 100000 \
+            or not isinstance(expected_repository, str) or not isinstance(expected_base_sha, str) \
+            or not isinstance(expected_head_sha, str) or not isinstance(expected_source_digest, str):
+        raise InvalidRequest("create requires explicit repository, base_sha, head_sha, and source_digest")
     repository = remote_identity(root)
     if expected_repository and expected_repository.lower() != repository.lower():
-        raise DeliveryError("repository expectation mismatch")
+        raise InvalidRequest("repository expectation mismatch")
     base_sha = pushed_head(root, base)
     head_sha = pushed_head(root, head)
     if expected_base_sha and expected_base_sha != base_sha:
@@ -519,8 +565,17 @@ def create_pr(root: Path, *, base: str, head: str, title: str, body: str,
     existing = _existing_open(root, repository, base, head, base_sha, head_sha, digest)
     if existing is not None:
         return existing
+    # There is no GitHub/gh atomic expected-head constraint for branch-name
+    # creation. Repeat the exact identity preflight immediately before mutation.
+    fresh_repository = remote_identity(root)
+    fresh_base_sha = pushed_head(root, base)
+    fresh_head_sha = pushed_head(root, head)
+    fresh_digest = source_identity(root, fresh_head_sha)
+    if (fresh_repository != repository or fresh_base_sha != base_sha or fresh_head_sha != head_sha
+            or fresh_digest != digest):
+        raise CandidateChanged("candidate branch moved before PR creation")
     try:
-        url = _run("gh", ["pr", "create", "--repo", repository, "--base", base, "--head", head,
+        url = _run("gh", ["pr", "create", "--repo", _repo_arg(repository), "--base", base, "--head", head,
                            "--title", title, "--body", body], root)
     except DeliveryError:
         # A concurrent creator may have won. One read-only exact lookup is the only recovery.
@@ -528,9 +583,13 @@ def create_pr(root: Path, *, base: str, head: str, title: str, body: str,
         if recovered is not None:
             return recovered
         raise
-    return read_pr(root, url, expected_repository=repository, expected_base=base,
-                   expected_base_sha=base_sha, expected_head=head, expected_head_sha=head_sha,
-                   expected_source_digest=digest)
+    try:
+        return read_pr(root, url, expected_repository=repository, expected_base=base,
+                       expected_base_sha=base_sha, expected_head=head, expected_head_sha=head_sha,
+                       expected_source_digest=digest)
+    except (CandidateChanged, InvalidRequest) as exc:
+        _close_created(root, repository, url)
+        raise CandidateChanged("new PR head/source did not match candidate; PR was closed") from exc
 
 
 def snapshot(root: Path, *, branch: str, base: str = "campaign/razr-pi-next") -> dict[str, Any]:
