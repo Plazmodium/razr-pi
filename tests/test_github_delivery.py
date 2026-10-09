@@ -45,12 +45,12 @@ class GithubDeliveryTests(unittest.TestCase):
             self.assertEqual(result["base_commit"], "b" * 40)
 
     def test_readback_binds_exact_identity_and_source(self):
-        with patch.object(delivery, "_json", return_value=pr_value()), \
-             patch.object(delivery, "_required_checks", return_value=([], "none")), \
+        with patch.object(delivery, "_required_checks", return_value=([], "none")), \
              patch.object(delivery, "_threads", return_value=[]), \
              patch.object(delivery, "remote_identity", return_value="o/r"), \
-             patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA]), \
-             patch.object(delivery, "source_identity", return_value=DIGEST):
+             patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA, "b" * 40, SHA]), \
+             patch.object(delivery, "source_identity", side_effect=[DIGEST, DIGEST]), \
+             patch.object(delivery, "_json", side_effect=[pr_value(), pr_value()]):
             result = delivery.read_pr(Path("."), URL, expected_repository="o/r",
                                       expected_base="campaign/razr-pi-next", expected_base_sha="b" * 40,
                                       expected_head="feature", expected_head_sha=SHA,
@@ -78,7 +78,7 @@ class GithubDeliveryTests(unittest.TestCase):
     def test_readback_rejects_branch_sha_and_source_mismatches(self):
         for kwargs in ({"expected_base": "wrong"}, {"expected_head_sha": "d" * 40},
                        {"expected_source_digest": "sha256:" + "d" * 64}):
-            with self.subTest(kwargs=kwargs), patch.object(delivery, "_json", return_value=pr_value()), \
+            with self.subTest(kwargs=kwargs), patch.object(delivery, "_json", side_effect=[pr_value(), pr_value()]), \
                  patch.object(delivery, "_required_checks", return_value=([], "none")), \
                  patch.object(delivery, "_threads", return_value=[]), \
                  patch.object(delivery, "remote_identity", return_value="o/r"), \
@@ -86,6 +86,20 @@ class GithubDeliveryTests(unittest.TestCase):
                  patch.object(delivery, "source_identity", return_value=DIGEST):
                 with self.assertRaises(delivery.DeliveryError):
                     delivery.read_pr(Path("."), URL, **kwargs)
+
+    def test_final_readback_fence_rejects_moved_head(self):
+        moved = "d" * 40
+        final = pr_value(headRefOid=moved)
+        with patch.object(delivery, "_json", side_effect=[pr_value(), final]), \
+             patch.object(delivery, "_required_checks", return_value=([], "none")), \
+             patch.object(delivery, "_threads", return_value=[]), \
+             patch.object(delivery, "remote_identity", return_value="o/r"), \
+             patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA, "b" * 40, moved]), \
+             patch.object(delivery, "source_identity", side_effect=[DIGEST, DIGEST]):
+            with self.assertRaises(delivery.CandidateChanged):
+                delivery.read_pr(Path("."), URL, expected_repository="o/r", expected_base="campaign/razr-pi-next",
+                                 expected_base_sha="b" * 40, expected_head="feature", expected_head_sha=SHA,
+                                 expected_source_digest=DIGEST)
 
     def test_hostile_gh_host_is_overridden(self):
         with patch.dict(delivery.os.environ, {"GH_HOST": "evil.invalid"}):
@@ -212,6 +226,13 @@ class GithubDeliveryTests(unittest.TestCase):
             with self.assertRaises(delivery.DeliveryError):
                 delivery._required_checks(Path("."), URL, "o/r")
 
+    def test_required_check_rejects_unsupported_and_contradictory_exits(self):
+        passing = '[{"name":"ci","state":"SUCCESS","bucket":"pass"}]'
+        for code, stderr in ((2, "fatal provider error"), (128, "permission denied"), (8, "fatal provider error")):
+            with self.subTest(code=code), patch.object(delivery, "_run_result", return_value=(passing, stderr, code)):
+                with self.assertRaises(delivery.DeliveryError):
+                    delivery._required_checks(Path("."), URL, "o/r")
+
     def test_required_check_schema_rejects_unknown_fields(self):
         with patch.object(delivery, "_run_result", return_value=('[{"name":"ci","state":"COMPLETED","bucket":"PASS","x":1}]', "", 0)):
             with self.assertRaises(delivery.DeliveryError):
@@ -245,10 +266,20 @@ class GithubDeliveryTests(unittest.TestCase):
             with self.assertRaisesRegex(delivery.DeliveryError, "timed out"):
                 delivery._capture(sys.executable, ["-c", script], Path("."), timeout=.1)
             self.assertLess(time.monotonic() - started, 2.0)
-            if pidfile.exists():
-                pid = int(pidfile.read_text())
-                with self.assertRaises(ProcessLookupError):
-                    os.kill(pid, 0)
+            for _ in range(50):
+                if pidfile.exists() and pidfile.read_text():
+                    try:
+                        os.kill(int(pidfile.read_text()), 0)
+                    except ProcessLookupError:
+                        break
+                time.sleep(.02)
+            if pidfile.exists() and pidfile.read_text():
+                try:
+                    os.kill(int(pidfile.read_text()), 0)
+                except ProcessLookupError:
+                    pass
+                else:
+                    self.fail("surviving descendant after timeout cleanup")
         with tempfile.TemporaryDirectory() as directory:
             pidfile = Path(directory) / "success-child.pid"
             script = ("import os,sys,subprocess; subprocess.Popen([sys.executable,'-c',"
@@ -261,8 +292,15 @@ class GithubDeliveryTests(unittest.TestCase):
                     break
                 time.sleep(.01)
             if pidfile.exists() and pidfile.read_text():
-                with self.assertRaises(ProcessLookupError):
-                    os.kill(int(pidfile.read_text()), 0)
+                pid = int(pidfile.read_text())
+                for _ in range(50):
+                    try:
+                        os.kill(pid, 0)
+                    except ProcessLookupError:
+                        break
+                    time.sleep(.02)
+                else:
+                    self.fail("surviving descendant after successful leader cleanup")
 
     def test_cli_rejects_malformed_input_and_wraps_snapshot(self):
         spec = importlib.util.spec_from_file_location("github_delivery_cli", Path(__file__).parents[1] / "packages/razr-pi/scripts/github-delivery.py")

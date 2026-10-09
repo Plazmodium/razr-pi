@@ -64,8 +64,8 @@ def _validate_request(request: object) -> dict:
             raise ValueError(f"invalid {key}")
     if "source_digest" in request and not re.fullmatch(r"sha256:[0-9a-f]{64}", request["source_digest"]):
         raise ValueError("invalid source_digest")
-    if "repository" in request and not re.fullmatch(r"[^/]+/[^/]+", request["repository"]):
-        raise ValueError("invalid repository")
+    if "repository" in request:
+        delivery.validate_repository(request["repository"])
     return request
 
 

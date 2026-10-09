@@ -13,6 +13,7 @@ import time
 from typing import Any
 
 SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
+REPOSITORY_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,38})/[A-Za-z0-9](?:[A-Za-z0-9._-]{0,99})\Z")
 REPO_RE = re.compile(r"^(?:git@github\.com:|https://github\.com/)([^/]+)/([^/]+)\Z")
 PR_RE = re.compile(r"https://github\.com/([^/]+)/([^/]+)/pull/(\d+)/?\Z")
 MAX_STDOUT = 1024 * 1024
@@ -101,9 +102,15 @@ def _capture_detailed(program: str, args: list[str], cwd: Path, *, timeout: floa
                 raise DeliveryError(f"{program} timed out")
         code = process.returncode
         _verify_group_clear(process)
-        if not allow_nonzero and code not in (accepted_codes or {0}):
+        if code not in (accepted_codes or {0}):
             raise DeliveryError(f"{program} request failed")
         return bytes(buffers["out"]), bytes(buffers["err"]), int(code)
+    except BaseException:
+        try:
+            _terminate_group(process)
+        except DeliveryError:
+            pass
+        raise
     finally:
         selector.close()
         for stream in (process.stdout, process.stderr):
@@ -171,6 +178,8 @@ def _terminate_group(process: subprocess.Popen[bytes]) -> None:
                 os.killpg(process.pid, 0)
             except ProcessLookupError:
                 group_alive = False
+            except PermissionError as exc:
+                raise DeliveryError("process-group cleanup could not be verified") from exc
         if group_alive:
             raise DeliveryError("process-group cleanup timed out")
     for stream in (process.stdout, process.stderr):
@@ -214,7 +223,10 @@ def remote_identity(root: Path, remote: str = "origin") -> str:
     match = REPO_RE.fullmatch(value)
     if not match:
         raise DeliveryError("unsupported GitHub remote")
-    return f"{match.group(1)}/{match.group(2)}"
+    repository = f"{match.group(1)}/{match.group(2)}"
+    if not REPOSITORY_RE.fullmatch(repository):
+        raise InvalidRequest("invalid GitHub repository identity")
+    return repository
 
 
 def pushed_head(root: Path, branch: str, remote: str = "origin") -> str:
@@ -389,8 +401,14 @@ def _validate_pr(value: Any, url: str, owner: str, repo: str, number: int) -> di
     return value
 
 
+def validate_repository(repository: str) -> str:
+    if not isinstance(repository, str) or not REPOSITORY_RE.fullmatch(repository):
+        raise InvalidRequest("invalid GitHub repository identity")
+    return repository
+
+
 def _repo_arg(repository: str) -> str:
-    return "github.com/" + repository
+    return "github.com/" + validate_repository(repository)
 
 
 def _required_checks(root: Path, url: str, repository: str) -> tuple[list[dict[str, str]], str]:
@@ -402,9 +420,11 @@ def _required_checks(root: Path, url: str, repository: str) -> tuple[list[dict[s
         if raw or not re.fullmatch(r"no checks reported on the '[^'\n]{1,255}' branch\n?", diagnostic):
             raise DeliveryError("required-check provider request failed")
         rows = []
-    elif code == 8 and not raw:
-        raise DeliveryError("required-check provider request failed")
     else:
+        if code == 8 and not raw:
+            raise DeliveryError("required-check provider request failed")
+        if re.search(r"(?i)(fatal|error|denied|permission|unauthori)", diagnostic):
+            raise DeliveryError("required-check provider request failed")
         try:
             rows = [] if not raw else json.loads(raw)
         except json.JSONDecodeError as exc:
@@ -427,6 +447,8 @@ def _required_checks(root: Path, url: str, repository: str) -> tuple[list[dict[s
         return result, "failing"
     if any(row["bucket"] == "PENDING" for row in result):
         return result, "pending"
+    if code == 8 and not any(row["bucket"] == "PENDING" or row["state"] in {"QUEUED", "IN_PROGRESS", "PENDING"} for row in result):
+        raise DeliveryError("exit 8 required-check result is not pending")
     if any(row["bucket"] == "SKIPPING" for row in result):
         return result, "skipping"
     return result, "passing"
@@ -567,7 +589,24 @@ def read_pr(root: Path, url: str, *, expected_repository: str | None = None,
     actual_source_digest = source_identity(root, actual_head_sha)
     if expected_source_digest is not None and actual_source_digest != expected_source_digest:
         raise IdentityMismatch("PR source identity mismatch")
-    value["sourceDigest"] = actual_source_digest
+    # Final fence after all network/page reads: branch and PR identity must
+    # remain stable from the initial observation through the returned result.
+    final_value = _validate_pr(_json("gh", ["pr", "view", url, "--repo", _repo_arg(actual_repository), "--json", fields], root), url, owner, repo, number)
+    final_base_sha = pushed_head(root, final_value["baseRefName"])
+    final_head_sha = pushed_head(root, final_value["headRefName"])
+    final_digest = source_identity(root, final_head_sha)
+    if (final_value["baseRefName"] != value["baseRefName"] or final_value["headRefName"] != value["headRefName"]
+            or final_value["baseRefOid"] != value["baseRefOid"] or final_value["headRefOid"] != value["headRefOid"]
+            or final_base_sha != actual_base_sha or final_head_sha != actual_head_sha
+            or final_digest != actual_source_digest or final_value["url"] != value["url"]):
+        raise CandidateChanged("PR or remote branch identity changed during readback")
+    if expected_base_sha is not None and final_base_sha != expected_base_sha:
+        raise CandidateChanged("final base identity mismatch")
+    if expected_head_sha is not None and final_head_sha != expected_head_sha:
+        raise CandidateChanged("final head identity mismatch")
+    if expected_source_digest is not None and final_digest != expected_source_digest:
+        raise CandidateChanged("final source identity mismatch")
+    value["sourceDigest"] = final_digest
     return value
 
 
@@ -597,7 +636,7 @@ def create_pr(root: Path, *, base: str, head: str, title: str, body: str,
               expected_repository: str | None = None, expected_base_sha: str | None = None,
               expected_head_sha: str | None = None, expected_source_digest: str | None = None) -> dict[str, Any]:
     if not base or not head or not title or len(title) > 256 or len(body) > 100000 \
-            or not isinstance(expected_repository, str) or not re.fullmatch(r"[^/\\s]+/[^/\\s]+", expected_repository) \
+            or not isinstance(expected_repository, str) or not REPOSITORY_RE.fullmatch(expected_repository) \
             or not isinstance(expected_base_sha, str) or not SHA_RE.fullmatch(expected_base_sha) \
             or not isinstance(expected_head_sha, str) or not SHA_RE.fullmatch(expected_head_sha) \
             or not isinstance(expected_source_digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_source_digest):
