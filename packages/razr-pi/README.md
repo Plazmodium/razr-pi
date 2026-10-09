@@ -1,8 +1,12 @@
 # Razr for Pi: public bootstrap
 
-Review [the skill](skills/razr/SKILL.md) and [managed routing](runtime/AGENTS.project-razr.md) before loading. This skill-only, private package supports explicit adoption/discovery. Loading does not authorize writes or adopt a project. Do not install automatically.
+Pi concept: a skill supplies instructions, while an extension registers executable commands. Loading either resource does not adopt a project or authorize writes. The extension is a thin dispatcher to the existing core and Memory adapter; it does not reimplement lifecycle authority, workers, authentication, or automatic adoption.
 
-The package resolves helpers and runtime internally. The core and five canonical templates are unchanged snapshots identified by [provenance](runtime/provenance.json). Provenance is not execution proof or licensing clearance.
+The package registers `/razr-status`, `/razr-context`, `/razr-remember`, `/razr-recall`, and `/razr-memory-inspect`. `/razr-status <work_id>` requires an adopted, materialized work item and returns the frozen core status/validate/raw-state projection; it also reports M04 fanout capability availability without launching workers. Status/context are read-only; context delegates bounded selection to the M03 `ContextEngine`, while remember is the one explicit append operation and requires the M02 Memory adapter's closed JSON request. There is deliberately no worker command: live fanout remains deferred.
+
+Review [the skill](skills/razr/SKILL.md) and [managed routing](runtime/AGENTS.project-razr.md) before loading. This private package provides the primary skill plus a thin command extension for explicit inspection/adoption workflows. Loading does not authorize writes or adopt a project. Do not install automatically.
+
+The package resolves helpers and runtime internally. Status constructs the frozen `CoreRequest` using the package-internal identity primitives already shared with M03 (`_git_head` and `_source_digest`); it does not duplicate digest logic or broaden the frozen protocol. The core and five canonical templates are unchanged snapshots identified by [provenance](runtime/provenance.json). Provenance is not execution proof or licensing clearance.
 
 Stable adapter surfaces:
 

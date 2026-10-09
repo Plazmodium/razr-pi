@@ -19,7 +19,7 @@ import stat
 import subprocess
 import sys
 
-ALLOWLIST_SHA256 = '3153fe81686c2e5bf3a34e70a63b614fdddc08253b1e4ebe1b0b60401475bedb'
+ALLOWLIST_SHA256 = '7a5a24211c5a4f8fe05a1700f210899014a639cc86384b4133ea051527a54a57'
 LICENSE_SHA256 = '9d2fdecab2aa2dca006dbd67b07d3cc63a9d9f64a4f954aff2fe782251f9f8f4'
 OUTPUT_MARKER = 'clean-source-v1 owned private test output\n'
 PROVENANCE = {
@@ -169,7 +169,7 @@ def check(root):
     raw = regular(root / 'tests/public-tree.txt')
     require(sha(raw) == ALLOWLIST_SHA256, 'public allowlist drift')
     names = raw.decode('utf-8').splitlines()
-    require(len(names) == len(set(names)) == 57, 'invalid allowlist cardinality')
+    require(len(names) == len(set(names)) == 60, 'invalid allowlist cardinality')
     for name in names:
         p = PurePosixPath(name)
         require(not p.is_absolute() and '..' not in p.parts and str(p) == name, 'unsafe allowlist entry')
@@ -230,7 +230,7 @@ def check(root):
                 for node in ast.walk(tree):
                     imports = ([alias.name for alias in node.names] if isinstance(node, ast.Import)
                                else [node.module or ''] if isinstance(node, ast.ImportFrom) else [])
-                    require(all(module.startswith('.') or module in {'protocol', 'core_subprocess'} or module.split('.')[0] in sys.stdlib_module_names for module in imports),
+                    require(all(module.startswith('.') or module in {'protocol', 'core_subprocess', 'memory', 'adapter'} or module.split('.')[0] in sys.stdlib_module_names or module.split('.')[0] == 'adapter' for module in imports),
                             'non-standard static package import: ' + name)
         elif name.endswith('.json'):
             json.loads(text)
@@ -247,11 +247,12 @@ def check(root):
     for name, expected in SOURCE_PINS.items():
         require(sha(regular(package / name)) == expected, 'retained helper/provenance drift: ' + name)
     manifest = json.loads(regular(package / 'package.json'))
-    require(set(manifest) == {'name', 'version', 'private', 'description', 'keywords', 'pi', 'files'},
+    require(set(manifest) == {'name', 'version', 'private', 'description', 'keywords', 'pi', 'peerDependencies', 'files'},
             'unexpected package manifest fields')
     require(manifest['name'] == 'razr-pi' and manifest['private'] is True, 'unsafe package identity/publication policy')
-    require(manifest['pi'] == {'skills': ['./skills']}, 'broadened package resource loading')
-    require(manifest['files'] == ['skills', 'runtime', 'scripts', 'adapter', 'README.md'], 'package file declaration drift')
+    require(manifest['pi'] == {'extensions': ['./extensions/razr.ts'], 'skills': ['./skills']}, 'broadened package resource loading')
+    require(manifest['peerDependencies'] == {'@earendil-works/pi-coding-agent': '*', '@earendil-works/pi-ai': '*', 'typebox': '*'}, 'unexpected host dependency declaration')
+    require(manifest['files'] == ['extensions', 'skills', 'runtime', 'scripts', 'adapter', 'README.md'], 'package file declaration drift')
     require(sorted(p.relative_to(package).as_posix() for p in (package / 'skills').rglob('SKILL.md'))
             == ['skills/razr/SKILL.md'], 'unexpected package skill inventory')
     provenance = json.loads(regular(package / 'runtime/provenance.json'))

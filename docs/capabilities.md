@@ -2,7 +2,7 @@
 
 This public source candidate implements safe adoption/discovery and selected no-model regression mechanics. Acceptance of a reviewed source identity, independent critique and actual post-import clone verification are separate gates; no historic acceptance is inherited.
 
-The integration tracer checks source/provenance, an actual installed Pi local-package resolver with no model/client construction, explicit safe adoption, discovery, core status/validation and unchanged relocated package bytes. Exactly one package skill and no other resource types are permitted. Loading does not adopt or authorize writes.
+The integration tracer checks source/provenance, an actual installed Pi local-package resolver with no model/client construction, explicit safe adoption, discovery, core status/validation and unchanged relocated package bytes. Exactly one package skill and one Razr extension are permitted; prompts, themes, and context files remain absent. Loading does not adopt or authorize writes.
 
 The selected public suite covers adoption refusal/idempotence/separation/relocation, loader refusal/no-adoption, synthetic contract preflight, core-materialized synthetic work inspected read-only, stale-generation refusal, source/provenance and privacy boundary refusals, deterministic bounded M03 context selection (including stale Memory, safe paths and omission markers), and collector test/subcase behavior. Core approval in a fixture uses explicitly synthetic metadata and never represents a real human decision. No lifecycle state is hand-written.
 
