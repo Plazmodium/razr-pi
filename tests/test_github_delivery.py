@@ -85,6 +85,21 @@ class GithubDeliveryTests(unittest.TestCase):
             run.assert_not_called()
             read.assert_called_once()
 
+    def test_create_refuses_remote_expectation_override(self):
+        with patch.object(delivery, "remote_identity", return_value="o/r"):
+            with self.assertRaisesRegex(delivery.DeliveryError, "repository expectation"):
+                delivery.create_pr(Path("."), base="base", head="feature", title="t", body="b",
+                                   expected_repository="other/repo")
+
+    def test_create_recovers_one_racing_server_pr(self):
+        with patch.object(delivery, "remote_identity", return_value="o/r"), \
+             patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA]), \
+             patch.object(delivery, "source_identity", return_value=DIGEST), \
+             patch.object(delivery, "_json", side_effect=[[], [{"url": URL}]]), \
+             patch.object(delivery, "_run", side_effect=delivery.DeliveryError("create failed")), \
+             patch.object(delivery, "read_pr", return_value={"number": 1}):
+            self.assertEqual(delivery.create_pr(Path("."), base="base", head="feature", title="t", body="b")["number"], 1)
+
     def test_create_refuses_ambiguous_existing_prs(self):
         with patch.object(delivery, "remote_identity", return_value="o/r"), \
              patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA]), \
@@ -154,6 +169,8 @@ class GithubDeliveryTests(unittest.TestCase):
              patch.object(delivery, "read_pr", return_value=pr_value()):
             delivery.create_pr(Path("."), base="campaign/razr-pi-next", head="feature", title="t", body="b")
             args = run.call_args.args[1]
+            self.assertIn("--repo", args)
+            self.assertIn("o/r", args)
             self.assertNotIn("--force", args + ["--merge", "--auto", "--delete-branch"])
 
 

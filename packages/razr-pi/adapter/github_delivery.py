@@ -268,7 +268,9 @@ def _threads(root: Path, owner: str, repo: str, number: int) -> list[dict[str, A
     result: list[dict[str, Any]] = []
     cursor: str | None = None
     for _ in range(MAX_THREADS_PAGES):
-        args = ["api", "graphql", "--repo", f"{owner}/{repo}", "-f", f"query={query}", "-F", f"o={owner}",
+        # gh api has no --repo flag; the explicit owner/name variables are the
+        # API equivalent and are bound to the verified repository above.
+        args = ["api", "graphql", "-f", f"query={query}", "-F", f"o={owner}",
                 "-F", f"r={repo}", "-F", f"n={number}"]
         if cursor is not None:
             args += ["-F", f"a={cursor}"]
