@@ -1,41 +1,55 @@
 # Current public state
 
-This page is an index of authority, not a second status ledger. It describes the public `dev` source baseline; it does not import or supersede workshop history.
+This page is an authority index, not a second lifecycle ledger. It describes the Razr-Pi Next M10 release candidate. Historical workshop state is deliberately absent from this public tree.
 
 ## Authoritative sources
 
 Read these in order:
 
-1. [Source baseline](../SOURCE_BASELINE.md) — current acceptance and source-identity status. The public candidate remains pending acceptance and publication.
-2. [Capability boundaries](capabilities.md) — the supported behavior and the capabilities that remain absent or unverified.
-3. [Testing](testing.md) — current verification commands, prerequisites, isolation rules, and proof limitations.
-4. [Architecture and authority](architecture.md) — ownership of instructions, contracts, lifecycle state, evidence, and Git history.
-5. [Repository overview](../README.md) and [package instructions](../packages/razr-pi/README.md) — entry points and the package-level surface.
+1. [Source baseline](../SOURCE_BASELINE.md) — current source-identity and acceptance status.
+2. [Capability boundaries](capabilities.md) — implemented behavior, proof scope, and limitations.
+3. [Testing](testing.md) — verification commands, prerequisites, isolation, and proof limits.
+4. [Architecture and authority](architecture.md) — ownership of instructions, lifecycle state, evidence, host transport, and Git history.
+5. [Repository overview](../README.md) and [package instructions](../packages/razr-pi/README.md) — user entry points and local package use.
+6. [Campaign log](campaigns/razr-pi-next.md) — append-only campaign chronology and exact closing observations.
 
 If these sources disagree, stop rather than turning this index into a competing status record.
 
-## Active work and latest result
+## Current release-candidate status
 
-There is no canonical active Razr work item, approval bundle, or live result record in this public tree. The included [public contract fixture](../tests/fixtures/public-contract/README.md) is synthetic, unapproved test data and is not current workflow state.
+M01–M09 are integrated on `campaign/razr-pi-next`. M10 finalizes normal product documentation, exercises the exact pushed mission head from fresh clones, and opens a mission PR back to that campaign branch. The campaign is not complete merely because mechanical checks pass.
 
-The local workshop has roadmap, chronology, readiness, verification, approval-bundle, and retained-result material that is deliberately absent from public `dev`. In particular, `WORKSHOP.md`, `docs/milestones-2026-10-03.md`, `docs/readiness.md`, and `docs/verification.md` are not distributed here. Local workshop observations therefore must not be presented as public-dev execution evidence, and this public index cannot identify a workshop task as a public active work item or claim its latest result.
+There is no canonical active Razr work item, approval bundle, or live result record in this public tree. The included [public contract fixture](../tests/fixtures/public-contract/README.md) is synthetic, unapproved test data and is not current workflow state. No lifecycle state may be created or edited merely to mark M10 complete.
 
-## Supported boundary
+## Implemented boundary
 
-The public candidate currently supports explicit safe adoption and discovery, no-model package/resource loading, read-only inspection, bounded context, local-first Memory, contract preflight, selected synthetic regressions, and the separately invoked M07 GitHub delivery helper. The helper exposes read-only `snapshot`/`read` and separately-authorized `create`; closed requests require exact repository/base/head/source identity. Authenticated/private-repository behavior, no-check `none` observations, bounded non-atomic read metadata, incomplete provider collection metadata, and `created-but-unverified`/compensation-uncertain outcomes are documented in [capabilities](capabilities.md) and [testing](testing.md). Its user-facing workflow is idea/conversation → spec convergence → executable → build → verify → delivery, using the repository as the project brain without requiring Project Brain, Obsidian, an MCP vault, or a parallel documentation tree. Loading Pi instructions is not execution, adoption, approval, or authorization to write. Verification results are evidence only for the exact tested source and stated scope.
+The release candidate provides:
 
-M08 exercised bounded live task execution through the direct Herdr provider in owned fixtures, including explicit caller/target identities, cross-pane workers, interruption/replacement, source-bound Memory revalidation, clean no-ambient package/tracer loading, and fresh non-final reviews. A separate generation-fenced corrective chronology binds its candidate before review acceptance and records delivery linkage afterward; see the campaign log for exact identities and limitations. A Pi worker command, general independent-critic launching, retained-run recovery, local-history admission, automated PR/factory operation, merge, and deployment remain absent or unverified here. The M07 helper is not a PR factory, does not merge/deploy/mutate lifecycle state or infer approval, and does not replace final human PR review. Exact human specification approval, generation-fenced transitions, the first verified-task human checkpoint, source-digest identity and excluded-input scrutiny, fresh independent Technical and Contract review, final human PR review, and an actual post-import clean-clone check remain required where applicable.
+- explicit safe adoption and discovery;
+- one Pi skill and one executable extension with five workflow/context/Memory commands;
+- deterministic clean-candidate context selection from Git objects;
+- local-first, bounded, evidence-linked Razr Memory;
+- contract preflight and read-only core-backed workflow inspection;
+- a direct optional Herdr provider with durable attempt/root evidence and strict generation/candidate/resource fences;
+- a separately invoked source-bound GitHub snapshot/read/create helper; and
+- no-model package loading, integration tracing, and selected public regressions.
+
+M08 exercised the Herdr provider in owned live fixtures with separate caller/target panes, two non-overlapping worker slices, interruption/replacement, bounded fresh reviews, Memory stale/revalidation behavior, and delivery linkage. M09 then hardened exact delivery identity, immutable context, Memory identity/locking, and provider crash/filesystem/process boundaries. The [campaign log](campaigns/razr-pi-next.md) preserves exact historical observations and limitations; they do not turn Herdr telemetry into Razr authority or supply M10's final critics.
+
+The extension deliberately has no worker command. General review dispatch, local-history admission, automatic recovery, PR factory operation, merge, deployment, and npm publication remain absent. Outside Herdr, ordinary status/context/Memory behavior remains available and fanout refuses cleanly.
+
+## Remaining acceptance gates
+
+Before a final campaign merge or completion decision:
+
+1. the M10 exact pushed head must retain successful clean-room evidence;
+2. fresh independent Technical and Contract critics must review that same exact head and excluded-input boundary;
+3. the final campaign PR to the actual development branch must be created and remotely read back;
+4. required checks and repository rules must be satisfied; and
+5. a human must perform the final PR review and decide whether to merge.
+
+No current document claims those future decisions. CLI attestations do not prove tests ran, no-check output does not prove success, and package loading does not authenticate approval.
 
 ## Historical-record rule
 
-Workshop chronology and approval bundles are historical records outside this public tree. Preserve their original approval or pending wording intentionally; a later decision belongs in a later authority record and must not be inferred from prepared metadata or retroactively written into historical bytes. Historical outcomes do not transfer to this baseline.
-
-## Resume here
-
-A future agent working on the public source should:
-
-1. read this index and the authoritative sources above;
-2. confirm the exact Git/source identity and inspect excluded inputs;
-3. treat the absence of public work-item state and workshop evidence as a boundary, not as approval or completion;
-4. follow the [vertical-slice policy](05-vertical-slices.md), beginning with one end-to-end tracer and stopping for the actual human checkpoint; and
-5. run only separately authorized checks from [testing](testing.md), reporting actual output and limitations without importing historical evidence.
+Workshop chronology and approval bundles are historical records outside this public tree. Preserve their original approval, failure, or pending wording. A later observation belongs in a later campaign-log entry; it must not be retroactively written into historical bytes. Historical outcomes do not transfer to this source candidate.
