@@ -192,6 +192,17 @@ def _validate_collection(value: Any, field: str) -> list[dict[str, Any]]:
     return value
 
 
+def _nullable_string(value: Any, field: str) -> None:
+    if value is not None and not isinstance(value, str):
+        raise DeliveryError(f"invalid PR {field}")
+
+
+def _author(value: Any) -> None:
+    if value is not None and (not isinstance(value, dict) or set(value) != {"login"}
+                              or not isinstance(value.get("login"), str) or not value["login"]):
+        raise DeliveryError("invalid PR author")
+
+
 def _validate_pr(value: Any, url: str, owner: str, repo: str, number: int) -> dict[str, Any]:
     allowed = {"number", "url", "state", "isDraft", "baseRefName", "baseRefOid", "headRefName", "headRefOid",
                "mergeStateStatus", "mergeable", "reviewDecision", "reviewRequests", "reviews", "comments",
@@ -210,21 +221,34 @@ def _validate_pr(value: Any, url: str, owner: str, repo: str, number: int) -> di
         rows = _validate_collection(value.get(field), field)
         for row in rows:
             if field == "reviewRequests":
-                if set(row) - {"login", "name"} or not isinstance(row.get("login") or row.get("name"), str):
+                if set(row) != {"login", "name"} or not isinstance(row.get("login"), str) \
+                        or not isinstance(row.get("name"), str):
                     raise DeliveryError("malformed review request")
             elif field == "reviews":
-                if set(row) - {"id", "author", "body", "state", "submittedAt", "updatedAt"} \
+                allowed = {"id", "author", "body", "commit", "createdAt", "includesCreatedEdit",
+                           "reactionGroups", "state", "submittedAt", "updatedAt"}
+                if set(row) - allowed or not isinstance(row.get("id"), str) or not row["id"] \
                         or not isinstance(row.get("state"), str) or row["state"] not in {"APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING"}:
                     raise DeliveryError("malformed review")
+                _author(row.get("author"))
+                for key in ("body", "commit", "createdAt", "submittedAt", "updatedAt"):
+                    _nullable_string(row.get(key), "review " + key)
+                if not isinstance(row.get("includesCreatedEdit"), bool):
+                    raise DeliveryError("malformed review metadata")
             elif field == "comments":
-                if set(row) - {"id", "author", "body", "createdAt", "updatedAt", "isMinimized"} \
-                        or not isinstance(row.get("body"), str):
+                allowed = {"id", "author", "body", "createdAt", "isMinimized", "reactions", "updatedAt", "url"}
+                if set(row) - allowed or not isinstance(row.get("id"), str) or not row["id"] \
+                        or not isinstance(row.get("body"), str) or not isinstance(row.get("isMinimized"), bool):
                     raise DeliveryError("malformed comment")
+                _author(row.get("author"))
+                for key in ("createdAt", "updatedAt", "url"):
+                    _nullable_string(row.get(key), "comment " + key)
             else:
-                if set(row) - {"context", "conclusion", "detailsUrl", "event", "group", "name", "startedAt", "state", "status", "workflowName"}:
+                allowed = {"context", "conclusion", "detailsUrl", "event", "group", "name", "startedAt", "state", "status", "workflowName"}
+                if set(row) - allowed or not isinstance(row.get("name") or row.get("context"), str):
                     raise DeliveryError("malformed status check")
-                if not isinstance(row.get("name") or row.get("context"), str):
-                    raise DeliveryError("malformed status check")
+                for key in ("conclusion", "detailsUrl", "event", "group", "startedAt", "workflowName"):
+                    _nullable_string(row.get(key), "check " + key)
     if not isinstance(value.get("isDraft"), bool) or not isinstance(value.get("reviewDecision"), str):
         raise DeliveryError("malformed draft/review state")
     value["repository"] = f"{owner}/{repo}"
@@ -260,10 +284,53 @@ def _required_checks(root: Path, url: str, repository: str) -> tuple[list[dict[s
     return result, "passing"
 
 
+def _validate_thread_comment(comment: Any) -> None:
+    if not isinstance(comment, dict) or set(comment) != {"id", "body", "author", "updatedAt", "path"} \
+            or not isinstance(comment.get("id"), str) or not comment["id"] \
+            or not isinstance(comment.get("body"), str):
+        raise DeliveryError("review-thread comment schema is invalid")
+    _author(comment.get("author"))
+    _nullable_string(comment.get("updatedAt"), "thread comment updatedAt")
+    _nullable_string(comment.get("path"), "thread comment path")
+
+
+def _thread_comments(root: Path, thread_id: str, initial: list[dict[str, Any]],
+                     cursor: str | None) -> list[dict[str, Any]]:
+    query = ("query($id:ID!,$a:String){node(id:$id){... on PullRequestReviewThread{comments(first:100,after:$a){"
+             "nodes{id body author{login} updatedAt path} pageInfo{hasNextPage endCursor}}}}}")
+    result = list(initial)
+    pages = 0
+    while cursor is not None and pages < MAX_THREADS_PAGES:
+        value = _json("gh", ["api", "graphql", "-f", f"query={query}", "-F", f"id={thread_id}",
+                              "-F", f"a={cursor}"], root)
+        pages += 1
+        try:
+            page = value["data"]["node"]["comments"]
+            nodes, info = page["nodes"], page["pageInfo"]
+            if not isinstance(nodes, list) or len(nodes) > MAX_THREAD_COMMENTS \
+                    or not isinstance(info, dict) or set(info) != {"hasNextPage", "endCursor"}:
+                raise KeyError("comments")
+            for comment in nodes:
+                _validate_thread_comment(comment)
+            result.extend(nodes)
+            if len(result) > MAX_THREAD_COMMENTS:
+                raise DeliveryError("review-thread comment bound exceeded")
+            has_next, next_cursor = info["hasNextPage"], info["endCursor"]
+            if not isinstance(has_next, bool) or (has_next and not isinstance(next_cursor, str)) \
+                    or (not has_next and next_cursor is not None) or next_cursor == cursor:
+                raise KeyError("pageInfo")
+            cursor = next_cursor if has_next else None
+        except (KeyError, TypeError) as exc:
+            raise DeliveryError("review-thread comment pagination schema is invalid") from exc
+    if cursor is not None:
+        raise DeliveryError("review-thread comment pagination exceeds bound")
+    return result
+
+
 def _threads(root: Path, owner: str, repo: str, number: int) -> list[dict[str, Any]]:
     query = ("query($o:String!,$r:String!,$n:Int!,$a:String){repository(owner:$o,name:$r){"
              "pullRequest(number:$n){reviewThreads(first:100,after:$a){nodes{id isResolved "
-             "comments(last:1){nodes{id body author{login} updatedAt path}}} "
+             "comments(first:100){nodes{id body author{login} updatedAt path} pageInfo{hasNextPage endCursor}}} "
              "pageInfo{hasNextPage endCursor}}}}}")
     result: list[dict[str, Any]] = []
     cursor: str | None = None
@@ -287,13 +354,20 @@ def _threads(root: Path, owner: str, repo: str, number: int) -> list[dict[str, A
                     raise KeyError("thread")
                 comments_obj = node["comments"] if isinstance(node["comments"], dict) else None
                 comments = comments_obj.get("nodes") if comments_obj is not None else None
-                if comments_obj is None or set(comments_obj) != {"nodes"} or not isinstance(comments, list) \
+                comment_info = comments_obj.get("pageInfo") if comments_obj is not None else None
+                if comments_obj is None or not isinstance(comment_info, dict) \
+                        or set(comment_info) != {"hasNextPage", "endCursor"} or not isinstance(comments, list) \
                         or len(comments) > MAX_THREAD_COMMENTS:
                     raise KeyError("comments")
                 for comment in comments:
-                    if not isinstance(comment, dict) or set(comment) != {"id", "body", "author", "updatedAt", "path"} \
-                            or not isinstance(comment.get("id"), str) or not isinstance(comment.get("body"), str):
-                        raise KeyError("comment")
+                    _validate_thread_comment(comment)
+                comment_next = comment_info["endCursor"] if comment_info["hasNextPage"] else None
+                if not isinstance(comment_info["hasNextPage"], bool) \
+                        or (comment_info["hasNextPage"] and not isinstance(comment_next, str)) \
+                        or (not comment_info["hasNextPage"] and comment_info["endCursor"] is not None):
+                    raise KeyError("comment pageInfo")
+                node["comments"] = {"nodes": _thread_comments(root, node["id"], comments, comment_next),
+                                    "pageInfo": {"hasNextPage": False, "endCursor": None}}
             result.extend(nodes)
             has_next = info.get("hasNextPage")
             next_cursor = info.get("endCursor")

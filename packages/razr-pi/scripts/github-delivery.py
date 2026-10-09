@@ -22,13 +22,43 @@ def fail(code: str, message: str) -> int:
     return 1
 
 
+def _string(request: dict, key: str, required: bool = False) -> None:
+    if key not in request:
+        if required:
+            raise ValueError(f"missing {key}")
+        return
+    if not isinstance(request[key], str) or not request[key]:
+        raise ValueError(f"invalid {key}")
+
+
+def _validate_request(request: object) -> dict:
+    if not isinstance(request, dict) or not isinstance(request.get("schema_version"), int) \
+            or isinstance(request.get("schema_version"), bool) or request["schema_version"] != 1:
+        raise ValueError("invalid schema")
+    operation = request.get("operation")
+    if operation not in {"snapshot", "read", "create"} or not isinstance(operation, str):
+        raise ValueError("invalid operation")
+    common = {"schema_version", "operation", "root"}
+    if "root" in request:
+        _string(request, "root")
+    if operation == "snapshot":
+        allowed, required = common | {"branch", "base"}, ("branch",)
+    elif operation == "read":
+        allowed, required = common | {"url", "repository", "base", "branch", "base_sha", "head_sha", "source_digest"}, ("url",)
+    else:
+        allowed, required = common | {"base", "branch", "title", "body", "repository", "base_sha", "head_sha", "source_digest"}, ("base", "branch", "title", "body")
+    if set(request) - allowed:
+        raise ValueError("unknown operation field")
+    for key in required:
+        _string(request, key, True)
+    for key in allowed - set(required) - {"schema_version", "operation"}:
+        _string(request, key)
+    return request
+
+
 def main() -> int:
     try:
-        request = json.load(sys.stdin)
-        if not isinstance(request, dict) or set(request) - {"schema_version", "operation", "root", "branch", "base", "url", "title", "body", "repository", "base_sha", "head_sha", "source_digest"}:
-            return fail("INVALID_REQUEST", "closed request fields required")
-        if request.get("schema_version") != 1 or request.get("operation") not in {"snapshot", "read", "create"}:
-            return fail("INVALID_REQUEST", "invalid schema or operation")
+        request = _validate_request(json.load(sys.stdin))
         root = Path(request.get("root", "."))
         delivery.auth_preflight(root)
         operation = request["operation"]

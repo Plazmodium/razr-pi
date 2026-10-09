@@ -124,14 +124,14 @@ class GithubDeliveryTests(unittest.TestCase):
 
     def test_thread_pagination_is_bounded_and_validated(self):
         page = {"data": {"repository": {"pullRequest": {"reviewThreads": {
-            "nodes": [{"id": "t1", "isResolved": False, "comments": {"nodes": []}}],
+            "nodes": [{"id": "t1", "isResolved": False, "comments": {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}}],
             "pageInfo": {"hasNextPage": True, "endCursor": "c1"}}}}}}
         last = {"data": {"repository": {"pullRequest": {"reviewThreads": {
             "nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}}
         with patch.object(delivery, "_json", side_effect=[page, last]):
             self.assertEqual(len(delivery._threads(Path("."), "o", "r", 1)), 1)
         malformed = {"data": {"repository": {"pullRequest": {"reviewThreads": {
-            "nodes": [{"id": "t", "isResolved": False, "comments": {"nodes": []}, "extra": 1}],
+            "nodes": [{"id": "t", "isResolved": False, "comments": {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}, "extra": 1}],
             "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}}
         with patch.object(delivery, "_json", return_value=malformed), self.assertRaises(delivery.DeliveryError):
             delivery._threads(Path("."), "o", "r", 1)
@@ -159,6 +159,29 @@ class GithubDeliveryTests(unittest.TestCase):
              patch.object(sys, "stdout", output):
             self.assertEqual(cli.main(), 0)
         self.assertIn('"commit": "' + SHA, output.getvalue())
+        for malformed in (
+                '{"schema_version":1,"operation":"snapshot","branch":7}',
+                '{"schema_version":1,"operation":"read","url":null}',
+                '{"schema_version":1,"operation":"create","base":"b","branch":"h","title":"t","body":"x","extra":1}',
+                '{"schema_version":1,"operation":"create","base":"b","branch":"h","title":"t","body":null}'):
+            with self.subTest(malformed=malformed), patch.object(cli.delivery, "auth_preflight") as auth, \
+                 patch.object(sys, "stdin", io.StringIO(malformed)), patch.object(sys, "stdout", io.StringIO()) as stream:
+                self.assertEqual(cli.main(), 1)
+                self.assertIn('"code": "INVALID_REQUEST"', stream.getvalue())
+                auth.assert_not_called()
+
+    def test_thread_comment_pagination_reads_multiple_pages(self):
+        first = {"data": {"repository": {"pullRequest": {"reviewThreads": {
+            "nodes": [{"id": "t1", "isResolved": False, "comments": {"nodes": [{"id": "c1", "body": "one", "author": None, "updatedAt": None, "path": None}], "pageInfo": {"hasNextPage": True, "endCursor": "c1"}}}],
+            "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}}
+        second = {"data": {"node": {"comments": {"nodes": [{"id": "c2", "body": "two", "author": None, "updatedAt": None, "path": None}], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}
+        with patch.object(delivery, "_json", side_effect=[first, second]):
+            result = delivery._threads(Path("."), "o", "r", 1)
+        self.assertEqual([c["id"] for c in result[0]["comments"]["nodes"]], ["c1", "c2"])
+
+    def test_nested_numeric_comment_id_refuses(self):
+        with self.assertRaises(delivery.DeliveryError):
+            delivery._validate_thread_comment({"id": 1, "body": "x", "author": None, "updatedAt": None, "path": None})
 
     def test_create_has_no_lifecycle_flags(self):
         with patch.object(delivery, "remote_identity", return_value="o/r"), \
