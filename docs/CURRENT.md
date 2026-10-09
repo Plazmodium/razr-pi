@@ -22,7 +22,7 @@ The local workshop has roadmap, chronology, readiness, verification, approval-bu
 
 ## Supported boundary
 
-The public candidate currently supports explicit safe adoption and discovery, no-model package/resource loading, read-only inspection and contract preflight, and selected synthetic regressions. Loading Pi instructions is not execution, adoption, approval, or authorization to write. Verification results are evidence only for the exact tested source and stated scope.
+The public candidate currently supports explicit safe adoption and discovery, no-model package/resource loading, read-only inspection, bounded context, local-first Memory, contract preflight, and selected synthetic regressions. Its user-facing workflow is idea/conversation → spec convergence → executable → build → verify → delivery, using the repository as the project brain without requiring Project Brain, Obsidian, an MCP vault, or a parallel documentation tree. Loading Pi instructions is not execution, adoption, approval, or authorization to write. Verification results are evidence only for the exact tested source and stated scope.
 
 Live task execution, general independent-critic launching, retained-run recovery, local-history admission, automated PR/factory operation, live GitHub delivery, merge, and deployment are absent or unverified here. Exact human specification approval, generation-fenced transitions, the first verified-task human checkpoint, source-digest identity and excluded-input scrutiny, fresh independent Technical and Contract review, final human PR review, and an actual post-import clean-clone check remain required where applicable.
 
