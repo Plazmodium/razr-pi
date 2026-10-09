@@ -976,42 +976,167 @@ class HerdrProvider:
             raise _fail("CANDIDATE_CHANGED", "current core candidate differs from dispatch candidate")
         return read
 
-    def _claim_root_identity(self, root: Path, root_id: str, root_digest: str, attempt_id: str, request_digest: str) -> None:
+    @staticmethod
+    def _root_claim_rows(stream) -> list[dict[str, object]]:
+        stream.seek(0); rows = []; previous = "sha256:" + "0" * 64
+        for line in stream:
+            if not line.endswith("\n"): raise _fail("LEDGER_CORRUPT", "partial root claims record")
+            try: row = _strict_json(line.rstrip("\n").encode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc: raise _fail("LEDGER_CORRUPT", "malformed root claims record") from exc
+            expected = {"schema_version", "root_id", "root_digest", "path", "attempt_id", "request_digest", "claimed_at", "prev_digest", "record_digest"}
+            if not isinstance(row, dict) or set(row) != expected or row["schema_version"] != 1 or row["prev_digest"] != previous or row["record_digest"] != raw_file_digest(canonical_json({key: row[key] for key in row if key != "record_digest"})):
+                raise _fail("LEDGER_CORRUPT", "corrupt root claims record")
+            try:
+                _id(row["root_id"], "root_id"); _id(row["attempt_id"], "attempt_id"); _digest(row["root_digest"], "root_digest"); _digest(row["request_digest"], "request_digest"); _digest(row["prev_digest"], "prev_digest"); _digest(row["record_digest"], "record_digest")
+            except ProtocolError as exc: raise _fail("LEDGER_CORRUPT", "invalid root claim identity") from exc
+            if not isinstance(row["path"], str) or not os.path.isabs(row["path"]) or os.path.normpath(row["path"]) != row["path"]:
+                raise _fail("LEDGER_CORRUPT", "invalid root claim path")
+            rows.append(row); previous = row["record_digest"]
+        return rows
+
+    def _started_claim_records(self) -> dict[str, dict[str, object]]:
+        if self.ledger is None: raise _fail("INVALID_REQUEST", "attempt ledger is required for root claims")
+        return {row["attempt_id"]: row for row in self.ledger.records() if row["event"] == "STARTED"}
+
+    @staticmethod
+    def _validate_root_claim_coverage(rows: Sequence[Mapping[str, object]], started: Mapping[str, Mapping[str, object]], *, incomplete_attempt: str | None = None) -> None:
+        observed: dict[str, set[str]] = {attempt_id: set() for attempt_id in started}
+        committed_paths: dict[str, str] = {}; committed_ids: dict[str, str] = {}
+        for row in rows:
+            event = started.get(row["attempt_id"])
+            if event is None:  # Pre-START orphan chronology is retained but has no authority.
+                continue
+            expected = {event["output_root_id"]: event["output_root_digest"], event["session_root_id"]: event["session_root_digest"]}
+            if row["root_id"] not in expected or row["root_digest"] != expected[row["root_id"]] or row["request_digest"] != event["request_digest"]:
+                raise _fail("LEDGER_CORRUPT", "root claim does not match durable STARTED")
+            if row["root_id"] in observed[row["attempt_id"]]: raise _fail("LEDGER_CORRUPT", "duplicate durable root claim")
+            owner = committed_ids.get(row["root_id"])
+            if owner is not None and owner != row["attempt_id"]: raise _fail("LEDGER_CORRUPT", "durable root ID is multiply claimed")
+            path_owner = committed_paths.get(row["path"])
+            if path_owner is not None: raise _fail("LEDGER_CORRUPT", "durable canonical root path is multiply claimed")
+            observed[row["attempt_id"]].add(row["root_id"]); committed_ids[row["root_id"]] = row["attempt_id"]; committed_paths[row["path"]] = row["attempt_id"]
+        for attempt_id, event in started.items():
+            expected_ids = {event["output_root_id"], event["session_root_id"]}
+            if attempt_id == incomplete_attempt:
+                if not observed[attempt_id].issubset(expected_ids): raise _fail("LEDGER_CORRUPT", "invalid incomplete root claim set")
+            elif observed[attempt_id] != expected_ids:
+                raise _fail("LEDGER_CORRUPT", "durable STARTED root claim history is missing")
+
+    def _prepared_authorizes_claims(self, attempt_id: str, request_digest: str, started: Mapping[str, object]) -> bool:
+        path = self._prepared_path(attempt_id)
+        try:
+            if path.is_symlink() or not path.is_file(): return False
+            value = _strict_json(path.read_bytes())
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError): return False
+        expected = {"schema_version", "kind", "attempt_id", "request_digest", "worktree", "roots", "evidence"}
+        if not isinstance(value, dict) or set(value) != expected or value["schema_version"] != 1 or value["kind"] != "dispatch_prepared" or value["attempt_id"] != attempt_id or value["request_digest"] != request_digest:
+            return False
+        roots = value["roots"]
+        if not isinstance(roots, list) or len(roots) != 2: return False
+        expected_roots = {started["output_root_id"]: started["output_root_digest"], started["session_root_id"]: started["session_root_digest"]}
+        actual: dict[str, str] = {}
+        for item in roots:
+            if not isinstance(item, dict) or set(item) != {"path", "root_id", "root_digest"} or not isinstance(item["path"], str) or not os.path.isabs(item["path"]) or os.path.normpath(item["path"]) != item["path"]:
+                return False
+            if item["root_id"] in actual: return False
+            actual[item["root_id"]] = item["root_digest"]
+        return actual == expected_roots and started["request_digest"] == request_digest
+
+    @staticmethod
+    def _root_claim_state(dirfd: int) -> dict[str, object] | None:
+        try: fd = os.open("root-claims.state.json", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+        except FileNotFoundError: return None
+        except OSError as exc: raise _fail("LEDGER_CORRUPT", "root claim state is unsafe") from exc
+        try:
+            info = os.fstat(fd); data = os.read(fd, 65_537)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or len(data) > 65_536: raise _fail("LEDGER_CORRUPT", "root claim state is unsafe")
+            value = _strict_json(data)
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError) as exc: raise _fail("LEDGER_CORRUPT", "root claim state is malformed") from exc
+        finally: os.close(fd)
+        expected = {"schema_version", "kind", "journal_device", "journal_inode", "records", "head_digest", "record_digest"}
+        body = {key: value[key] for key in value if key != "record_digest"} if isinstance(value, dict) else {}
+        if (not isinstance(value, dict) or set(value) != expected or value["schema_version"] != 1 or value["kind"] != "root_claim_state"
+                or not all(isinstance(value[key], int) and not isinstance(value[key], bool) and value[key] >= 0 for key in ("journal_device", "journal_inode", "records"))
+                or value["record_digest"] != raw_file_digest(canonical_json(body))):
+            raise _fail("LEDGER_CORRUPT", "root claim state identity differs")
+        try: _digest(value["head_digest"], "root claim head"); _digest(value["record_digest"], "root claim state digest")
+        except ProtocolError as exc: raise _fail("LEDGER_CORRUPT", "root claim state digest is invalid") from exc
+        return value
+
+    @staticmethod
+    def _write_root_claim_state(dirfd: int, journal: os.stat_result, rows: Sequence[Mapping[str, object]]) -> None:
+        body = {"schema_version": 1, "kind": "root_claim_state", "journal_device": journal.st_dev, "journal_inode": journal.st_ino,
+                "records": len(rows), "head_digest": rows[-1]["record_digest"] if rows else "sha256:" + "0" * 64}
+        body["record_digest"] = raw_file_digest(canonical_json(body)); data = canonical_json(body); temporary = ".root-claims.state.staging"
+        try:
+            try: os.unlink(temporary, dir_fd=dirfd)
+            except FileNotFoundError: pass
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dirfd)
+            with os.fdopen(fd, "wb") as stream: stream.write(data); stream.flush(); os.fsync(stream.fileno())
+            os.replace(temporary, "root-claims.state.json", src_dir_fd=dirfd, dst_dir_fd=dirfd); os.fsync(dirfd)
+        except OSError as exc: raise _fail("LEDGER_CORRUPT", "root claim state cannot be persisted") from exc
+
+    def _verify_root_claim_history(self) -> None:
         if self.private_root is None: raise _fail("INVALID_REQUEST", "private root unavailable")
-        private = _canonical_dir(str(self.private_root), "private_root")
+        started = self._started_claim_records(); private = _canonical_dir(str(self.private_root), "private_root")
         dirfd = os.open(private, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            fd = os.open("root-claims.jsonl", os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600, dir_fd=dirfd)
+            state = self._root_claim_state(dirfd)
+            try: fd = os.open("root-claims.jsonl", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+            except FileNotFoundError:
+                if state is not None or started: raise _fail("LEDGER_CORRUPT", "durable root claim history is missing")
+                return
+            with os.fdopen(fd, "r", encoding="utf-8") as stream:
+                info = os.fstat(stream.fileno())
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1: raise _fail("LEDGER_CORRUPT", "root claims is not a private regular file")
+                fcntl.flock(stream.fileno(), fcntl.LOCK_SH); rows = self._root_claim_rows(stream)
+            self._validate_root_claim_coverage(rows, started)
+            if state is not None:
+                head = rows[-1]["record_digest"] if rows else "sha256:" + "0" * 64
+                if (state["journal_device"], state["journal_inode"], state["records"], state["head_digest"]) != (info.st_dev, info.st_ino, len(rows), head):
+                    raise _fail("LEDGER_CORRUPT", "root claim journal was replaced or lost")
+        except OSError as exc: raise _fail("LEDGER_CORRUPT", "root claims cannot be read") from exc
+        finally: os.close(dirfd)
+
+    def _claim_root_identity(self, root: Path, root_id: str, root_digest: str, attempt_id: str, request_digest: str) -> None:
+        if self.private_root is None: raise _fail("INVALID_REQUEST", "private root unavailable")
+        private = _canonical_dir(str(self.private_root), "private_root"); started = self._started_claim_records()
+        if attempt_id not in started: raise _fail("INVALID_ORDER", "root claim requires durable STARTED")
+        authorized = self._prepared_authorizes_claims(attempt_id, request_digest, started[attempt_id])
+        dirfd = os.open(private, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            state = self._root_claim_state(dirfd); created = False
+            try: fd = os.open("root-claims.jsonl", os.O_RDWR | os.O_APPEND | os.O_NOFOLLOW, 0o600, dir_fd=dirfd)
+            except FileNotFoundError:
+                if state is not None or set(started) != {attempt_id} or not authorized:
+                    raise _fail("LEDGER_CORRUPT", "durable root claim history is missing")
+                fd = os.open("root-claims.jsonl", os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_APPEND | os.O_NOFOLLOW, 0o600, dir_fd=dirfd); created = True
             try:
                 file_stat = os.fstat(fd)
                 if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1: raise _fail("LEDGER_CORRUPT", "root claims is not a private regular file")
                 with os.fdopen(fd, "a+", encoding="utf-8") as stream:
-                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX); stream.seek(0); rows = []; previous = "sha256:" + "0" * 64
-                    for line in stream:
-                        if not line.endswith("\n"): raise _fail("LEDGER_CORRUPT", "partial root claims record")
-                        try: row = _strict_json(line.rstrip("\n").encode("utf-8"))
-                        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc: raise _fail("LEDGER_CORRUPT", "malformed root claims record") from exc
-                        expected = {"schema_version", "root_id", "root_digest", "path", "attempt_id", "request_digest", "claimed_at", "prev_digest", "record_digest"}
-                        if not isinstance(row, dict) or set(row) != expected or row["prev_digest"] != previous or row["record_digest"] != raw_file_digest(canonical_json({key: row[key] for key in row if key != "record_digest"})):
-                            raise _fail("LEDGER_CORRUPT", "corrupt root claims record")
-                        _id(row["root_id"], "root_id"); _digest(row["root_digest"], "root_digest"); _digest(row["request_digest"], "request_digest"); _digest(row["prev_digest"], "prev_digest"); _digest(row["record_digest"], "record_digest")
-                        if not isinstance(row["path"], str) or not os.path.isabs(row["path"]): raise _fail("LEDGER_CORRUPT", "invalid root claim path")
-                        rows.append(row); previous = row["record_digest"]
-                    if self.ledger is None:
-                        raise _fail("INVALID_REQUEST", "attempt ledger is required for root claims")
-                    started_attempts = {item["attempt_id"] for item in self.ledger.records() if item["event"] == "STARTED"}
-                    if attempt_id not in started_attempts:
-                        raise _fail("INVALID_ORDER", "root claim requires durable STARTED")
-                    exact = next((row for row in rows if row["attempt_id"] == attempt_id and row["root_id"] == root_id
-                                  and row["root_digest"] == root_digest and row["path"] == str(root)
-                                  and row["request_digest"] == request_digest), None)
-                    if exact is not None:
-                        return
-                    committed = [row for row in rows if row["attempt_id"] in started_attempts]
-                    if any(row["root_id"] == root_id or row["path"] == str(root) for row in committed):
-                        raise _fail("RESOURCE_REUSED", "root identity or canonical path was previously claimed")
-                    row = {"schema_version": 1, "root_id": root_id, "root_digest": root_digest, "path": str(root), "attempt_id": attempt_id, "request_digest": request_digest, "claimed_at": _now(), "prev_digest": previous}
-                    row["record_digest"] = raw_file_digest(canonical_json(row)); stream.seek(0, 2); stream.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"); stream.flush(); os.fsync(stream.fileno()); fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_EX); rows = self._root_claim_rows(stream)
+                    self._validate_root_claim_coverage(rows, started, incomplete_attempt=attempt_id)
+                    head = rows[-1]["record_digest"] if rows else "sha256:" + "0" * 64
+                    if state is not None:
+                        if (state["journal_device"], state["journal_inode"]) != (file_stat.st_dev, file_stat.st_ino) or state["records"] > len(rows):
+                            raise _fail("LEDGER_CORRUPT", "root claim journal was replaced or truncated")
+                        state_head = rows[state["records"] - 1]["record_digest"] if state["records"] else "sha256:" + "0" * 64
+                        if state["head_digest"] != state_head: raise _fail("LEDGER_CORRUPT", "root claim state chain differs")
+                        if state["records"] != len(rows) and (not authorized or any(row["attempt_id"] != attempt_id for row in rows[state["records"]:])):
+                            raise _fail("LEDGER_CORRUPT", "unauthenticated root claim state lag")
+                    elif rows and not (authorized or all(len({row["root_id"] for row in rows if row["attempt_id"] == key}) == 2 for key in started)):
+                        raise _fail("LEDGER_CORRUPT", "root claim state is missing")
+                    if state is None or state["records"] != len(rows): self._write_root_claim_state(dirfd, file_stat, rows)
+                    exact = next((row for row in rows if row["attempt_id"] == attempt_id and row["root_id"] == root_id and row["root_digest"] == root_digest and row["path"] == str(root) and row["request_digest"] == request_digest), None)
+                    if exact is not None: return
+                    if not authorized: raise _fail("LEDGER_CORRUPT", "incomplete root claims lack authenticated prepared state")
+                    committed = [row for row in rows if row["attempt_id"] in started]
+                    if any(row["root_id"] == root_id or row["path"] == str(root) for row in committed): raise _fail("RESOURCE_REUSED", "root identity or canonical path was previously claimed")
+                    row = {"schema_version": 1, "root_id": root_id, "root_digest": root_digest, "path": str(root), "attempt_id": attempt_id, "request_digest": request_digest, "claimed_at": _now(), "prev_digest": head}
+                    row["record_digest"] = raw_file_digest(canonical_json(row)); stream.seek(0, 2); stream.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"); stream.flush(); os.fsync(stream.fileno()); rows.append(row)
+                    self._write_root_claim_state(dirfd, file_stat, rows); fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+                if created: os.fsync(dirfd)
             except (OSError, UnicodeDecodeError) as exc: raise _fail("LEDGER_CORRUPT", "root claims cannot be locked or written") from exc
         finally: os.close(dirfd)
 
@@ -1285,6 +1410,7 @@ class HerdrProvider:
             if root == private_root or not root.is_relative_to(private_root): raise _fail("PATH_ESCAPE", f"{key} is outside provider private root")
         with self._dispatch_lock():
             self._reconcile_prepared()
+            self._verify_root_claim_history()
             self.ledger.assert_start_available(attempt_id=value["attempt_id"], allowance_id=value["allowance_id"],
                                                output_root_id=value["output_root_id"], session_root_id=value["session_root_id"])
             # Razr authority is read before worktree_open or any other dispatch mutation.

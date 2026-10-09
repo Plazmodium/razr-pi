@@ -480,7 +480,7 @@ class HerdrProviderTests(unittest.TestCase):
             with patch.object(provider, "probe", return_value=probe), patch.object(provider, "_verify_candidate") as verify, \
                  patch.object(provider, "_prepare_launch_material") as claims:
                 with self.assertRaises(ProtocolError) as caught: provider.launch(request)
-            self.assertEqual(caught.exception.code, "DUPLICATE_ATTEMPT")
+            self.assertEqual(caught.exception.code, "LEDGER_CORRUPT")
             verify.assert_not_called(); claims.assert_not_called(); self.assertEqual(ledger.path.read_bytes(), before)
             self.assertFalse((private / "root-claims.jsonl").exists()); self.assertFalse((worktree / ".razr/evidence").exists())
 
@@ -746,6 +746,39 @@ class HerdrProviderTests(unittest.TestCase):
             claims = [json.loads(line) for line in (private / "root-claims.jsonl").read_text().splitlines()]
             self.assertEqual(sum(row["path"] == str(output) for row in claims), 1)
 
+    def test_lost_or_replaced_root_claim_journal_refuses_before_new_started_or_launch(self):
+        for damage in ("deleted", "replaced"):
+            with self.subTest(damage=damage), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp).resolve(); request, current, probe, private, _, output, _ = request_fixture(base, "att-journal-original-" + damage)
+                ledger = AttemptLedger(base / "attempts.jsonl"); starts = []
+                def runner(argv, **kwargs):
+                    if argv[:3] == ["herdr", "agent", "start"]:
+                        starts.append(argv); return subprocess.CompletedProcess(argv, 7, b"", b"failed")
+                    raise AssertionError(argv)
+                provider = HerdrProvider(runner=runner, ledger=ledger, private_root=private)
+                with patch.object(provider, "probe", return_value=probe), patch.object(provider, "_verify_candidate"), \
+                     patch.object(provider, "_read_current_work", return_value=current):
+                    with self.assertRaises(ProtocolError): provider.launch(request)
+                self.assertEqual(len(starts), 1); self.assertEqual([row["event"] for row in ledger.records()], ["STARTED", "SETTLED"])
+                journal = private / "root-claims.jsonl"; original = journal.read_bytes()
+                if damage == "deleted":
+                    journal.unlink(); (private / "root-claims.state.json").unlink()
+                else:
+                    journal.rename(private / "root-claims.replaced"); journal.write_bytes(original)
+                __import__("shutil").rmtree(output); output.mkdir()
+                session2 = private / ("session-journal-" + damage); session2.mkdir()
+                second = json.loads(json.dumps(request)); second.update({"request_id": "exec-journal-" + damage,
+                    "attempt_id": "att-journal-new-" + damage, "allowance_id": "allow-journal-" + damage,
+                    "worker_id": "worker-journal-" + damage, "output_root_id": "out-journal-" + damage,
+                    "session_root": str(session2), "session_root_id": "sess-journal-" + damage})
+                restarted = HerdrProvider(runner=runner, ledger=ledger, private_root=private)
+                with patch.object(restarted, "probe", return_value=probe), patch.object(restarted, "_read_current_work") as authority, \
+                     patch.object(restarted, "_verify_candidate") as candidate:
+                    with self.assertRaises(ProtocolError) as caught: restarted.launch(second)
+                self.assertEqual(caught.exception.code, "LEDGER_CORRUPT")
+                authority.assert_not_called(); candidate.assert_not_called()
+                self.assertEqual(len(starts), 1); self.assertEqual([row["event"] for row in ledger.records()], ["STARTED", "SETTLED"])
+
     def test_pre_started_crash_staging_is_reconciled_and_exactly_retryable(self):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp).resolve(); request, current, probe, private, _, _, _ = request_fixture(base, "att-pre-start-crash")
@@ -791,6 +824,7 @@ class HerdrProviderTests(unittest.TestCase):
             self.assertTrue((session / ".razr-herdr-root.json").is_file())
             claims = (private / "root-claims.jsonl").read_text().splitlines()
             self.assertEqual(len(claims), 2)
+            self.assertTrue((private / "root-claims.state.json").is_file())
             boundary = worktree / ".razr/evidence/launch-boundary-att-crash-window.json"
             retained = {"ref": ".razr/evidence/" + boundary.name, "digest_domain": "raw_file",
                         "digest": raw_file_digest(boundary.read_bytes()), "kind": "event"}
