@@ -65,6 +65,12 @@ class GithubDeliveryTests(unittest.TestCase):
             subprocess.run(["git", "commit", "-qm", "custom"], cwd=root, check=True)
             commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
             self.assertEqual(delivery.source_identity(root, commit), _source_digest(root, commit))
+            # The live checkout may have no config (or a different config); the
+            # candidate commit's custom config still defines the digest domain.
+            (root / "razr.yaml").unlink()
+            from runtime.scripts.razr import source_tree_digest
+            self.assertEqual(delivery.source_identity(root, commit),
+                             source_tree_digest(root, commit, ".workflow/data"))
 
     def test_snapshot_has_source_identity_and_base_head(self):
         with patch.object(delivery, "remote_identity", return_value="o/r"), \
@@ -87,6 +93,20 @@ class GithubDeliveryTests(unittest.TestCase):
                                       expected_source_digest=DIGEST)
             self.assertEqual(result["repository"], "o/r")
             self.assertEqual(result["sourceDigest"], DIGEST)
+
+    def test_provider_review_and_reaction_enums_are_closed(self):
+        for decision in ("", "APPROVED", "CHANGES_REQUESTED", "REVIEW_REQUIRED"):
+            delivery._validate_pr(pr_value(reviewDecision=decision), URL, "o", "r", 1)
+        with self.assertRaises(delivery.DeliveryError):
+            delivery._validate_pr(pr_value(reviewDecision="DISMISSED"), URL, "o", "r", 1)
+        good = pr_value(comments=[{"id": "c", "author": None, "authorAssociation": "NONE", "body": "x",
+                                   "createdAt": None, "includesCreatedEdit": False, "isMinimized": False,
+                                   "minimizedReason": None, "reactionGroups":[{"content":"HEART","users":{"totalCount":0}}],
+                                   "updatedAt": None, "url": None, "viewerDidAuthor": False}])
+        delivery._validate_pr(good, URL, "o", "r", 1)
+        bad = pr_value(comments=[{**good["comments"][0], "reactionGroups":[{"content":"UNKNOWN","users":{"totalCount":0}}]}])
+        with self.assertRaises(delivery.DeliveryError):
+            delivery._validate_pr(bad, URL, "o", "r", 1)
 
     def test_merge_state_uses_live_graphql_enum(self):
         delivery._validate_pr(pr_value(mergeStateStatus="HAS_HOOKS"), URL, "o", "r", 1)
@@ -273,11 +293,44 @@ class GithubDeliveryTests(unittest.TestCase):
                                    expected_head_sha=SHA, expected_source_digest=DIGEST)
             self.assertEqual(run.call_count, 1)
 
-    def test_new_mismatched_pr_is_closed_but_race_recovery_is_not(self):
+    def test_create_transport_failure_is_explicit_when_recovery_is_missing_or_fails(self):
+        common = dict(base="base", head="feature", title="t", body="b", expected_repository="o/r",
+                      expected_base_sha="b" * 40, expected_head_sha=SHA, expected_source_digest=DIGEST)
         with patch.object(delivery, "remote_identity", return_value="o/r"), \
              patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA, "b" * 40, SHA]), \
              patch.object(delivery, "source_identity", side_effect=[DIGEST, DIGEST]), \
              patch.object(delivery, "_json", return_value=[]), \
+             patch.object(delivery, "_run", side_effect=delivery.DeliveryError("create timeout")):
+            with self.assertRaisesRegex(delivery.DeliveryError, "created-but-unverified.*unavailable"):
+                delivery.create_pr(Path("."), **common)
+        with patch.object(delivery, "remote_identity", return_value="o/r"), \
+             patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA, "b" * 40, SHA]), \
+             patch.object(delivery, "source_identity", side_effect=[DIGEST, DIGEST]), \
+             patch.object(delivery, "_json", side_effect=[[], delivery.DeliveryError("lookup timeout")]), \
+             patch.object(delivery, "_run", side_effect=delivery.DeliveryError("create timeout")):
+            with self.assertRaisesRegex(delivery.DeliveryError, "created-but-unverified.*uncertain"):
+                delivery.create_pr(Path("."), **common)
+
+    def test_wrong_repository_create_output_recovers_exact_candidate(self):
+        recovered = {"number": 1}
+        with patch.object(delivery, "remote_identity", return_value="o/r"), \
+             patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA, "b" * 40, SHA]), \
+             patch.object(delivery, "source_identity", side_effect=[DIGEST, DIGEST]), \
+             patch.object(delivery, "_json", side_effect=[[], [{"url": URL}]]), \
+             patch.object(delivery, "_run", return_value="https://github.com/other/r/pull/99"), \
+             patch.object(delivery, "read_pr", return_value=recovered):
+            self.assertIs(delivery.create_pr(Path("."), base="base", head="feature", title="t", body="b",
+                                             expected_repository="o/r", expected_base_sha="b" * 40,
+                                             expected_head_sha=SHA, expected_source_digest=DIGEST), recovered)
+
+    def test_new_mismatched_pr_is_closed_but_race_recovery_is_not(self):
+        with patch.object(delivery, "remote_identity", return_value="o/r"), \
+             patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA, "b" * 40, SHA]), \
+             patch.object(delivery, "source_identity", side_effect=[DIGEST, DIGEST]), \
+             patch.object(delivery, "_json", side_effect=[[],
+                 {"number": 1, "url": URL, "state": "OPEN", "baseRefName": "base", "headRefName": "feature",
+                  "baseRefOid": "b" * 40, "headRefOid": SHA},
+                 {"number": 1, "url": URL, "state": "CLOSED"}]), \
              patch.object(delivery, "_run", side_effect=[URL, ""]) as run, \
              patch.object(delivery, "read_pr", side_effect=delivery.CandidateChanged("moved")):
             with self.assertRaises(delivery.CandidateChanged):
@@ -318,6 +371,16 @@ class GithubDeliveryTests(unittest.TestCase):
             raw = json.dumps([{"name": "ci", "state": state, "bucket": bucket}])
             with self.subTest(state=state), patch.object(delivery, "_run_result", return_value=(raw, "", code)):
                 self.assertEqual(delivery._required_checks(Path("."), URL, "o/r")[1], expected)
+
+    def test_required_check_mixed_failure_and_pending_keeps_all_rows(self):
+        raw = json.dumps([
+            {"name": "failed", "state": "FAILURE", "bucket": "FAIL"},
+            {"name": "running", "state": "IN_PROGRESS", "bucket": "PENDING"},
+        ])
+        with patch.object(delivery, "_run_result", return_value=(raw, "", 1)):
+            rows, status = delivery._required_checks(Path("."), URL, "o/r")
+        self.assertEqual(status, "failing")
+        self.assertEqual([row["name"] for row in rows], ["failed", "running"])
 
     def test_required_check_exit_one_requires_exact_no_checks_diagnostic(self):
         for diagnostic in ("no checks reported on the 'feature' branch\n", "no required checks reported on the 'feature' branch\n"):

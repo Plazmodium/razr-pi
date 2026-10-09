@@ -265,16 +265,23 @@ def pushed_head(root: Path, branch: str, remote: str = "origin") -> str:
 
 
 def _configured_work_root(root: Path, commit: str) -> str:
-    # Use the frozen core's config authority. Unadopted public source trees do
-    # not contain a live razr.yaml, so use the core's shipped default rather
-    # than inventing a delivery-specific .razr exclusion.
-    if (root / "razr.yaml").exists():
-        try:
-            from .core_subprocess import _core_work_root
-            return _core_work_root(root, commit)
-        except Exception as exc:
-            raise DeliveryError("validated Razr work root is unavailable") from exc
+    # Read configuration from the candidate object, never from the live
+    # checkout. Core validate_config remains the semantic authority.
     core_namespace = runpy.run_path(str(Path(__file__).resolve().parents[1] / "runtime/scripts/razr.py"))
+    try:
+        out, diagnostic, code = _run_result("git", ["show", f"{commit}:razr.yaml"], root,
+                                            accepted_codes={0, 128})
+        if code == 0:
+            config = json.loads(out)
+            try:
+                validated = core_namespace["validate_config"](root.resolve(), config)
+            except Exception as exc:
+                raise DeliveryError("candidate razr.yaml is invalid") from exc
+            return str(validated.relative_to(root.resolve()))
+        if "does not exist in" not in diagnostic:
+            raise DeliveryError("candidate razr.yaml is unavailable")
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError, OSError) as exc:
+        raise DeliveryError("candidate razr.yaml is invalid") from exc
     work_root = core_namespace.get("DEFAULT_CONFIG", {}).get("work_root")
     if not isinstance(work_root, str) or not work_root:
         raise DeliveryError("core default work root is unavailable")
@@ -339,7 +346,8 @@ def _reactions(value: Any) -> None:
         raise DeliveryError("invalid reaction groups")
     for group in value:
         if not isinstance(group, dict) or set(group) != {"content", "users"} \
-                or not isinstance(group["content"], str) or not isinstance(group["users"], dict):
+                or group.get("content") not in {"THUMBS_UP", "THUMBS_DOWN", "LAUGH", "HOORAY", "CONFUSED", "HEART", "ROCKET", "EYES"} \
+                or not isinstance(group["users"], dict):
             raise DeliveryError("invalid reaction group")
         users = group["users"]
         if set(users) - {"totalCount", "nodes"} or not isinstance(users.get("totalCount"), int) \
@@ -442,7 +450,8 @@ def _validate_pr(value: Any, url: str, owner: str, repo: str, number: int) -> di
                     _nullable_string(row.get(key), "check " + key)
     if not isinstance(value.get("isDraft"), bool):
         raise DeliveryError("malformed draft state")
-    _nullable_string(value.get("reviewDecision"), "reviewDecision")
+    if value.get("reviewDecision") not in {"", "APPROVED", "CHANGES_REQUESTED", "REVIEW_REQUIRED"}:
+        raise DeliveryError("unknown review decision")
     for key in ("mergedAt", "closedAt", "updatedAt"):
         _nullable_string(value.get(key), key)
     value["repository"] = f"{owner}/{repo}"
@@ -500,8 +509,8 @@ def _required_checks(root: Path, url: str, repository: str) -> tuple[list[dict[s
     expected = 1 if failing else 8 if pending else 0
     if code != expected:
         raise DeliveryError("required-check exit contradicts populated checks")
-    if failing and pending:
-        raise DeliveryError("required-check result is both failing and pending")
+    # gh uses failure precedence (exit 1) while retaining pending rows.
+    # The aggregate is failing, but every provider row remains returned.
     if failing:
         return result, "failing"
     if pending:
@@ -718,23 +727,39 @@ def _existing_open(root: Path, repository: str, base: str, head: str, base_sha: 
                    expected_source_digest=source_digest)
 
 
-def _close_created(root: Path, repository: str, url: str) -> str:
-    # GitHub's branch-name PR create has no atomic expected-head argument. This
-    # compensates only a validated URL returned by this invocation.
+def _close_created(root: Path, repository: str, url: str, *, base: str, head: str,
+                   base_sha: str, head_sha: str) -> str:
+    # A syntactic URL is not a compensation binding. Independently read the
+    # candidate and require the attempted branch names and OIDs before close.
     owner, name, number = _pr_url(url)
     if f"{owner}/{name}".lower() != repository.lower():
         raise IdentityMismatch("created PR repository differs from verified repository")
+    fields = _json("gh", ["pr", "view", url, "--repo", _repo_arg(repository), "--json",
+                           "number,url,state,baseRefName,headRefName,baseRefOid,headRefOid"], root)
+    required = {"number", "url", "state", "baseRefName", "headRefName", "baseRefOid", "headRefOid"}
+    if not isinstance(fields, dict) or set(fields) != required \
+            or fields["number"] != number or fields["url"] != url \
+            or fields["baseRefName"] != base or fields["headRefName"] != head \
+            or fields["baseRefOid"] != base_sha or fields["headRefOid"] != head_sha \
+            or fields["state"] != "OPEN":
+        raise DeliveryError("created PR compensation target is not safely bound")
     _run("gh", ["pr", "close", url, "--repo", _repo_arg(repository)], root)
-    fields = _json("gh", ["pr", "view", url, "--repo", _repo_arg(repository), "--json", "number,url,state"], root)
-    if not isinstance(fields, dict) or set(fields) != {"number", "url", "state"} \
-            or fields["number"] != number or fields["url"] != url or fields["state"] != "CLOSED":
+    closed = _json("gh", ["pr", "view", url, "--repo", _repo_arg(repository), "--json", "number,url,state"], root)
+    if not isinstance(closed, dict) or set(closed) != {"number", "url", "state"} \
+            or closed["number"] != number or closed["url"] != url or closed["state"] != "CLOSED":
         raise DeliveryError("created PR compensation is unconfirmed")
     return "confirmed"
 
 
-def _candidate_identity_mismatch(error: IdentityMismatch) -> bool:
-    text = str(error).lower()
-    return any(token in text for token in ("base branch", "base commit", "head branch", "head commit", "source identity", "final head", "final base"))
+def _recover_created(root: Path, repository: str, base: str, head: str, base_sha: str,
+                     head_sha: str, digest: str, cause: DeliveryError) -> dict[str, Any]:
+    try:
+        recovered = _existing_open(root, repository, base, head, base_sha, head_sha, digest)
+    except DeliveryError as recovery_error:
+        raise DeliveryError(f"created-but-unverified; compensation uncertain; exact recovery failed: {cause}; {recovery_error}") from cause
+    if recovered is not None:
+        return recovered
+    raise DeliveryError(f"created-but-unverified; compensation unavailable; exact candidate not found: {cause}") from cause
 
 
 def create_pr(root: Path, *, base: str, head: str, title: str, body: str,
@@ -777,27 +802,18 @@ def create_pr(root: Path, *, base: str, head: str, title: str, body: str,
     try:
         url = _run("gh", ["pr", "create", "--repo", _repo_arg(repository), "--base", base, "--head", head,
                            "--title", title, "--body", body], root)
-    except DeliveryError:
-        # A concurrent creator may have won. One read-only exact lookup is the only recovery.
-        recovered = _existing_open(root, repository, base, head, base_sha, head_sha, digest)
-        if recovered is not None:
-            return recovered
-        raise
+    except DeliveryError as exc:
+        # Transport failure is potentially mutating; never imply that create
+        # definitely did not happen.
+        return _recover_created(root, repository, base, head, base_sha, head_sha, digest, exc)
     try:
-        # Validate the provider's returned text before it can reach close.
         created_owner, created_name, _ = _pr_url(url)
         if f"{created_owner}/{created_name}".lower() != repository.lower():
-            raise DeliveryError("created-but-unverified; returned PR repository differs and cannot be safely closed")
-    except InvalidRequest as exc:
-        # gh has mutated remotely but supplied no safe close target. Perform
-        # one exact candidate lookup; never pass malformed text to gh close.
-        try:
-            recovered = _existing_open(root, repository, base, head, base_sha, head_sha, digest)
-        except DeliveryError as recovery_error:
-            raise DeliveryError(f"created-but-unverified; exact recovery failed: {recovery_error}") from exc
-        if recovered is not None:
-            return recovered
-        raise DeliveryError("created-but-unverified; no exact PR URL was recoverable and compensation is unavailable") from exc
+            raise DeliveryError("returned PR repository differs from verified repository")
+    except DeliveryError as exc:
+        # Every unverified output variant uses the same exact recovery path;
+        # malformed or wrong-repository text never reaches gh close.
+        return _recover_created(root, repository, base, head, base_sha, head_sha, digest, exc)
 
     try:
         return read_pr(root, url, expected_repository=repository, expected_base=base,
@@ -805,7 +821,8 @@ def create_pr(root: Path, *, base: str, head: str, title: str, body: str,
                        expected_source_digest=digest)
     except DeliveryError as exc:
         try:
-            outcome = _close_created(root, repository, url)
+            outcome = _close_created(root, repository, url, base=base, head=head,
+                                     base_sha=base_sha, head_sha=head_sha)
         except DeliveryError as close_error:
             message = f"post-create verification failed: {exc}; compensation uncertain: {close_error}"
             raise type(exc)(message) from exc
