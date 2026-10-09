@@ -857,11 +857,14 @@ class HerdrProvider:
         elif len(roots) != 1: raise _fail("IDENTITY_MISMATCH", "open worktree root pane is ambiguous")
         return {"workspace_id": roots[0]["workspace_id"], "tab_id": roots[0]["tab_id"], "pane_id": roots[0]["pane_id"]}
 
-    def _verify_candidate(self, request: ProviderRequest, *, deadline_at: float | None = None) -> None:
+    def _verify_candidate(self, request: ProviderRequest, *, deadline_at: float | None = None,
+                          allow_worktree_open: bool = True) -> None:
         value = request.value
         root = _canonical_dir(value["worktree"], "worktree")
         target = _target(value["host"])
         existing = self._resolve_existing_worktree(root, target, deadline_at=deadline_at)
+        if existing is None and not allow_worktree_open:
+            raise _fail("IDENTITY_MISMATCH", "verified worktree disappeared before launch")
         opened = ({**existing, "path": str(root)} if existing is not None
                   else self.worktree_open(path=str(root), deadline_at=deadline_at)["result"])
         if any(opened[key] != target[key] for key in ("workspace_id", "tab_id", "pane_id")):
@@ -1049,8 +1052,9 @@ class HerdrProvider:
         with self._dispatch_lock():
             self.ledger.assert_start_available(attempt_id=value["attempt_id"], allowance_id=value["allowance_id"],
                                                output_root_id=value["output_root_id"], session_root_id=value["session_root_id"])
-            self._verify_candidate(parsed, deadline_at=deadline_at)
+            # Razr authority is read before worktree_open or any other dispatch mutation.
             current = self._read_current_work(parsed, deadline_at=deadline_at)
+            self._verify_candidate(parsed, deadline_at=deadline_at)
             evidence = self._claim_roots(parsed, probe_report["result"]["report_digest"], current)
             started = {"schema_version": 1, "event": "STARTED", "attempt_id": value["attempt_id"], "work_id": value["work"]["work_id"], "node_id": value["work"]["node_id"], "observed_generation": value["work"]["generation"], "observed_ordinal": value["work"]["ordinal"], "worker_id": value["worker_id"], "branch": value["branch"], "worktree_ref": ".", "allowance_id": value["allowance_id"], "provider_id": self.provider_id, "started_at": _now(), "started_at_source": "adapter_observed", "candidate": {"commit": value["candidate"]["commit"], "source_digest": value["candidate"]["source_digest"]}, "candidate_evidence": evidence["candidate"], "request_packet": evidence["packet"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"], "request_digest": evidence["request_digest"], "herdr": _ledger_host(value["host"]), "prev_digest": "sha256:" + "0" * 64}
             try:
@@ -1065,7 +1069,7 @@ class HerdrProvider:
                 final = self._read_current_work(parsed, deadline_at=deadline_at)
                 if (final.raw_state_digest != current.raw_state_digest or final.raw_state_core_identity != current.raw_state_core_identity):
                     raise _fail("STALE_GENERATION", "core state changed at final launch fence")
-                self._verify_candidate(parsed, deadline_at=deadline_at)
+                self._verify_candidate(parsed, deadline_at=deadline_at, allow_worktree_open=False)
                 remaining = self._remaining_ms(deadline_at, deadline)
                 response = self._exec([self.herdr, "agent", "start", value["worker_id"], "--kind", "pi", "--pane", _target(value["host"])["pane_id"], "--timeout", str(remaining), "--", "--model", _MODEL, "--thinking", "medium", "--session-dir", value["session_root"], "--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve"], timeout_ms=remaining, cwd=_canonical_dir(value["cwd"], "cwd"), max_output=value["limits"]["max_output_bytes"], deadline_at=deadline_at)
             except ProtocolError as exc:

@@ -93,7 +93,12 @@ class HerdrProviderTests(unittest.TestCase):
             probe = {"schema_version": 1, "ok": True, "request_id": "probe-cross-pane",
                      "result": {"provider_id": "herdr", "runtime_identity": "openai-codex/gpt-5.6-luna:medium",
                                 "capabilities": ["runtime_identity"], "report_digest": digest}}
+            current = SimpleNamespace(work_id="work", node_id="node", generation=1, node_attempt=1,
+                                      candidate_repository="fixture", candidate_branch="feature/x",
+                                      candidate_commit="0" * 40, candidate_source_digest=digest,
+                                      raw_state_digest=digest, raw_state_core_identity=digest)
             with patch.object(rejecting, "probe", return_value=probe), \
+                 patch.object(rejecting, "_read_current_work", return_value=current), \
                  patch.object(rejecting, "_resolve_existing_worktree", return_value={**target, "pane_id": "wrong-pane"}), \
                  patch("adapter.herdr_provider.verify_candidate_identity"):
                 with self.assertRaises(ProtocolError) as caught:
@@ -315,6 +320,8 @@ class HerdrProviderTests(unittest.TestCase):
             with patch.object(provider, "_verify_candidate") as verify, patch.object(provider, "_read_current_work", return_value=current):
                 response = provider.launch(request)
             self.assertEqual(verify.call_count, 2)
+            self.assertNotIn("allow_worktree_open", verify.call_args_list[0].kwargs)
+            self.assertIs(verify.call_args_list[1].kwargs["allow_worktree_open"], False)
             handle = response["result"]["handle"]
             self.assertEqual(open_calls, [])
             self.assertEqual(set(handle), {"provider_id", "handle_id", "request_digest", "attempt_id", "host", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest"})
@@ -434,14 +441,22 @@ class HerdrProviderTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp).resolve(); request, current, probe, private, worktree, output, session = request_fixture(base)
             ledger = AttemptLedger(base / "attempts.jsonl")
-            provider = HerdrProvider(runner=lambda argv, **kwargs: (_ for _ in ()).throw(AssertionError("must not launch")),
+            herdr_calls = []
+            provider = HerdrProvider(runner=lambda argv, **kwargs: herdr_calls.append(list(argv)),
                                      ledger=ledger, private_root=private)
-            with patch.object(provider, "probe", return_value=probe), patch.object(provider, "_verify_candidate"), \
-                 patch.object(provider, "_read_current_work", side_effect=ProtocolError("STALE_GENERATION", "moved")), \
-                 patch.object(provider, "_claim_roots") as claims:
-                with self.assertRaises(ProtocolError) as caught: provider.launch(request)
-            self.assertEqual(caught.exception.code, "STALE_GENERATION")
-            claims.assert_not_called(); self.assertFalse(ledger.path.exists())
+            for code in ("STALE_GENERATION", "CANDIDATE_CHANGED"):
+                with self.subTest(code=code), patch.object(provider, "probe", return_value=probe), \
+                     patch.object(provider, "_read_current_work", side_effect=ProtocolError(code, "moved")), \
+                     patch.object(provider, "_resolve_existing_worktree") as resolve, \
+                     patch.object(provider, "worktree_open") as opened, \
+                     patch("adapter.herdr_provider.verify_candidate_identity") as git_verify, \
+                     patch.object(provider, "_claim_roots") as claims:
+                    with self.assertRaises(ProtocolError) as caught: provider.launch(request)
+                self.assertEqual(caught.exception.code, code)
+                resolve.assert_not_called(); opened.assert_not_called(); git_verify.assert_not_called()
+                claims.assert_not_called()
+            self.assertEqual(herdr_calls, [])
+            self.assertFalse(ledger.path.exists())
             self.assertEqual(list(output.iterdir()), []); self.assertEqual(list(session.iterdir()), [])
 
             started_ref = {"ref": ".razr/evidence/candidate.json", "digest_domain": "canonical_json", "digest": "sha256:" + "e" * 64}
@@ -546,6 +561,31 @@ class HerdrProviderTests(unittest.TestCase):
             self.assertTrue(all(not thread.is_alive() for thread in threads))
             self.assertEqual(errors, [])
             self.assertEqual(sum(row["event"] == "SETTLED" for row in ledger.records()), 1)
+
+    def test_stale_authority_refuses_before_worktree_or_herdr_mutation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve()
+            request, _, probe, private, worktree, output, session = request_fixture(base, "att-pre-open-fence")
+            ledger = AttemptLedger(base / "attempts.jsonl")
+            herdr_calls = []
+            provider = HerdrProvider(runner=lambda argv, **kwargs: herdr_calls.append(list(argv)),
+                                     ledger=ledger, private_root=private)
+            for code in ("STALE_GENERATION", "CANDIDATE_CHANGED"):
+                with self.subTest(code=code), patch.object(provider, "probe", return_value=probe), \
+                     patch.object(provider, "_read_current_work", side_effect=ProtocolError(code, "moved")), \
+                     patch.object(provider, "_resolve_existing_worktree") as resolve, \
+                     patch.object(provider, "worktree_open") as opened, \
+                     patch("adapter.herdr_provider.verify_candidate_identity") as git_verify, \
+                     patch.object(provider, "_claim_roots") as claims:
+                    with self.assertRaises(ProtocolError) as caught:
+                        provider.launch(request)
+                self.assertEqual(caught.exception.code, code)
+                resolve.assert_not_called(); opened.assert_not_called(); git_verify.assert_not_called()
+                claims.assert_not_called()
+            self.assertEqual(herdr_calls, [])
+            self.assertFalse(ledger.path.exists())
+            self.assertFalse((worktree / ".razr").exists())
+            self.assertEqual(list(output.iterdir()), []); self.assertEqual(list(session.iterdir()), [])
 
     def test_end_to_end_deadline_includes_final_authority_preflight(self):
         with tempfile.TemporaryDirectory() as tmp:
