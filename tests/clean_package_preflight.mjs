@@ -99,8 +99,9 @@ await commandMap.get('razr-recall').handler('[]', commandContext);
 await commandMap.get('razr-remember').handler('null', commandContext);
 assert.ok(notifications.some(item => item.level === 'error'), 'invalid/unadopted handlers must refuse');
 const contextNotice = notifications.find(item => item.level === 'info' && item.message.includes('packet_digest'));
-assert.ok(contextNotice, 'context handler must return the M03 packet');
-assert.match(JSON.parse(contextNotice.message).request_id, /^ctx-[0-9a-f]{32}$/);
+assert.equal(contextNotice, undefined, 'candidate-bound context must not fabricate identity in an unborn repository');
+assert.ok(notifications.some(item => item.level === 'error' && item.message.includes('HEAD')),
+  'candidate-bound context refusal must be actionable');
 assert.equal(readdirSync(cwd).includes('.razr'), false, 'handler smoke must not implicitly adopt');
 assert.deepEqual(snapshot(cwd), before.project, 'handler smoke must not mutate project');
 assert.deepEqual(snapshot(agentDir), before.agent, 'handler smoke must not mutate Pi config');

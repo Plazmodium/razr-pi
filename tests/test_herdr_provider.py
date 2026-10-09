@@ -7,6 +7,9 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -19,6 +22,33 @@ from adapter.protocol import canonical_json, raw_file_digest
 def execution_host(*, workspace="w", tab="t", pane="p"):
     return {"mode": "herdr", "caller": {"workspace_id": "w", "tab_id": "t", "pane_id": "p"},
             "target": {"workspace_id": workspace, "tab_id": tab, "pane_id": pane}}
+
+
+def request_fixture(base: Path, attempt: str = "att-hardening"):
+    worktree = (base / "worktree").resolve(); worktree.mkdir()
+    private = (base / "private").resolve(); private.mkdir()
+    output = (private / "output").resolve(); output.mkdir()
+    session = (private / "session").resolve(); session.mkdir()
+    empty = raw_file_digest(canonical_json([])); source = "sha256:" + "f" * 64
+    request = {"schema_version": 1, "request_id": "exec-hardening", "attempt_id": attempt, "role": "worker",
+               "host": execution_host(), "work": {"work_id": "work", "node_id": "node", "generation": 3, "ordinal": 2},
+               "worker_id": "worker-hardening", "branch": "feature/x",
+               "candidate": {"repository": "owner/repo", "branch": "feature/x", "commit": "0" * 40, "source_digest": source},
+               "worktree": str(worktree), "cwd": str(worktree), "output_root": str(output), "output_root_id": "out-" + attempt,
+               "output_root_digest": empty, "session_root": str(session), "session_root_id": "sess-" + attempt,
+               "session_root_digest": empty, "fresh_context": True, "neutral_input_digest": "sha256:" + "a" * 64,
+               "environment_policy_digest": "sha256:" + "b" * 64, "tool_policy_digest": "sha256:" + "c" * 64,
+               "required_capabilities": ["runtime_identity"],
+               "runtime": {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "thinking": "medium"},
+               "limits": {"deadline_ms": 2000, "max_output_bytes": 1000}, "allowance_id": "allow-" + attempt}
+    current = SimpleNamespace(work_id="work", node_id="node", generation=3, node_attempt=2,
+                              candidate_repository="owner/repo", candidate_branch="feature/x", candidate_commit="0" * 40,
+                              candidate_source_digest=source, raw_state_digest="sha256:" + "9" * 64,
+                              raw_state_core_identity="sha256:" + "8" * 64)
+    probe = {"schema_version": 1, "ok": True, "request_id": request["request_id"],
+             "result": {"provider_id": "herdr", "runtime_identity": "openai-codex/gpt-5.6-luna:medium",
+                        "capabilities": ["runtime_identity"], "report_digest": "sha256:" + "d" * 64}}
+    return request, current, probe, private, worktree, output, session
 
 
 class HerdrProviderTests(unittest.TestCase):
@@ -118,6 +148,8 @@ class HerdrProviderTests(unittest.TestCase):
                 with patch.object(provider, "_exec", return_value=output):
                     with self.assertRaises(ProtocolError) as caught: provider._model()
                 self.assertEqual(caught.exception.code, "UNSUPPORTED_CAPABILITY")
+                self.assertNotIn("release", str(caught.exception).lower())
+                self.assertNotIn("version", str(caught.exception).lower())
         provider = HerdrProvider()
         with patch.object(provider, "_exec", return_value=b"Provider    Model             Context\nopenai-codex gpt-5.6-luna      200000\n"):
             self.assertEqual(provider._model().splitlines()[1].split()[:2], ["openai-codex", "gpt-5.6-luna"])
@@ -222,7 +254,7 @@ class HerdrProviderTests(unittest.TestCase):
             tree = b"100644 blob " + b"0" * 40 + b"\tfile.txt\0"
             source_digest = "sha256:" + hashlib.sha256(tree).hexdigest()
             empty_digest = raw_file_digest(canonical_json([]))
-            open_calls = []; list_calls = [0]
+            open_calls = []; list_calls = [1]
             host = execution_host(workspace="target-w", tab="target-t", pane="target-p")
             target = host["target"]
             def run(argv, **kwargs):
@@ -275,8 +307,14 @@ class HerdrProviderTests(unittest.TestCase):
             provider = HerdrProvider(runner=run, ledger=ledger, private_root=private)
             for bad_schema in (True, 1.0):
                 with self.assertRaises(ProtocolError): provider.launch({**request, "schema_version": bad_schema})
-            with patch("adapter.herdr_provider.verify_candidate_identity"):
+            current = SimpleNamespace(work_id="work", node_id="node", generation=1, node_attempt=1,
+                                      candidate_repository="owner/repo", candidate_branch="feature/x",
+                                      candidate_commit="0" * 40, candidate_source_digest=source_digest,
+                                      raw_state_digest="sha256:" + "9" * 64,
+                                      raw_state_core_identity="sha256:" + "8" * 64)
+            with patch.object(provider, "_verify_candidate") as verify, patch.object(provider, "_read_current_work", return_value=current):
                 response = provider.launch(request)
+            self.assertEqual(verify.call_count, 2)
             handle = response["result"]["handle"]
             self.assertEqual(open_calls, [])
             self.assertEqual(set(handle), {"provider_id", "handle_id", "request_digest", "attempt_id", "host", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest"})
@@ -391,6 +429,191 @@ class HerdrProviderTests(unittest.TestCase):
             mismatch = {**base, "retained_evidence": [{"ref": ".razr/evidence/actual.json", "digest_domain": "raw_file", "digest": "sha256:" + "b" * 64, "kind": "event"}]}
             with self.assertRaises(ProtocolError) as caught: HerdrProvider().recover_unmatched(mismatch)
             self.assertEqual(caught.exception.code, "DIGEST_MISMATCH")
+
+    def test_launch_fences_generation_candidate_duplicate_and_failure_ordering(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve(); request, current, probe, private, worktree, output, session = request_fixture(base)
+            ledger = AttemptLedger(base / "attempts.jsonl")
+            provider = HerdrProvider(runner=lambda argv, **kwargs: (_ for _ in ()).throw(AssertionError("must not launch")),
+                                     ledger=ledger, private_root=private)
+            with patch.object(provider, "probe", return_value=probe), patch.object(provider, "_verify_candidate"), \
+                 patch.object(provider, "_read_current_work", side_effect=ProtocolError("STALE_GENERATION", "moved")), \
+                 patch.object(provider, "_claim_roots") as claims:
+                with self.assertRaises(ProtocolError) as caught: provider.launch(request)
+            self.assertEqual(caught.exception.code, "STALE_GENERATION")
+            claims.assert_not_called(); self.assertFalse(ledger.path.exists())
+            self.assertEqual(list(output.iterdir()), []); self.assertEqual(list(session.iterdir()), [])
+
+            started_ref = {"ref": ".razr/evidence/candidate.json", "digest_domain": "canonical_json", "digest": "sha256:" + "e" * 64}
+            started = {"schema_version": 1, "event": "STARTED", "attempt_id": request["attempt_id"], "work_id": "work", "node_id": "node",
+                       "observed_generation": 3, "observed_ordinal": 2, "worker_id": "worker-hardening", "branch": "feature/x", "worktree_ref": ".",
+                       "allowance_id": request["allowance_id"], "provider_id": "herdr", "started_at": "2026-01-01T00:00:00Z",
+                       "started_at_source": "adapter_observed", "candidate": {"commit": "0" * 40, "source_digest": request["candidate"]["source_digest"]},
+                       "candidate_evidence": started_ref, "request_packet": started_ref, "output_root_id": "prior-out", "output_root_digest": request["output_root_digest"],
+                       "session_root_id": "prior-session", "session_root_digest": request["session_root_digest"], "request_digest": "sha256:" + "d" * 64,
+                       "herdr": {"caller": execution_host()["caller"], "target": execution_host()["target"]}, "prev_digest": "sha256:" + "0" * 64}
+            started["record_digest"] = raw_file_digest(canonical_json(started)); ledger.append(started)
+            before = ledger.path.read_bytes()
+            with patch.object(provider, "probe", return_value=probe), patch.object(provider, "_verify_candidate") as verify, \
+                 patch.object(provider, "_claim_roots") as claims:
+                with self.assertRaises(ProtocolError) as caught: provider.launch(request)
+            self.assertEqual(caught.exception.code, "DUPLICATE_ATTEMPT")
+            verify.assert_not_called(); claims.assert_not_called(); self.assertEqual(ledger.path.read_bytes(), before)
+            self.assertFalse((private / "root-claims.jsonl").exists()); self.assertFalse((worktree / ".razr/evidence").exists())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve(); request, current, probe, private, worktree, _, _ = request_fixture(base, "att-race")
+            ledger = AttemptLedger(base / "attempts.jsonl"); calls = []
+            provider = HerdrProvider(runner=lambda argv, **kwargs: calls.append(argv), ledger=ledger, private_root=private)
+            candidate_checks = [None, ProtocolError("CANDIDATE_CHANGED", "moved before launch")]
+            with patch.object(provider, "probe", return_value=probe), \
+                 patch.object(provider, "_verify_candidate", side_effect=candidate_checks), \
+                 patch.object(provider, "_read_current_work", return_value=current):
+                with self.assertRaises(ProtocolError) as caught: provider.launch(request)
+            self.assertEqual(caught.exception.code, "CANDIDATE_CHANGED")
+            self.assertEqual(calls, [])
+            events = ledger.records(); self.assertEqual([row["event"] for row in events], ["STARTED", "SETTLED"])
+            self.assertEqual(events[1]["outcome"], "FAILED")
+            boundary = json.loads((worktree / ".razr/evidence/launch-boundary-att-race.json").read_text())
+            self.assertEqual(boundary["candidate"]["commit"], request["candidate"]["commit"])
+            self.assertEqual(boundary["work"], request["work"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve(); request, current, probe, private, _, _, _ = request_fixture(base, "att-failure")
+            ledger = AttemptLedger(base / "attempts.jsonl"); calls = []
+            def fail_start(argv, **kwargs):
+                calls.append(argv)
+                return subprocess.CompletedProcess(argv, 7, b"", b"failed")
+            provider = HerdrProvider(runner=fail_start, ledger=ledger, private_root=private)
+            actual_open = os.open
+            def fail_failure_evidence(path, flags, *args, **kwargs):
+                if Path(path).name.startswith("launch-failure-"): raise OSError("evidence write failed")
+                return actual_open(path, flags, *args, **kwargs)
+            with patch.object(provider, "probe", return_value=probe), patch.object(provider, "_verify_candidate"), \
+                 patch.object(provider, "_read_current_work", return_value=current), \
+                 patch("adapter.herdr_provider.os.open", side_effect=fail_failure_evidence):
+                with self.assertRaises(ProtocolError) as caught: provider.launch(request)
+            self.assertEqual(caught.exception.code, "LAUNCH_FAILED")
+            self.assertIn("--no-session", calls[0])
+            self.assertEqual([row["event"] for row in ledger.records()], ["STARTED", "SETTLED"])
+            self.assertEqual(ledger.records()[1]["evidence_refs"][0]["error_code"], "LAUNCH_FAILED")
+            self.assertIn("launch-boundary-", ledger.records()[1]["evidence_refs"][0]["ref"])
+
+    def test_worker_disappearance_recovery_and_concurrent_settlement_use_one_durable_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve(); evidence = root / ".razr/evidence"; evidence.mkdir(parents=True)
+            digest = "sha256:" + "a" * 64
+            retained = evidence / "pane-disappeared.json"; retained.write_bytes(b"pane disappeared")
+            ref = {"ref": ".razr/evidence/candidate.json", "digest_domain": "canonical_json", "digest": digest}
+            started = {"schema_version": 1, "event": "STARTED", "attempt_id": "att-disappeared", "work_id": "work", "node_id": "node",
+                       "observed_generation": 4, "observed_ordinal": 1, "worker_id": "worker", "branch": "feature/x", "worktree_ref": ".",
+                       "allowance_id": "allow-disappeared", "provider_id": "herdr", "started_at": "2026-01-01T00:00:00Z",
+                       "started_at_source": "adapter_observed", "candidate": {"commit": "0" * 40, "source_digest": digest},
+                       "candidate_evidence": ref, "request_packet": ref, "output_root_id": "out-disappeared", "output_root_digest": digest,
+                       "session_root_id": "sess-disappeared", "session_root_digest": digest, "request_digest": digest,
+                       "herdr": {"caller": execution_host()["caller"], "target": execution_host()["target"]}, "prev_digest": "sha256:" + "0" * 64}
+            started["record_digest"] = raw_file_digest(canonical_json(started)); ledger = AttemptLedger(root / ".razr/attempts.jsonl"); ledger.append(started)
+            retained_ref = {"ref": ".razr/evidence/pane-disappeared.json", "digest_domain": "raw_file",
+                            "digest": raw_file_digest(retained.read_bytes()), "kind": "event"}
+            recovered = HerdrProvider(ledger=ledger).recover_unmatched({"schema_version": 1, "request_id": "recover-disappeared",
+                "attempt_id": "att-disappeared", "worktree": str(root),
+                "recovery_authority": {"kind": "explicit", "authority_id": "human-1", "asserted": True, "reason": "pane disappeared"},
+                "retained_evidence": [retained_ref]})
+            self.assertEqual(recovered["result"]["outcome"], "UNKNOWN")
+            self.assertEqual([row["event"] for row in ledger.records()], ["STARTED", "SETTLED"])
+            self.assertEqual(ledger.records()[1]["outcome"], "UNKNOWN")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve(); evidence = root / ".razr/evidence"; evidence.mkdir(parents=True)
+            digest = "sha256:" + "b" * 64; ref = {"ref": ".razr/evidence/candidate.json", "digest_domain": "canonical_json", "digest": digest}
+            started = {"schema_version": 1, "event": "STARTED", "attempt_id": "att-race-settle", "work_id": "work", "node_id": "node",
+                       "observed_generation": 1, "observed_ordinal": 1, "worker_id": "worker", "branch": "feature/x", "worktree_ref": ".",
+                       "allowance_id": "allow-race", "provider_id": "herdr", "started_at": "2026-01-01T00:00:00Z", "started_at_source": "adapter_observed",
+                       "candidate": {"commit": "0" * 40, "source_digest": digest}, "candidate_evidence": ref, "request_packet": ref,
+                       "output_root_id": "out-race", "output_root_digest": digest, "session_root_id": "sess-race", "session_root_digest": digest,
+                       "request_digest": digest, "herdr": {"caller": execution_host()["caller"], "target": execution_host()["target"]},
+                       "prev_digest": "sha256:" + "0" * 64}
+            started["record_digest"] = raw_file_digest(canonical_json(started)); ledger = AttemptLedger(root / ".razr/attempts.jsonl"); ledger.append(started)
+            provider_a = HerdrProvider(ledger=ledger); provider_b = HerdrProvider(ledger=ledger)
+            provider_a._attempt_paths["att-race-settle"] = root; provider_b._attempt_paths["att-race-settle"] = root
+            errors = []
+            def settle(provider):
+                try: provider._settle({"attempt_id": "att-race-settle"}, "UNKNOWN", cleanup="uncertain", reason="concurrent terminal observation")
+                except ProtocolError as exc: errors.append(exc.code)
+            threads = [threading.Thread(target=settle, args=(provider,)) for provider in (provider_a, provider_b)]
+            for thread in threads: thread.start()
+            for thread in threads: thread.join(5)
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+            self.assertEqual(sum(row["event"] == "SETTLED" for row in ledger.records()), 1)
+
+    def test_end_to_end_deadline_includes_final_authority_preflight(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve(); request, current, probe, private, _, _, _ = request_fixture(base, "att-deadline")
+            request["limits"]["deadline_ms"] = 50
+            ledger = AttemptLedger(base / "attempts.jsonl"); calls = []
+            provider = HerdrProvider(runner=lambda argv, **kwargs: calls.append(argv), ledger=ledger, private_root=private)
+            reads = {"count": 0}
+            def slow_final(_request):
+                reads["count"] += 1
+                if reads["count"] == 2: time.sleep(.06)
+                return current
+            with patch.object(provider, "probe", return_value=probe), patch.object(provider, "_verify_candidate"), \
+                 patch.object(provider, "_read_current_work", side_effect=slow_final):
+                with self.assertRaises(ProtocolError) as caught: provider.launch(request)
+            self.assertEqual(caught.exception.code, "TIMEOUT")
+            self.assertEqual(calls, [])
+            self.assertEqual([row["event"] for row in ledger.records()], ["STARTED", "SETTLED"])
+
+    def test_native_command_boundary_streams_kills_groups_and_rejects_symlinks(self):
+        python = str(Path(sys.executable).resolve())
+        provider = HerdrProvider(herdr=python, pi=python)
+        with self.assertRaises(ProtocolError) as caught:
+            provider._exec([python, "-c", "import os; os.write(1,b'x'*200000)"], timeout_ms=2000, max_output=1024)
+        self.assertEqual(caught.exception.code, "OUTPUT_LIMIT")
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "child.pid"
+            script = ("import os,subprocess,sys,time; subprocess.Popen([sys.executable,'-c',"
+                      "'import os,sys,time; open(sys.argv[1],\"w\").write(str(os.getpid())); time.sleep(10)',sys.argv[1]]); time.sleep(10)")
+            with self.assertRaises(ProtocolError) as caught:
+                provider._exec([python, "-c", script, str(pidfile)], timeout_ms=100, max_output=1024)
+            self.assertEqual(caught.exception.code, "TIMEOUT")
+            if pidfile.exists():
+                pid = int(pidfile.read_text())
+                for _ in range(50):
+                    try: os.kill(pid, 0)
+                    except ProcessLookupError: break
+                    __import__("time").sleep(.02)
+                else: self.fail("surviving descendant after Herdr timeout")
+        with tempfile.TemporaryDirectory() as tmp:
+            pidfile = Path(tmp) / "orphan.pid"
+            script = ("import subprocess,sys; subprocess.Popen([sys.executable,'-c',"
+                      "'import os,sys,time; os.close(1); os.close(2); open(sys.argv[1],\"w\").write(str(os.getpid())); time.sleep(10)',sys.argv[1]])")
+            with self.assertRaises(ProtocolError) as caught:
+                provider._exec([python, "-c", script, str(pidfile)], timeout_ms=1000, max_output=1024)
+            self.assertEqual(caught.exception.code, "CLEANUP_UNKNOWN")
+            if pidfile.exists():
+                pid = int(pidfile.read_text())
+                for _ in range(50):
+                    try: os.kill(pid, 0)
+                    except ProcessLookupError: break
+                    time.sleep(.02)
+                else: self.fail("surviving descendant after Herdr leader exit")
+        with tempfile.TemporaryDirectory() as tmp:
+            link = Path(tmp) / "herdr"; link.symlink_to(Path(python))
+            with self.assertRaises(ProtocolError) as caught:
+                HerdrProvider(herdr=str(link), pi=sys.executable)._exec([str(link), "--help"], timeout_ms=1000)
+            self.assertEqual(caught.exception.code, "PROVIDER_UNAVAILABLE")
+
+    def test_cli_unavailable_has_no_attempt_or_root_side_effects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve(); request, _, _, private, worktree, output, session = request_fixture(base)
+            ledger = AttemptLedger(base / "attempts.jsonl")
+            provider = HerdrProvider(herdr="razr-definitely-missing-herdr", pi=sys.executable, ledger=ledger, private_root=private)
+            with self.assertRaises(ProtocolError) as caught: provider.launch(request)
+            self.assertEqual(caught.exception.code, "PROVIDER_UNAVAILABLE")
+            self.assertFalse(ledger.path.exists()); self.assertFalse((private / "root-claims.jsonl").exists())
+            self.assertFalse((worktree / ".razr").exists()); self.assertEqual(list(output.iterdir()), []); self.assertEqual(list(session.iterdir()), [])
 
     def test_request_rejects_runtime_fallback_and_root_reuse(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -873,6 +873,8 @@ def validate_work(work_root: Path, work_id: str) -> list[str]:
             record = critics.get(role) if isinstance(critics.get(role), dict) else {}
             if record.get("candidate") != candidate.get("source_digest"):
                 errors.append(f"review requires {role} Critic source-digest identity.")
+            if record.get("reviewed_commit") != candidate.get("commit"):
+                errors.append(f"review requires {role} Critic exact candidate commit identity.")
             evidence_ref = record.get("evidence_ref")
             if not isinstance(evidence_ref, str) or not evidence_ref.startswith("evidence.md#"):
                 errors.append(f"review requires {role} Critic evidence.md anchor.")
@@ -895,6 +897,8 @@ def validate_work(work_root: Path, work_id: str) -> list[str]:
             errors.append("complete status requires review stage and ready/merged PR outcome.")
         if delivery.get("source_digest") != candidate.get("source_digest"):
             errors.append("complete PR source digest does not match candidate.")
+        if delivery.get("head_commit") != candidate.get("commit"):
+            errors.append("complete PR head commit does not match candidate.")
     if not (folder / "evidence.md").read_text(encoding="utf-8").strip():
         errors.append("evidence.md must not be empty.")
     return errors
@@ -1799,6 +1803,15 @@ def ensure_gh_ready() -> None:
         raise RazrError("gh auth is not ready; run `gh auth status` and authenticate first.")
 
 
+def require_exact_reviewed_head(candidate: dict[str, Any], critics: dict[str, Any], live_head: str) -> None:
+    if live_head != candidate.get("commit"):
+        raise RazrError("PR head is not the exact reviewed candidate commit; rerun Build and both Critics.")
+    for role in ("technical", "contract"):
+        record = critics.get(role) if isinstance(critics.get(role), dict) else {}
+        if record.get("reviewed_commit") != live_head:
+            raise RazrError(f"PR readiness requires {role} Critic review of the exact PR head commit.")
+
+
 def command_pr(args: argparse.Namespace) -> None:
     repo, config, work_root = project_context()
     ensure_gh_ready()
@@ -1840,6 +1853,8 @@ def _command_pr_locked(
             raise RazrError("PR repository does not match the candidate repository.")
         if live_digest != candidate.get("source_digest"):
             raise RazrError("PR head changes reviewed product source; rerun Build and both Critics.")
+        critics = state.get("critics") if isinstance(state.get("critics"), dict) else {}
+        require_exact_reviewed_head(candidate, critics, live_head)
         for other in iter_work_item_dirs(work_root):
             if other.name == args.work_id or not (other / "state.yaml").exists():
                 continue
@@ -1854,7 +1869,6 @@ def _command_pr_locked(
         if previous_outcome == "ready" and args.outcome == "pending":
             raise RazrError("stale pending state cannot regress a ready PR; reopen through transition instead.")
         if args.outcome in {"ready", "merged"}:
-            critics = state.get("critics") if isinstance(state.get("critics"), dict) else {}
             if critics.get("technical", {}).get("outcome") != "PASS" or critics.get("contract", {}).get("outcome") != "PASS":
                 raise RazrError("PR readiness requires both Critic passes.")
             required_checks = snapshot.get("required_checks") if isinstance(snapshot.get("required_checks"), list) else []

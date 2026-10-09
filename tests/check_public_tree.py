@@ -23,7 +23,7 @@ ALLOWLIST_SHA256 = '9cc6fd48169089963a1470adb59e5ca251ff2afdd632c4524f41522c751a
 LICENSE_SHA256 = '9d2fdecab2aa2dca006dbd67b07d3cc63a9d9f64a4f954aff2fe782251f9f8f4'
 OUTPUT_MARKER = 'clean-source-v1 owned private test output\n'
 PROVENANCE = {
-    'scripts/razr.py': '4a366402b130b946d6609ddee392167b80c8f69723e292202b23aeb0a507bd9a',
+    'scripts/razr.py': 'a463afd5078d3fbaa54bc425a681b0cb2cf71562c1db85bd4018716a3846b020',
     'templates/evidence.md': '7a4a2eee74df44e152f079f31f032c34c2de1a0dba04530d97df3f15ac8c7447',
     'templates/executable.yaml': '662461e91527d3ed810edd6a04f7fd223f3097f9066e1e9fa158f8adc196a0f2',
     'templates/razr.yaml': 'a68278cdf4588c8debad214f22dedbc6ef31011287160bdafd981b57a2ac335a',
@@ -36,7 +36,7 @@ SOURCE_PINS = {
     'scripts/primary.py': '4ea38b5ef08dfb4944f50376d2475653d81671fb51239cac61549c49dfe895ed',
     'scripts/contract-preflight.py': '54d237feabd02cb250c51d677cc8df08de9fe9feaecc557583ef76579899a850',
     'scripts/named-regressions.py': '8885fa72a2ae3446e69577f26347c3ffacd8f499a322725d807bb8e947d01392',
-    'runtime/provenance.json': 'd4a712e663ac75ff0f447a0a2a62e917f43222aa652cb1ba8cb7735b6e4bf1ee',
+    'runtime/provenance.json': '071d73081db98d2f397a58925ffade5844d4b873a82074acb7c8661583f3fc89',
 }
 
 

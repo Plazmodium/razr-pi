@@ -1,6 +1,6 @@
 # Architecture and authority
 
-Pi loads the declared skill as instructions. Loading is not execution authority or an approval sandbox. The adoption wrapper checks target control paths and delegates to the unchanged Python core. No extension or model runtime is part of the bootstrap proof.
+Pi loads the declared skill as instructions. Loading is not execution authority or an approval sandbox. The adoption wrapper checks target control paths and delegates to the provenance-pinned Python core, which remains the sole lifecycle authority. M09 changes only its exact delivery-identity gate; no adapter owns lifecycle state. No extension or model runtime is part of the bootstrap proof.
 
 The core owns lifecycle state and legal generation-fenced transitions. spec.md owns intent, executable.yaml the immutable approved DAG, state.yaml materialized progress, and evidence.md actual reproduced observations. Before approval, discovery has only spec.md. Never hand-edit lifecycle state or mistake prepared metadata for actual human approval.
 
@@ -8,6 +8,6 @@ The normal product flow is idea or conversation → spec convergence → executa
 
 The reusable package owns no target list or mutable project state. Helpers locate their core/templates relative to the package. Public tests own their temporary roots; installed Pi is an explicit external tool prerequisite, not bundled source or an implicit download.
 
-Public inspection and preflight helpers do not execute tasks or grant authority. The complete core is preserved for provenance, not advertised as complete adapter automation. Candidate identity and excluded input scrutiny, fresh dual independent critique and human PR review remain required gates. There is no background fleet, native subagent assumption, scheduler, recovery dispatcher or factory.
+Public inspection and preflight helpers do not execute tasks or grant authority. The complete core is preserved for provenance, not advertised as complete adapter automation. Candidate identity and excluded-input scrutiny, fresh dual independent critique and human PR review remain required gates. Source-digest equality cannot substitute for exact commit equality: final PR head, candidate commit, and both reviewed commits must match. There is no background fleet, native subagent assumption, scheduler, recovery dispatcher or factory.
 
 Comments explain non-obvious local intent and invariants only; tests preserve behavioral memory, while Git and Razr Memory preserve history and rationale. Existing legacy Project Brain/Obsidian/MCP-vault hooks may be ignored or migrated deliberately, but are not silently rewritten or made authoritative. Historical workshop evidence remains historical and is never imported as current proof.

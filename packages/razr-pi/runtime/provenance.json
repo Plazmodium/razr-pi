@@ -1,10 +1,10 @@
 {
-  "source": "razr sibling distribution; source paths relative to its root",
-  "policy": "Byte-identical snapshot; runtime must not resolve source location. Pi routing is adapter-owned, not an upstream copy.",
+  "source": "razr sibling distribution baseline plus reviewed M09 lifecycle hardening; source paths relative to this runtime root",
+  "policy": "Pinned runtime identity; Python core remains sole lifecycle authority. Pi routing and transport adapters do not reimplement lifecycle state.",
   "files": [
     {
       "path": "scripts/razr.py",
-      "sha256": "4a366402b130b946d6609ddee392167b80c8f69723e292202b23aeb0a507bd9a"
+      "sha256": "a463afd5078d3fbaa54bc425a681b0cb2cf71562c1db85bd4018716a3846b020"
     },
     {
       "path": "templates/evidence.md",

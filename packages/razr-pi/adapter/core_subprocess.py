@@ -224,8 +224,25 @@ def _reject_dirty_checkout(root: Path, work_root: str) -> None:
             path = raw_path.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise _fail("IDENTITY_MISMATCH", "Git returned an invalid dirty path") from exc
-        if not path.startswith(prefix):
+        adapter_private = (path in {".razr/memory.jsonl", ".razr/memory.jsonl.lock", ".razr/attempts.jsonl"}
+                           or path.startswith(".razr/evidence/"))
+        if not path.startswith(prefix) and not adapter_private:
             raise _fail("SOURCE_CHANGED", "checkout has dirty or untracked path", path=path)
+
+
+def verify_checkout_snapshot(root: Path, *, commit: str, source_digest: str) -> None:
+    """Verify one clean live checkout against an exact committed source identity."""
+    root = _canonical(root, directory=True)
+    validate_git_object_id(commit)
+    validate_source_digest(source_digest)
+    _verify_git_identity(root)
+    if not _git_commit_exists(root, commit):
+        raise _fail("IDENTITY_MISMATCH", "expected commit is not present")
+    if _git_head(root) != commit:
+        raise _fail("SOURCE_CHANGED", "repository HEAD differs from expected commit")
+    _reject_dirty_checkout(root, _core_work_root(root, commit))
+    if _source_digest(root, commit) != source_digest:
+        raise _fail("SOURCE_CHANGED", "source digest differs")
 
 
 def verify_candidate_identity(root: Path, *, branch: str, commit: str, source_digest: str) -> None:
@@ -233,13 +250,7 @@ def verify_candidate_identity(root: Path, *, branch: str, commit: str, source_di
     root = _canonical(root, directory=True)
     if not isinstance(branch, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", branch) or ".." in PurePosixPath(branch).parts:
         raise _fail("INVALID_REQUEST", "invalid candidate branch")
-    validate_git_object_id(commit)
-    _verify_git_identity(root)
-    if not _git_commit_exists(root, commit):
-        raise _fail("IDENTITY_MISMATCH", "expected commit is not present")
-    if _git_head(root) != commit:
-        raise _fail("SOURCE_CHANGED", "repository HEAD differs from expected commit")
-    _reject_dirty_checkout(root, _core_work_root(root, commit))
+    verify_checkout_snapshot(root, commit=commit, source_digest=source_digest)
     try:
         result = subprocess.run(["git", "-C", str(root), "rev-parse", "--verify", f"refs/heads/{branch}"], env=_environment(), cwd=root, capture_output=True, check=False, timeout=10)
     except (OSError, subprocess.TimeoutExpired) as exc:

@@ -1,8 +1,53 @@
 """Read-only inspection of core-materialized, explicitly synthetic work."""
 import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "packages/razr-pi"))
 
 from test_adoption import FixtureTest, surface
 from run_public import ROOT, sha
+
+
+class DeliveryIdentityTests(unittest.TestCase):
+    def test_delivery_requires_exact_candidate_and_both_critic_commits_even_for_equal_digest(self):
+        from runtime.scripts.razr import RazrError, require_exact_reviewed_head
+        candidate = {"commit": "a" * 40, "source_digest": "sha256:" + "c" * 64}
+        critics = {role: {"outcome": "PASS", "candidate": candidate["source_digest"], "reviewed_commit": "a" * 40}
+                   for role in ("technical", "contract")}
+        require_exact_reviewed_head(candidate, critics, "a" * 40)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                   "GIT_AUTHOR_NAME": "fixture", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
+                   "GIT_COMMITTER_NAME": "fixture", "GIT_COMMITTER_EMAIL": "fixture@example.invalid"}
+            subprocess.run(["git", "init", "-q", str(root)], check=True, env=env)
+            (root / "razr.yaml").write_text(json.dumps({"schema_version": 1, "work_root": ".razr/work",
+                "retention": "commit", "adapter": {"mode": "process-local", "max_active_work_items": 5,
+                "queue_order": ["priority", "approved_at", "id"]}}) + "\n")
+            (root / "source.txt").write_text("same product source\n"); (root / "AGENTS.md").write_text("first instructions\n")
+            subprocess.run(["git", "-C", str(root), "add", "."], check=True, env=env)
+            subprocess.run(["git", "-C", str(root), "commit", "-qm", "candidate-a"], check=True, env=env)
+            commit_a = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True, env=env).strip()
+            (root / "AGENTS.md").write_text("changed excluded instructions\n")
+            subprocess.run(["git", "-C", str(root), "add", "AGENTS.md"], check=True, env=env)
+            subprocess.run(["git", "-C", str(root), "commit", "-qm", "candidate-b"], check=True, env=env)
+            commit_b = subprocess.check_output(["git", "-C", str(root), "rev-parse", "HEAD"], text=True, env=env).strip()
+            from runtime.scripts.razr import source_tree_digest
+            self.assertEqual(source_tree_digest(root, commit_a, ".razr/work"), source_tree_digest(root, commit_b, ".razr/work"))
+            candidate["commit"] = commit_a
+            critics["technical"]["reviewed_commit"] = commit_a; critics["contract"]["reviewed_commit"] = commit_a
+            with self.assertRaises(RazrError):
+                require_exact_reviewed_head(candidate, critics, commit_b)
+        for role in ("technical", "contract"):
+            changed = {name: dict(record) for name, record in critics.items()}
+            changed[role]["reviewed_commit"] = "b" * 40
+            with self.subTest(role=role), self.assertRaises(RazrError):
+                require_exact_reviewed_head(candidate, changed, "a" * 40)
 
 
 class PrimaryInspectionTests(FixtureTest):

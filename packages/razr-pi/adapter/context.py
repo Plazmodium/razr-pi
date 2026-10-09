@@ -7,10 +7,12 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import stat
 import subprocess
 from typing import Any, Callable, Mapping
 
-from .core_subprocess import _git_head, _source_digest, read_workflow_context
+from .core_subprocess import (_git_head, _source_digest, read_workflow_context,
+                              verify_checkout_snapshot)
 from .protocol import (CoreRequest, ProtocolError, WorkflowRead, canonical_json,
                        raw_file_digest, validate_git_object_id, validate_source_digest)
 
@@ -141,47 +143,88 @@ def _deny_ref(ref: str) -> None:
         raise _error("PATH_ESCAPE", "private or control path refused", ref=ref)
 
 
-def _open_nofollow(root: Path, ref: str) -> int:
-    """Open every component without following links, then open the leaf safely."""
+def _identity(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return info.st_dev, info.st_ino, info.st_mode, info.st_nlink, info.st_size, info.st_mtime_ns
+
+
+def _open_nofollow(root: Path, ref: str) -> tuple[int, int, os.stat_result]:
+    """Open every component from a pinned root FD and retain the leaf parent."""
     parts = PurePosixPath(_ref(ref)).parts
     _deny_ref(ref)
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     directory = getattr(os, "O_DIRECTORY", 0)
+    root_fd = current = leaf = -1
     try:
-        current = os.open(root, os.O_RDONLY | directory | nofollow)
+        root_fd = current = os.open(root, os.O_RDONLY | directory | nofollow)
+        root_info = os.fstat(root_fd)
+        path_info = os.stat(root, follow_symlinks=False)
+        if not stat.S_ISDIR(root_info.st_mode) or _identity(root_info)[:2] != _identity(path_info)[:2]:
+            raise _error("SOURCE_CHANGED", "repository root identity changed")
         for part in parts[:-1]:
             child = os.open(part, os.O_RDONLY | directory | nofollow, dir_fd=current)
-            os.close(current); current = child
+            child_info = os.fstat(child)
+            path_child = os.stat(part, dir_fd=current, follow_symlinks=False)
+            if not stat.S_ISDIR(child_info.st_mode) or _identity(child_info)[:2] != _identity(path_child)[:2]:
+                os.close(child)
+                raise _error("PATH_ESCAPE", "repository directory identity changed", ref=ref)
+            if current != root_fd:
+                os.close(current)
+            current = child
         leaf = os.open(parts[-1], os.O_RDONLY | nofollow, dir_fd=current)
-        os.close(current)
-        return leaf
+        if current == root_fd:
+            root_fd = -1
+        elif root_fd >= 0:
+            os.close(root_fd)
+            root_fd = -1
+        return leaf, current, root_info
+    except ProtocolError:
+        for fd in {leaf, current, root_fd}:
+            if fd >= 0:
+                try: os.close(fd)
+                except OSError: pass
+        raise
     except OSError as exc:
-        try: os.close(current)
-        except (UnboundLocalError, OSError): pass
+        for fd in {leaf, current, root_fd}:
+            if fd >= 0:
+                try: os.close(fd)
+                except OSError: pass
         raise _error("PATH_ESCAPE", "repository path cannot be opened safely", ref=ref) from exc
 
 
 def _read_bounded(root: Path, ref: str, max_content: int) -> tuple[bytes, str, int] | None:
-    """Read max_content+1 from one no-follow FD; digest only a complete bounded file."""
+    """Read one stable regular file and reject pathname/root races."""
     if max_content <= 0: return None
-    fd = _open_nofollow(root, ref)
+    fd, parent_fd, root_before = _open_nofollow(root, ref)
+    leaf = PurePosixPath(ref).name
     try:
-        info = os.fstat(fd)
-        if (info.st_mode & 0o170000) != 0o100000 or info.st_nlink != 1:
+        before = os.fstat(fd)
+        path_before = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
             return None
+        if _identity(before) != _identity(path_before):
+            raise _error("SOURCE_CHANGED", "selected file pathname identity changed", ref=ref)
         data = bytearray()
         while len(data) <= max_content:
             chunk = os.read(fd, min(65536, max_content + 1 - len(data)))
             if not chunk: break
             data.extend(chunk)
+        after = os.fstat(fd)
+        path_after = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+        root_after = os.stat(root, follow_symlinks=False)
+        if (_identity(before) != _identity(after) or _identity(after) != _identity(path_after)
+                or _identity(root_before)[:2] != _identity(root_after)[:2]):
+            raise _error("SOURCE_CHANGED", "selected file or repository changed during read", ref=ref)
         if len(data) > max_content:
             return None
         raw = bytes(data)
         return raw, raw_file_digest(raw), len(raw)
+    except ProtocolError:
+        raise
     except OSError as exc:
-        raise _error("INTERNAL", "bounded descriptor read failed", ref=ref) from exc
+        raise _error("SOURCE_CHANGED", "bounded descriptor read raced with source change", ref=ref) from exc
     finally:
         os.close(fd)
+        os.close(parent_fd)
 
 
 def _git_env(git: Path) -> dict[str, str]:
@@ -236,52 +279,73 @@ class ContextEngine:
         # Explicit paths use exactly the same policy as discovery; they cannot bypass controls.
         for ref in request.paths:
             _deny_ref(_ref(ref))
-            fd = _open_nofollow(self.root, ref)
+            fd, parent_fd, _ = _open_nofollow(self.root, ref)
             try:
                 info = os.fstat(fd)
-                if (info.st_mode & 0o170000) != 0o100000 or info.st_nlink != 1:
-                    raise _error("PATH_ESCAPE", "explicit path is not a private regular file", ref=ref)
+                path_info = os.stat(PurePosixPath(ref).name, dir_fd=parent_fd, follow_symlinks=False)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or _identity(info) != _identity(path_info):
+                    raise _error("PATH_ESCAPE", "explicit path is not a stable private regular file", ref=ref)
             finally:
                 os.close(fd)
+                os.close(parent_fd)
             refs.append(ref); seen.add(ref)
-        queue: list[tuple[Path, int]] = [(self.root, 0)]
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        directory_flag = getattr(os, "O_DIRECTORY", 0)
+        try:
+            root_fd = os.open(self.root, os.O_RDONLY | directory_flag | nofollow)
+        except OSError as exc:
+            raise _error("SOURCE_CHANGED", "repository root cannot be pinned") from exc
+        queue: list[tuple[int, str, int]] = [(root_fd, ".", 0)]
         visited_dirs = visited_entries = discovered = 0
-        while queue and visited_dirs < _MAX_VISITED_DIRS and visited_entries < _MAX_VISITED_ENTRIES and discovered < _MAX_DISCOVERED:
-            directory, depth = queue.pop(0); visited_dirs += 1
-            try:
-                # Read only a bounded prefix plus one sentinel; sorting makes selection deterministic.
-                with os.scandir(directory) as scan:
-                    entries = []
-                    for _ in range(_MAX_DIR_ENTRIES + 1):
-                        try: entry = next(scan)
-                        except StopIteration: break
-                        entries.append(entry)
-                entries.sort(key=lambda e: e.name)
-            except OSError:
-                continue
-            if len(entries) > _MAX_DIR_ENTRIES:
-                omitted.append({"ref": directory.relative_to(self.root).as_posix() or ".", "reason": "limit"})
-                entries = entries[:_MAX_DIR_ENTRIES]
-            for entry in entries:
-                visited_entries += 1
-                ref = Path(entry.path).relative_to(self.root).as_posix()
-                if entry.name in _PRIVATE_DIRS or entry.name in _PRIVATE_NAMES or entry.name.startswith(".env"):
-                    omitted.append({"ref": ref, "reason": "unsafe"}); continue
-                try: info = entry.stat(follow_symlinks=False)
-                except OSError:
-                    omitted.append({"ref": ref, "reason": "unsafe"}); continue
-                mode = info.st_mode & 0o170000
-                if mode == 0o040000:
-                    if depth >= _MAX_DEPTH or len(queue) >= _MAX_QUEUE:
-                        omitted.append({"ref": ref, "reason": "limit"})
-                    elif len(queue) < _MAX_QUEUE:
-                        queue.append((Path(entry.path), depth + 1))
-                    continue
-                if mode != 0o100000 or info.st_nlink != 1 or Path(entry.name).suffix.lower() not in _TEXT_SUFFIXES: continue
-                discovered += 1
-                if ref not in seen: refs.append(ref); seen.add(ref)
-        if queue or visited_dirs >= _MAX_VISITED_DIRS or visited_entries >= _MAX_VISITED_ENTRIES or discovered >= _MAX_DISCOVERED:
-            omitted.append({"ref": ".", "reason": "limit"})
+        try:
+            while queue and visited_dirs < _MAX_VISITED_DIRS and visited_entries < _MAX_VISITED_ENTRIES and discovered < _MAX_DISCOVERED:
+                directory_fd, directory_ref, depth = queue.pop(0); visited_dirs += 1
+                try:
+                    with os.scandir(directory_fd) as scan:
+                        entries = []
+                        for _ in range(_MAX_DIR_ENTRIES + 1):
+                            try: entry = next(scan)
+                            except StopIteration: break
+                            entries.append(entry)
+                    entries.sort(key=lambda entry: entry.name)
+                    if len(entries) > _MAX_DIR_ENTRIES:
+                        omitted.append({"ref": directory_ref, "reason": "limit"})
+                        entries = entries[:_MAX_DIR_ENTRIES]
+                    for entry in entries:
+                        visited_entries += 1
+                        ref = entry.name if directory_ref == "." else directory_ref + "/" + entry.name
+                        if entry.name in _PRIVATE_DIRS or entry.name in _PRIVATE_NAMES or entry.name.startswith(".env"):
+                            omitted.append({"ref": ref, "reason": "unsafe"}); continue
+                        try: info = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
+                        except OSError:
+                            omitted.append({"ref": ref, "reason": "unsafe"}); continue
+                        if stat.S_ISDIR(info.st_mode):
+                            if depth >= _MAX_DEPTH or len(queue) >= _MAX_QUEUE:
+                                omitted.append({"ref": ref, "reason": "limit"})
+                                continue
+                            try:
+                                child_fd = os.open(entry.name, os.O_RDONLY | directory_flag | nofollow, dir_fd=directory_fd)
+                                child_info = os.fstat(child_fd)
+                                path_info = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
+                                if not stat.S_ISDIR(child_info.st_mode) or _identity(child_info)[:2] != _identity(path_info)[:2]:
+                                    os.close(child_fd)
+                                    raise OSError("directory identity changed")
+                            except OSError:
+                                omitted.append({"ref": ref, "reason": "unsafe"}); continue
+                            queue.append((child_fd, ref, depth + 1))
+                            continue
+                        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or Path(entry.name).suffix.lower() not in _TEXT_SUFFIXES:
+                            continue
+                        discovered += 1
+                        if ref not in seen: refs.append(ref); seen.add(ref)
+                finally:
+                    os.close(directory_fd)
+            if queue or visited_dirs >= _MAX_VISITED_DIRS or visited_entries >= _MAX_VISITED_ENTRIES or discovered >= _MAX_DISCOVERED:
+                omitted.append({"ref": ".", "reason": "limit"})
+        finally:
+            for directory_fd, _, _ in queue:
+                try: os.close(directory_fd)
+                except OSError: pass
         def score(ref: str) -> tuple[int, str]:
             low, base = ref.lower(), Path(ref).name.lower(); rank = 0
             if any(token in low for token in objective): rank -= 30
@@ -330,6 +394,17 @@ class ContextEngine:
             raise _error("WORKFLOW_UNAVAILABLE", "workflow seam did not return WorkflowRead")
         return read
 
+    def _verified_snapshot(self) -> tuple[str, str]:
+        try:
+            commit = _git_head(self.root)
+            source = _source_digest(self.root, commit)
+            verify_checkout_snapshot(self.root, commit=commit, source_digest=source)
+            return commit, source
+        except ProtocolError as exc:
+            if exc.code == "SOURCE_CHANGED":
+                raise
+            raise _error("SOURCE_CHANGED", "candidate-bound checkout could not be verified", cause=exc.code) from exc
+
     def _verify_workflow_candidate(self, read: WorkflowRead) -> None:
         try:
             actual_commit = _git_head(self.root)
@@ -357,6 +432,7 @@ class ContextEngine:
         if parsed.repository_root != "." and Path(parsed.repository_root).is_absolute() and Path(parsed.repository_root).resolve() != self.root:
             raise _error("INVALID_REQUEST", "request root differs from engine root")
         items: list[dict[str, object]] = []; omitted: list[dict[str, str]] = []; used = 0; read: WorkflowRead | None = None
+        initial_commit, initial_source = self._verified_snapshot()
         if parsed.observed is not None:
             self._verify_observed(parsed.observed)
         if parsed.include["workflow"]:
@@ -389,7 +465,7 @@ class ContextEngine:
         stale: list[str] = []
         if parsed.include["memory"]:
             if self.memory is None: raise _error("MEMORY_UNAVAILABLE", "Memory recall boundary unavailable", retryable=True)
-            try: recalled = self.memory.recall(parsed.objective, paths=list(parsed.paths), limit=parsed.limits["max_memory_records"])
+            try: recalled = self.memory.recall(parsed.objective, paths=list(parsed.paths), limit=parsed.limits["max_memory_records"], repository=initial_source)
             except ProtocolError as exc: raise _error("MEMORY_UNAVAILABLE", "Memory recall failed", retryable=exc.retryable) from exc
             stale = list(recalled["stale_ids"])
             for record in recalled["records"]:
@@ -409,6 +485,9 @@ class ContextEngine:
             elif item["kind"] == "git_history": source_kind = "git"
             else: source_kind = "workflow"
             sources.append({"kind": source_kind, "ref": item["ref"], "digest_domain": item["digest_domain"], "digest": item["digest"], "reason": item["reason"]})
+        final_commit, final_source = self._verified_snapshot()
+        if (final_commit, final_source) != (initial_commit, initial_source):
+            raise _error("SOURCE_CHANGED", "candidate changed during context assembly")
         packet = {"schema_version": 1, "request_id": parsed.request_id, "authoritative_sources": sources,
                   "items": items, "omitted": omitted, "stale_memory_ids": sorted(stale)}
         _assert_no_nulls(packet)

@@ -4,6 +4,7 @@ import json
 import multiprocessing
 from pathlib import Path
 import resource
+import stat
 import sys
 import tempfile
 import unittest
@@ -11,12 +12,12 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "packages/razr-pi"))
-from adapter.memory import GENESIS, MemoryStore  # noqa: E402
+from adapter.memory import GENESIS, MAX_LEDGER_BYTES, MemoryStore  # noqa: E402
 from adapter.protocol import ProtocolError, raw_file_digest  # noqa: E402
 
 
 def _append_worker(root: str, index: int, repository: str) -> None:
-    MemoryStore(root).remember(kind="learning", summary=f"worker {index}", repository=repository)
+    MemoryStore(root, repository=repository).remember(kind="learning", summary=f"worker {index}", repository=repository)
 
 
 class MemoryTests(unittest.TestCase):
@@ -24,7 +25,7 @@ class MemoryTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name).resolve()
         self.repo = "sha256:" + "a" * 64
-        self.store = MemoryStore(self.root, now=lambda: "2026-01-01T00:00:00Z")
+        self.store = MemoryStore(self.root, repository=self.repo, now=lambda: "2026-01-01T00:00:00Z")
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -160,9 +161,12 @@ class MemoryTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             self.store.inspect()
         (self.root / ".razr/memory.jsonl").unlink()
-        (self.root / ".razr-memory.lock").symlink_to(self.root / "target.jsonl")
-        self.assertTrue(self.store.validate()["valid"])
-        (self.root / ".razr-memory.lock").unlink()
+        (self.root / ".razr/memory.jsonl.lock").unlink()
+        (self.root / ".razr/memory.jsonl.lock").symlink_to(self.root / "target.jsonl")
+        with self.assertRaises(ProtocolError) as caught:
+            self.store.validate()
+        self.assertEqual(caught.exception.code, "LOCK_UNAVAILABLE")
+        (self.root / ".razr/memory.jsonl.lock").unlink()
         evidence = self.root / "identity.txt"
         evidence.write_text("one")
         digest = raw_file_digest(evidence.read_bytes())
@@ -210,12 +214,12 @@ class MemoryTests(unittest.TestCase):
                                 related_ids=["r" * 128] * 32)
 
     def test_lifecycle_hardlinks_directory_replacement_and_fd_bound(self):
-        store = MemoryStore(self.root)
+        store = MemoryStore(self.root, repository=self.repo)
         self.assertIs(store.close(), None)
         store.close()
         with self.assertRaises(ProtocolError):
             store.inspect()
-        with MemoryStore(self.root) as managed:
+        with MemoryStore(self.root, repository=self.repo) as managed:
             managed.remember(kind="learning", summary="managed", repository=self.repo)
         with self.assertRaises(ProtocolError):
             managed.inspect()
@@ -224,38 +228,41 @@ class MemoryTests(unittest.TestCase):
         evidence.write_text("hard")
         hardlink = self.root / "hard-copy.txt"
         hardlink.hardlink_to(evidence)
-        with MemoryStore(self.root) as managed:
+        with MemoryStore(self.root, repository=self.repo) as managed:
             with self.assertRaises(ProtocolError):
                 managed.remember(kind="learning", summary="hard evidence", repository=self.repo,
                     evidence=[{"type":"path", "ref":"hard.txt", "digest_domain":"raw_file",
                                "digest":raw_file_digest(b"hard")}])
 
-        with MemoryStore(self.root) as managed:
+        with MemoryStore(self.root, repository=self.repo) as managed:
             managed.remember(kind="learning", summary="storage", repository=self.repo)
         external_ledger = self.root / "ledger-copy"
         external_ledger.hardlink_to(self.root / ".razr/memory.jsonl")
-        with MemoryStore(self.root) as linked_store:
+        with MemoryStore(self.root, repository=self.repo) as linked_store:
             with self.assertRaises(ProtocolError):
                 linked_store.inspect()
         external_ledger.unlink()
-        former_lock = self.root / ".razr-memory.lock"
+        former_lock = self.root / ".razr/memory.jsonl.lock"
+        former_lock.unlink()
         former_lock.symlink_to(self.root / "ledger-copy")
-        with MemoryStore(self.root) as linked_store:
-            self.assertTrue(linked_store.validate()["valid"])
+        with MemoryStore(self.root, repository=self.repo) as linked_store:
+            with self.assertRaises(ProtocolError) as caught:
+                linked_store.validate()
+        self.assertEqual(caught.exception.code, "LOCK_UNAVAILABLE")
         former_lock.unlink()
 
-        first = MemoryStore(self.root)
-        second = MemoryStore(self.root)
+        first = MemoryStore(self.root, repository=self.repo)
+        second = MemoryStore(self.root, repository=self.repo)
         first.remember(kind="learning", summary="first instance", repository=self.repo)
         second.remember(kind="learning", summary="second instance", repository=self.repo)
         first.close(); second.close()
-        with MemoryStore(self.root) as flock_store:
+        with MemoryStore(self.root, repository=self.repo) as flock_store:
             with patch("adapter.memory.fcntl.flock", side_effect=OSError("unsupported")):
                 with self.assertRaises(ProtocolError) as caught:
                     flock_store.validate()
             self.assertEqual(caught.exception.code, "LOCK_UNAVAILABLE")
 
-        pinned = MemoryStore(self.root)
+        pinned = MemoryStore(self.root, repository=self.repo)
         pinned.validate()
         old_storage = self.root / "razr-old"
         (self.root / ".razr").rename(old_storage)
@@ -270,10 +277,79 @@ class MemoryTests(unittest.TestCase):
             try:
                 resource.setrlimit(resource.RLIMIT_NOFILE, (lowered, hard))
                 for _ in range(80):
-                    with MemoryStore(self.root) as managed:
+                    with MemoryStore(self.root, repository=self.repo) as managed:
                         managed.validate()
             finally:
                 resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+    def test_repository_scope_bounds_permissions_and_secret_heuristics(self):
+        current = [self.repo]
+        with MemoryStore(self.root, repository=self.repo, repository_identity=lambda: current[0]) as store:
+            record = store.remember(kind="learning", summary="repository scoped", repository=self.repo)
+            current[0] = "sha256:" + "b" * 64
+            recalled = store.recall(repository=current[0])
+            self.assertEqual(recalled["records"], [])
+            self.assertEqual(recalled["stale_ids"], [record["id"]])
+
+        for secret in ("AKIAABCDEFGHIJKLMNOP", "https://user:password@example.invalid/path",
+                       "eyJabcdefgh.abcdefgh.abcdefgh", "secret_b64=YWJjZGVmZ2hpamtsbW5vcA==",
+                       "-----BEGIN " + "OPENSSH PRIVATE" + " KEY-----\nencoded"):
+            with self.subTest(secret=secret), self.assertRaises(ProtocolError):
+                MemoryStore(self.root, repository=self.repo).remember(kind="learning", summary=secret, repository=self.repo)
+        with MemoryStore(self.root, repository=self.repo) as store:
+            store.remember(kind="learning", summary="private modes", repository=self.repo)
+        self.assertEqual(self.store.path.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.store.path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual((self.store.path.parent / "memory.jsonl.lock").stat().st_mode & 0o777, 0o600)
+        ignores = (ROOT / ".gitignore").read_text().splitlines()
+        self.assertIn("/.razr/memory.jsonl", ignores)
+        self.assertIn("/.razr/memory.jsonl.lock", ignores)
+        implementation = (ROOT / "packages/razr-pi/adapter/memory.py").read_text()
+        for forbidden in ("keyring", "keychain", "boto3", "requests", "urllib.request", "socket.", "subprocess.", "os.environ"):
+            self.assertNotIn(forbidden, implementation)
+
+        oversized = self.root / ".razr/memory.jsonl"
+        oversized.write_bytes(b"x" * (MAX_LEDGER_BYTES + 1))
+        with MemoryStore(self.root, repository=self.repo) as store:
+            with self.assertRaises(ProtocolError) as caught:
+                store.inspect()
+        self.assertEqual(caught.exception.code, "LIMIT_EXCEEDED")
+
+    def test_ledger_record_line_identity_and_directory_durability_bounds(self):
+        self.store.remember(kind="learning", summary="bounded ledger", repository=self.repo)
+        with patch("adapter.memory.MAX_LEDGER_RECORDS", 0):
+            with self.assertRaises(ProtocolError) as caught: self.store.inspect()
+        self.assertEqual(caught.exception.code, "LIMIT_EXCEEDED")
+        with patch("adapter.memory.MAX_LEDGER_LINE_BYTES", 8):
+            with self.assertRaises(ProtocolError) as caught: self.store.inspect()
+        self.assertEqual(caught.exception.code, "LIMIT_EXCEEDED")
+
+        current = [self.repo]
+        evidence = self.root / "race.txt"; evidence.write_text("stable")
+        digest = raw_file_digest(evidence.read_bytes()); original_read = __import__("os").read
+        changed = {"done": False}
+        def change_repository(fd, count):
+            data = original_read(fd, count)
+            if data and not changed["done"]:
+                changed["done"] = True; current[0] = "sha256:" + "b" * 64
+            return data
+        with MemoryStore(self.root, repository=self.repo, repository_identity=lambda: current[0]) as store, \
+             patch("adapter.memory.os.read", side_effect=change_repository):
+            with self.assertRaises(ProtocolError) as caught:
+                store.remember(kind="learning", summary="identity race", repository=self.repo,
+                    evidence=[{"type": "path", "ref": "race.txt", "digest_domain": "raw_file", "digest": digest}])
+        self.assertEqual(caught.exception.code, "SOURCE_CHANGED")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve(); actual_fsync = __import__("os").fsync
+            def reject_directory_fsync(fd):
+                if stat.S_ISDIR(__import__("os").fstat(fd).st_mode): raise OSError("directory fsync")
+                return actual_fsync(fd)
+            with MemoryStore(root, repository=self.repo) as store, patch("adapter.memory.os.fsync", side_effect=reject_directory_fsync):
+                with self.assertRaises(ProtocolError) as caught:
+                    store.remember(kind="learning", summary="durability", repository=self.repo)
+            self.assertEqual(caught.exception.code, "LEDGER_CORRUPT")
+            self.assertFalse((root / ".razr/memory.jsonl").exists())
 
     def test_portable_paths_and_validate(self):
         record = self.store.remember(kind="preference", summary="portable", repository=self.repo,
