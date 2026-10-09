@@ -254,7 +254,7 @@ class AttemptLedger:
         _digest(value["digest"], f"{name} digest")
 
     @classmethod
-    def _validate_event(cls, event: object) -> dict[str, object]:
+    def _validate_event(cls, event: object, *, allow_legacy_herdr: bool = True) -> dict[str, object]:
         if not isinstance(event, dict) or not isinstance(event.get("schema_version"), int) or isinstance(event.get("schema_version"), bool) or event.get("schema_version") != 1 or event.get("event") not in {"STARTED", "SETTLED"}:
             raise _fail("LEDGER_CORRUPT", "invalid attempt event")
         required = cls.STARTED if event["event"] == "STARTED" else cls.SETTLED
@@ -299,15 +299,17 @@ class AttemptLedger:
                 _identity(host["caller"], "ledger caller"); _identity(host["target"], "ledger target")
             else:
                 # Retained revision-3 records used one overloaded target identity.
+                if not allow_legacy_herdr:
+                    raise _fail("LEDGER_CORRUPT", "new ledger event uses legacy Herdr identity")
                 _identity(host, "legacy ledger target")
         expected = raw_file_digest(canonical_json({key: value for key, value in event.items() if key != "record_digest"}))
         if event["record_digest"] != expected: raise _fail("LEDGER_CORRUPT", "record digest differs")
         return event
 
     @classmethod
-    def _replay_validate(cls, event: object) -> dict[str, object]:
+    def _replay_validate(cls, event: object, *, allow_legacy_herdr: bool = True) -> dict[str, object]:
         try:
-            return cls._validate_event(event)
+            return cls._validate_event(event, allow_legacy_herdr=allow_legacy_herdr)
         except ProtocolError as exc:
             raise _fail("LEDGER_CORRUPT", "malformed attempt record", cause=exc.code) from exc
         except (KeyError, TypeError, AttributeError, ValueError, UnicodeError) as exc:
@@ -423,7 +425,7 @@ class AttemptLedger:
             previous = records[-1]["record_digest"] if records else "sha256:" + "0" * 64
             event["prev_digest"] = previous
             event["record_digest"] = raw_file_digest(canonical_json(event))
-            event = self._replay_validate(event)
+            event = self._replay_validate(event, allow_legacy_herdr=False)
             same = [row for row in records if row["attempt_id"] == event["attempt_id"]]
             if event["event"] == "STARTED" and any(row["event"] == "STARTED" and row["allowance_id"] == event["allowance_id"] and row["attempt_id"] != event["attempt_id"] for row in records):
                 raise _fail("ALLOWANCE_REUSED", "allowance is already bound to another attempt")

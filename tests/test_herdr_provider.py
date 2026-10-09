@@ -57,10 +57,19 @@ class HerdrProviderTests(unittest.TestCase):
             target = {"workspace_id": "target-workspace", "tab_id": "target-tab", "pane_id": "target-pane"}
             with patch.object(provider, "_resolve_existing_worktree", return_value=target), patch("adapter.herdr_provider.verify_candidate_identity"):
                 provider._verify_candidate(parsed)
-            with patch.object(provider, "_resolve_existing_worktree", return_value={**target, "pane_id": "wrong-pane"}), patch("adapter.herdr_provider.verify_candidate_identity"):
+            calls = []
+            rejecting = HerdrProvider(runner=lambda argv, **kwargs: calls.append(argv),
+                                      ledger=AttemptLedger(root / "attempts.jsonl"), private_root=root)
+            probe = {"schema_version": 1, "ok": True, "request_id": "probe-cross-pane",
+                     "result": {"provider_id": "herdr", "runtime_identity": "openai-codex/gpt-5.6-luna:medium",
+                                "capabilities": ["runtime_identity"], "report_digest": digest}}
+            with patch.object(rejecting, "probe", return_value=probe), \
+                 patch.object(rejecting, "_resolve_existing_worktree", return_value={**target, "pane_id": "wrong-pane"}), \
+                 patch("adapter.herdr_provider.verify_candidate_identity"):
                 with self.assertRaises(ProtocolError) as caught:
-                    provider._verify_candidate(parsed)
+                    rejecting.launch(request)
             self.assertEqual(caught.exception.code, "IDENTITY_MISMATCH")
+            self.assertEqual(calls, [])
             with patch.dict(os.environ, {"HERDR_PANE_ID": "different-caller"}):
                 with self.assertRaises(ProtocolError) as caught:
                     ProviderRequest(request)
@@ -155,7 +164,13 @@ class HerdrProviderTests(unittest.TestCase):
                        "started_at": "2026-01-01T00:00:00Z", "started_at_source": "adapter_observed", "candidate": candidate,
                        "candidate_evidence": ref, "request_packet": packet, "output_root_id": "out-1", "output_root_digest": digest,
                        "session_root_id": "sess-1", "session_root_digest": digest, "request_digest": digest,
-                       "herdr": {"workspace_id": "w", "tab_id": "t", "pane_id": "p"}, "prev_digest": "sha256:" + "0" * 64}
+                       "herdr": {"caller": execution_host()["caller"], "target": execution_host()["target"]}, "prev_digest": "sha256:" + "0" * 64}
+            legacy = {**started, "herdr": {"workspace_id": "w", "tab_id": "t", "pane_id": "p"}}
+            legacy["record_digest"] = raw_file_digest(canonical_json(legacy))
+            self.assertEqual(AttemptLedger._replay_validate(legacy)["herdr"]["pane_id"], "p")
+            with self.assertRaises(ProtocolError) as caught:
+                ledger.append(legacy)
+            self.assertEqual(caught.exception.code, "LEDGER_CORRUPT")
             for bad_schema in (True, 1.0):
                 malformed = dict(started); malformed["schema_version"] = bad_schema
                 with self.assertRaises(ProtocolError): ledger.append(malformed)
@@ -208,23 +223,26 @@ class HerdrProviderTests(unittest.TestCase):
             source_digest = "sha256:" + hashlib.sha256(tree).hexdigest()
             empty_digest = raw_file_digest(canonical_json([]))
             open_calls = []; list_calls = [0]
+            host = execution_host(workspace="target-w", tab="target-t", pane="target-p")
+            target = host["target"]
             def run(argv, **kwargs):
                 if argv[:3] == ["herdr", "agent", "start"]:
-                    result = {"agent": {"name": "worker-1", "agent": "pi", "agent_session": {"kind": "provisional", "agent": "pi", "value": "herdr:pi"}, "workspace_id": "w", "tab_id": "t", "pane_id": "p", "telemetry": {"status": "ready"}}, "type": "agent_started"}
+                    self.assertEqual(argv[argv.index("--pane") + 1], target["pane_id"])
+                    result = {"agent": {"name": "worker-1", "agent": "pi", "agent_session": {"kind": "provisional", "agent": "pi", "value": "herdr:pi"}, **target, "telemetry": {"status": "ready"}}, "type": "agent_started"}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "cli:agent:start", "result": result}).encode(), b"")
                 if argv[:3] == ["herdr", "agent", "get"]:
                     (session / "session-live.jsonl").write_bytes(b'{"type":"session"}\n')
-                    result = {"agent": {"name": "worker-1", "agent_status": "done", "workspace_id": "w", "tab_id": "t", "pane_id": "p", "telemetry": {"live": True}}, "telemetry": {"observed": True}}
+                    result = {"agent": {"name": "worker-1", "agent_status": "done", **target, "telemetry": {"live": True}}, "telemetry": {"observed": True}}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "cli:agent:get", "result": result}).encode(), b"")
                 if argv[:3] == ["herdr", "workspace", "list"]:
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "cli:workspace:list", "result": {"type": "workspace_list", "workspaces": []}}).encode(), b"")
                 if argv[:3] == ["herdr", "worktree", "list"]:
                     list_calls[0] += 1
                     if list_calls[0] > 1: return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "cli:worktree:list", "result": {"source": {"repo_key": str(worktree / ".git"), "repo_name": "repo", "repo_root": str(worktree), "source_checkout_path": str(worktree), "source_workspace_id": "other"}, "type": "worktree_list", "worktrees": []}}).encode(), b"")
-                    result = {"source": {"repo_key": str(worktree / ".git"), "repo_name": "repo", "repo_root": str(worktree), "source_checkout_path": str(worktree), "source_workspace_id": "w"}, "type": "worktree_list", "worktrees": [{"branch": "feature/x", "is_bare": False, "is_detached": False, "is_linked_worktree": False, "is_prunable": False, "label": "worktree", "open_workspace_id": "w", "path": str(worktree)}]}
+                    result = {"source": {"repo_key": str(worktree / ".git"), "repo_name": "repo", "repo_root": str(worktree), "source_checkout_path": str(worktree), "source_workspace_id": target["workspace_id"]}, "type": "worktree_list", "worktrees": [{"branch": "feature/x", "is_bare": False, "is_detached": False, "is_linked_worktree": False, "is_prunable": False, "label": "worktree", "open_workspace_id": target["workspace_id"], "path": str(worktree)}]}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "cli:worktree:list", "result": result}).encode(), b"")
                 if argv[:3] == ["herdr", "pane", "list"]:
-                    pane = {"agent_status": "unknown", "cwd": str(worktree), "focused": False, "foreground_cwd": str(worktree), "pane_id": "p", "revision": 0, "scroll": {"max_offset_from_bottom": 0, "offset_from_bottom": 0, "viewport_rows": 29}, "tab_id": "t", "terminal_id": "term", "workspace_id": "w", "workspace_telemetry": {"layout": "grid"}}
+                    pane = {"agent_status": "unknown", "cwd": str(worktree), "focused": False, "foreground_cwd": str(worktree), **target, "revision": 0, "scroll": {"max_offset_from_bottom": 0, "offset_from_bottom": 0, "viewport_rows": 29}, "terminal_id": "term", "workspace_telemetry": {"layout": "grid"}}
                     return subprocess.CompletedProcess(argv, 0, json.dumps({"id": "cli:pane:list", "result": {"panes": [pane], "type": "pane_list"}}).encode(), b"")
                 if argv[:3] == ["herdr", "worktree", "open"]:
                     if "--help" not in argv: open_calls.append(argv)
@@ -252,7 +270,7 @@ class HerdrProviderTests(unittest.TestCase):
                 if argv[:3] == ["git", "-C", str(worktree)] and argv[3] == "ls-tree":
                     return subprocess.CompletedProcess(argv, 0, tree, b"")
                 raise AssertionError(argv)
-            request = {"schema_version": 1, "request_id": "exec-1", "attempt_id": "att-1", "role": "worker", "host": execution_host(), "work": {"work_id": "work", "node_id": "node", "generation": 1, "ordinal": 1}, "worker_id": "worker-1", "branch": "feature/x", "candidate": {"repository": "owner/repo", "branch": "feature/x", "commit": "0" * 40, "source_digest": source_digest}, "worktree": str(worktree), "cwd": str(worktree), "output_root": str(output), "output_root_id": "out-1", "output_root_digest": empty_digest, "session_root": str(session), "session_root_id": "sess-1", "session_root_digest": empty_digest, "fresh_context": True, "neutral_input_digest": "sha256:" + "a" * 64, "environment_policy_digest": "sha256:" + "b" * 64, "tool_policy_digest": "sha256:" + "c" * 64, "required_capabilities": ["runtime_identity"], "runtime": {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "thinking": "medium"}, "limits": {"deadline_ms": 1000, "max_output_bytes": 1000}, "allowance_id": "allow-1"}
+            request = {"schema_version": 1, "request_id": "exec-1", "attempt_id": "att-1", "role": "worker", "host": host, "work": {"work_id": "work", "node_id": "node", "generation": 1, "ordinal": 1}, "worker_id": "worker-1", "branch": "feature/x", "candidate": {"repository": "owner/repo", "branch": "feature/x", "commit": "0" * 40, "source_digest": source_digest}, "worktree": str(worktree), "cwd": str(worktree), "output_root": str(output), "output_root_id": "out-1", "output_root_digest": empty_digest, "session_root": str(session), "session_root_id": "sess-1", "session_root_digest": empty_digest, "fresh_context": True, "neutral_input_digest": "sha256:" + "a" * 64, "environment_policy_digest": "sha256:" + "b" * 64, "tool_policy_digest": "sha256:" + "c" * 64, "required_capabilities": ["runtime_identity"], "runtime": {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "thinking": "medium"}, "limits": {"deadline_ms": 1000, "max_output_bytes": 1000}, "allowance_id": "allow-1"}
             ledger = AttemptLedger(base / "attempts.jsonl")
             provider = HerdrProvider(runner=run, ledger=ledger, private_root=private)
             for bad_schema in (True, 1.0):
@@ -262,11 +280,11 @@ class HerdrProviderTests(unittest.TestCase):
             handle = response["result"]["handle"]
             self.assertEqual(open_calls, [])
             self.assertEqual(set(handle), {"provider_id", "handle_id", "request_digest", "attempt_id", "host", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest"})
-            self.assertEqual(handle["host"], execution_host())
+            self.assertEqual(handle["host"], host)
             started = json.loads(ledger.path.read_text().splitlines()[0])
-            self.assertEqual(started["herdr"], {"caller": execution_host()["caller"], "target": execution_host()["target"]})
+            self.assertEqual(started["herdr"], {"caller": host["caller"], "target": target})
             private_handle = json.loads((private / "handles" / "handle-worker-1.json").read_text())
-            self.assertEqual(private_handle["handle"]["host"], execution_host())
+            self.assertEqual(private_handle["handle"]["host"], host)
             self.assertEqual(response["result"]["capability_report_digest"], provider.probe({"schema_version": 1, "request_id": "probe-after-launch", "required_capabilities": ["runtime_identity"], "runtime": request["runtime"]})["result"]["report_digest"])
             self.assertEqual(provider.inspect({"schema_version": 1, "request_id": "inspect-unique", "handle": handle})["request_id"], "inspect-unique")
             collected = HerdrProvider(runner=run, ledger=ledger, private_root=private)
@@ -312,7 +330,7 @@ class HerdrProviderTests(unittest.TestCase):
             packet = root / ".razr" / "request.json"; packet.write_bytes(b"{}")
             candidate_file = evidence / "candidate.json"; candidate_file.write_bytes(b"{}")
             digest = "sha256:" + "a" * 64; ref = {"ref": ".razr/evidence/candidate.json", "digest_domain": "canonical_json", "digest": raw_file_digest(b"{}")}; packet_ref = {"ref": ".razr/request.json", "digest_domain": "canonical_json", "digest": raw_file_digest(b"{}")}
-            started = {"schema_version": 1, "event": "STARTED", "attempt_id": "att-real-int", "work_id": "work", "node_id": "node", "worker_id": "worker", "observed_generation": 1, "observed_ordinal": 0, "provider_id": "herdr", "worktree_ref": ".", "branch": "feature/x", "allowance_id": "allow", "started_at": "2026-01-01T00:00:00Z", "started_at_source": "adapter_observed", "candidate": {"commit": "0" * 40, "source_digest": digest}, "candidate_evidence": ref, "request_packet": packet_ref, "output_root_id": "out", "output_root_digest": digest, "session_root_id": "sess", "session_root_digest": digest, "request_digest": digest, "herdr": {"workspace_id": "w", "tab_id": "t", "pane_id": "p"}, "prev_digest": "sha256:" + "0" * 64}
+            started = {"schema_version": 1, "event": "STARTED", "attempt_id": "att-real-int", "work_id": "work", "node_id": "node", "worker_id": "worker", "observed_generation": 1, "observed_ordinal": 0, "provider_id": "herdr", "worktree_ref": ".", "branch": "feature/x", "allowance_id": "allow", "started_at": "2026-01-01T00:00:00Z", "started_at_source": "adapter_observed", "candidate": {"commit": "0" * 40, "source_digest": digest}, "candidate_evidence": ref, "request_packet": packet_ref, "output_root_id": "out", "output_root_digest": digest, "session_root_id": "sess", "session_root_digest": digest, "request_digest": digest, "herdr": {"caller": execution_host()["caller"], "target": execution_host()["target"]}, "prev_digest": "sha256:" + "0" * 64}
             started["record_digest"] = raw_file_digest(canonical_json(started)); ledger = AttemptLedger(root / "attempts.jsonl"); ledger.append(started)
             value = {"attempt_id": "att-real-int", "handle_id": "agent-real", "request_digest": digest, "host": execution_host(), "output_root_id": "out", "output_root_digest": digest, "session_root_id": "sess", "session_root_digest": digest}
             provider = HerdrProvider(ledger=ledger, runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, b"", b"")); provider._attempt_paths[value["attempt_id"]] = root; provider._attempt_sessions[value["attempt_id"]] = session
