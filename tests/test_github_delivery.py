@@ -2,6 +2,9 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
+import tempfile
+import time
 import subprocess
 import sys
 import unittest
@@ -54,6 +57,23 @@ class GithubDeliveryTests(unittest.TestCase):
                                       expected_source_digest=DIGEST)
             self.assertEqual(result["repository"], "o/r")
             self.assertEqual(result["sourceDigest"], DIGEST)
+
+    def test_realistic_populated_pr_schema_validates(self):
+        realistic = pr_value(
+            reviewDecision="APPROVED",
+            reviews=[{"id": "rv1", "author": {"login": "reviewer"}, "body": "ok", "commit": {"oid": SHA},
+                      "createdAt": "2026-01-01T00:00:00Z", "includesCreatedEdit": False,
+                      "reactionGroups": [], "state": "APPROVED", "submittedAt": "2026-01-01T00:00:01Z", "updatedAt": "2026-01-01T00:00:01Z"}],
+            comments=[{"id": "cm1", "author": {"login": "reviewer"}, "body": "note", "createdAt": "2026-01-01T00:00:00Z",
+                       "isMinimized": False, "reactions": {"totalCount": 0}, "updatedAt": "2026-01-01T00:00:00Z", "url": "https://github.com/o/r/pull/1#issuecomment-1"}],
+            statusCheckRollup=[{"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS",
+                                "completedAt": "2026-01-01T00:00:00Z", "detailsUrl": "https://example.invalid/ci", "workflowName": "CI"}])
+        delivery._validate_pr(realistic, URL, "o", "r", 1)
+
+    def test_readback_rejects_nested_numeric_values(self):
+        bad = pr_value(comments=[{"id": 7, "author": None, "body": "x", "isMinimized": False}])
+        with self.assertRaises(delivery.DeliveryError):
+            delivery._validate_pr(bad, URL, "o", "r", 1)
 
     def test_readback_rejects_branch_sha_and_source_mismatches(self):
         for kwargs in ({"expected_base": "wrong"}, {"expected_head_sha": "d" * 40},
@@ -112,7 +132,8 @@ class GithubDeliveryTests(unittest.TestCase):
     def test_required_check_states_are_truthful(self):
         cases = [("", "none"), ('[{"name":"ci","state":"QUEUED","bucket":"PENDING"}]', "pending"),
                  ('[{"name":"ci","state":"COMPLETED","bucket":"FAIL"}]', "failing"),
-                 ('[{"name":"ci","state":"COMPLETED","bucket":"PASS"}]', "passing")]
+                 ('[{"name":"ci","state":"COMPLETED","bucket":"PASS"}]', "passing"),
+                 ('[{"name":"ci","state":"completed","bucket":"skipping"}]', "skipping")]
         for raw, expected in cases:
             with self.subTest(expected=expected), patch.object(delivery, "_run", return_value=raw):
                 self.assertEqual(delivery._required_checks(Path("."), URL, "o/r")[1], expected)
@@ -136,13 +157,24 @@ class GithubDeliveryTests(unittest.TestCase):
         with patch.object(delivery, "_json", return_value=malformed), self.assertRaises(delivery.DeliveryError):
             delivery._threads(Path("."), "o", "r", 1)
 
-    def test_streaming_overflow_timeout_and_stderr_suppression(self):
-        script = "import sys,time; sys.stderr.write('credential-secret'); sys.stdout.write('x'*100); sys.stdout.flush()"
+    def test_streaming_overflow_timeout_and_process_group_cleanup(self):
+        script = "import sys; sys.stderr.write('credential-secret'); sys.stdout.write('x'*100); sys.stdout.flush()"
         with patch.object(delivery, "MAX_STDOUT", 10):
             with self.assertRaises(delivery.DeliveryError):
                 delivery._capture(sys.executable, ["-c", script], Path("."))
-        with self.assertRaisesRegex(delivery.DeliveryError, "timed out"):
-            delivery._capture(sys.executable, ["-c", "import time; time.sleep(2)"], Path("."), timeout=.05)
+        with tempfile.TemporaryDirectory() as directory:
+            pidfile = Path(directory) / "child.pid"
+            script = ("import os,subprocess,sys,time; child=subprocess.Popen([sys.executable,'-c',"
+                      "'import os,sys,time; open(sys.argv[1],\\\"w\\\").write(str(os.getpid())); time.sleep(10)',"
+                      "'" + str(pidfile) + "']); os.write(1,b'x'); time.sleep(10)")
+            started = time.monotonic()
+            with self.assertRaisesRegex(delivery.DeliveryError, "timed out"):
+                delivery._capture(sys.executable, ["-c", script], Path("."), timeout=.1)
+            self.assertLess(time.monotonic() - started, 2.0)
+            if pidfile.exists():
+                pid = int(pidfile.read_text())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(pid, 0)
 
     def test_cli_rejects_malformed_input_and_wraps_snapshot(self):
         spec = importlib.util.spec_from_file_location("github_delivery_cli", Path(__file__).parents[1] / "packages/razr-pi/scripts/github-delivery.py")

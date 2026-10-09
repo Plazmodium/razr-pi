@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import re
 import sys
 
 PACKAGE = Path(__file__).resolve().parents[1]
@@ -53,6 +54,18 @@ def _validate_request(request: object) -> dict:
         _string(request, key, True)
     for key in allowed - set(required) - {"schema_version", "operation"}:
         _string(request, key)
+    for key in ("branch", "base"):
+        if key in request and (not re.fullmatch(r"[A-Za-z0-9._/-]{1,255}", request[key]) or ".." in request[key]):
+            raise ValueError(f"invalid {key}")
+    if operation == "read":
+        delivery._pr_url(request["url"])
+    for key in ("base_sha", "head_sha"):
+        if key in request and not delivery.SHA_RE.fullmatch(request[key]):
+            raise ValueError(f"invalid {key}")
+    if "source_digest" in request and not re.fullmatch(r"sha256:[0-9a-f]{64}", request["source_digest"]):
+        raise ValueError("invalid source_digest")
+    if "repository" in request and not re.fullmatch(r"[^/]+/[^/]+", request["repository"]):
+        raise ValueError("invalid repository")
     return request
 
 
@@ -78,8 +91,10 @@ def main() -> int:
                                         expected_source_digest=request.get("source_digest"))
         print(json.dumps({"schema_version": 1, "ok": True, "result": result}, sort_keys=True))
         return 0
-    except (KeyError, TypeError, ValueError, delivery.DeliveryError) as exc:
-        return fail("INVALID_REQUEST" if isinstance(exc, (KeyError, TypeError, ValueError)) else "PROVIDER_UNAVAILABLE", str(exc))
+    except (KeyError, TypeError, ValueError, delivery.InvalidRequest) as exc:
+        return fail("INVALID_REQUEST", str(exc))
+    except delivery.DeliveryError as exc:
+        return fail("PROVIDER_UNAVAILABLE", str(exc))
 
 
 if __name__ == "__main__":

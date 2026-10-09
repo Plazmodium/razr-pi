@@ -29,6 +29,10 @@ class DeliveryError(RuntimeError):
     pass
 
 
+class InvalidRequest(DeliveryError):
+    pass
+
+
 def _env() -> dict[str, str]:
     names = ("PATH", "HOME", "TMPDIR", "GH_HOST", "LANG", "LC_ALL", "LC_CTYPE",
              "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_OPTIONAL_LOCKS",
@@ -65,7 +69,8 @@ def _capture(program: str, args: list[str], cwd: Path, *, timeout: float = 30.0,
             _terminate_group(process)
             raise DeliveryError(f"{program} timed out")
         for key, _ in selector.select(remaining):
-            chunk = key.fileobj.read(4096)
+            # Buffered pipe reads can wait for size bytes after select().
+            chunk = os.read(key.fileobj.fileno(), 4096)
             if not chunk:
                 selector.unregister(key.fileobj)
                 continue
@@ -143,7 +148,7 @@ def remote_identity(root: Path, remote: str = "origin") -> str:
 
 def pushed_head(root: Path, branch: str, remote: str = "origin") -> str:
     if not re.fullmatch(r"[A-Za-z0-9._/-]{1,255}", branch) or ".." in branch:
-        raise DeliveryError("invalid branch")
+        raise InvalidRequest("invalid branch")
     rows = _run("git", ["ls-remote", remote, f"refs/heads/{branch}"], root).splitlines()
     if len(rows) != 1 or len(rows[0].split()) != 2 or not SHA_RE.fullmatch(rows[0].split()[0]):
         raise DeliveryError("remote branch head is missing or ambiguous")
@@ -152,7 +157,7 @@ def pushed_head(root: Path, branch: str, remote: str = "origin") -> str:
 
 def source_identity(root: Path, commit: str, work_root: str = ".razr") -> str:
     if not SHA_RE.fullmatch(commit):
-        raise DeliveryError("candidate commit must be a full Git object id")
+        raise InvalidRequest("candidate commit must be a full Git object id")
     out, _ = _capture("git", ["ls-tree", "-r", "-z", "--full-tree", commit], root,
                       timeout=30)
     if len(out) > MAX_STDOUT * 8:
@@ -176,7 +181,7 @@ def source_identity(root: Path, commit: str, work_root: str = ".razr") -> str:
 def _pr_url(value: str) -> tuple[str, str, int]:
     match = PR_RE.fullmatch(value)
     if not match:
-        raise DeliveryError("GitHub returned an invalid PR URL")
+        raise InvalidRequest("GitHub returned an invalid PR URL")
     return match.group(1), match.group(2), int(match.group(3))
 
 
@@ -203,11 +208,42 @@ def _author(value: Any) -> None:
         raise DeliveryError("invalid PR author")
 
 
+def _reactions(value: Any) -> None:
+    if not isinstance(value, list):
+        raise DeliveryError("invalid reaction groups")
+    for group in value:
+        if not isinstance(group, dict) or set(group) != {"content", "users"} \
+                or not isinstance(group["content"], str) or not isinstance(group["users"], dict):
+            raise DeliveryError("invalid reaction group")
+        users = group["users"]
+        if set(users) - {"totalCount", "nodes"} or not isinstance(users.get("totalCount"), int) \
+                or isinstance(users.get("totalCount"), bool):
+            raise DeliveryError("invalid reaction users")
+        if "nodes" in users and (not isinstance(users["nodes"], list)
+                                  or any(not isinstance(node, dict) or set(node) != {"login"}
+                                         or not isinstance(node["login"], str) for node in users["nodes"])):
+            raise DeliveryError("invalid reaction user nodes")
+
+
+def _commit(value: Any) -> None:
+    if value is not None and (not isinstance(value, dict) or set(value) != {"oid"}
+                              or not isinstance(value["oid"], str) or not SHA_RE.fullmatch(value["oid"])):
+        raise DeliveryError("invalid review commit")
+
+
+def _reaction_summary(value: Any) -> None:
+    if not isinstance(value, dict) or set(value) != {"totalCount"} \
+            or not isinstance(value["totalCount"], int) or isinstance(value["totalCount"], bool):
+        raise DeliveryError("invalid reaction summary")
+
+
 def _validate_pr(value: Any, url: str, owner: str, repo: str, number: int) -> dict[str, Any]:
     allowed = {"number", "url", "state", "isDraft", "baseRefName", "baseRefOid", "headRefName", "headRefOid",
                "mergeStateStatus", "mergeable", "reviewDecision", "reviewRequests", "reviews", "comments",
                "statusCheckRollup", "mergedAt", "closedAt", "updatedAt"}
-    if not isinstance(value, dict) or set(value) != allowed or value.get("url") != url or value.get("number") != number:
+    if not isinstance(value, dict) or set(value) != allowed or value.get("url") != url \
+            or not isinstance(value.get("number"), int) or isinstance(value.get("number"), bool) \
+            or value.get("number") != number:
         raise DeliveryError("PR identity/schema read-back mismatch")
     if value["state"] not in PR_STATES or value["mergeStateStatus"] not in MERGE_STATES \
             or value["mergeable"] not in MERGEABLE:
@@ -231,7 +267,9 @@ def _validate_pr(value: Any, url: str, owner: str, repo: str, number: int) -> di
                         or not isinstance(row.get("state"), str) or row["state"] not in {"APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING"}:
                     raise DeliveryError("malformed review")
                 _author(row.get("author"))
-                for key in ("body", "commit", "createdAt", "submittedAt", "updatedAt"):
+                _commit(row.get("commit"))
+                _reactions(row.get("reactionGroups"))
+                for key in ("body", "createdAt", "submittedAt", "updatedAt"):
                     _nullable_string(row.get(key), "review " + key)
                 if not isinstance(row.get("includesCreatedEdit"), bool):
                     raise DeliveryError("malformed review metadata")
@@ -241,16 +279,31 @@ def _validate_pr(value: Any, url: str, owner: str, repo: str, number: int) -> di
                         or not isinstance(row.get("body"), str) or not isinstance(row.get("isMinimized"), bool):
                     raise DeliveryError("malformed comment")
                 _author(row.get("author"))
+                if "reactions" in row:
+                    _reaction_summary(row["reactions"])
                 for key in ("createdAt", "updatedAt", "url"):
                     _nullable_string(row.get(key), "comment " + key)
             else:
-                allowed = {"context", "conclusion", "detailsUrl", "event", "group", "name", "startedAt", "state", "status", "workflowName"}
-                if set(row) - allowed or not isinstance(row.get("name") or row.get("context"), str):
+                allowed = {"__typename", "completedAt", "conclusion", "context", "createdAt", "detailsUrl", "event", "group", "headSha", "name", "startedAt", "state", "status", "targetUrl", "updatedAt", "workflowName"}
+                if set(row) - allowed or not isinstance(row.get("__typename"), str):
                     raise DeliveryError("malformed status check")
-                for key in ("conclusion", "detailsUrl", "event", "group", "startedAt", "workflowName"):
+                if row["__typename"] == "CheckRun":
+                    if not isinstance(row.get("name"), str) or row.get("status") not in {"QUEUED", "IN_PROGRESS", "COMPLETED"}:
+                        raise DeliveryError("malformed check run")
+                    if row.get("conclusion") not in {None, "SUCCESS", "SKIPPED", "FAILURE", "CANCELLED", "NEUTRAL", "TIMED_OUT", "ACTION_REQUIRED"}:
+                        raise DeliveryError("unknown check conclusion")
+                elif row["__typename"] == "StatusContext":
+                    if not isinstance(row.get("context"), str) or row.get("state") not in {"EXPECTED", "ERROR", "FAILURE", "PENDING", "SUCCESS"}:
+                        raise DeliveryError("malformed status context")
+                else:
+                    raise DeliveryError("unknown status check type")
+                for key in ("completedAt", "createdAt", "detailsUrl", "event", "group", "headSha", "startedAt", "targetUrl", "updatedAt", "workflowName"):
                     _nullable_string(row.get(key), "check " + key)
-    if not isinstance(value.get("isDraft"), bool) or not isinstance(value.get("reviewDecision"), str):
-        raise DeliveryError("malformed draft/review state")
+    if not isinstance(value.get("isDraft"), bool):
+        raise DeliveryError("malformed draft state")
+    _nullable_string(value.get("reviewDecision"), "reviewDecision")
+    for key in ("mergedAt", "closedAt", "updatedAt"):
+        _nullable_string(value.get(key), key)
     value["repository"] = f"{owner}/{repo}"
     return value
 
@@ -270,9 +323,10 @@ def _required_checks(root: Path, url: str, repository: str) -> tuple[list[dict[s
             raise DeliveryError("check row schema is invalid")
         if not all(isinstance(row[x], str) and row[x] for x in row):
             raise DeliveryError("check row is invalid")
-        if row["state"] not in CHECK_STATES or row["bucket"] not in CHECK_BUCKETS:
+        state, bucket = row["state"].upper(), row["bucket"].upper()
+        if state not in CHECK_STATES or bucket not in CHECK_BUCKETS:
             raise DeliveryError("unknown check state/bucket")
-        result.append({x: row[x] for x in ("name", "state", "bucket")})
+        result.append({"name": row["name"], "state": state, "bucket": bucket})
     if not result:
         return result, "none"
     if any(row["bucket"] == "FAIL" for row in result):
@@ -418,7 +472,7 @@ def read_pr(root: Path, url: str, *, expected_repository: str | None = None,
     value["reviewThreads"] = _threads(root, owner, repo, number)
     actual_source_digest = source_identity(root, actual_head_sha)
     if expected_source_digest is not None and actual_source_digest != expected_source_digest:
-        raise DeliveryError("PR source identity mismatch")
+        raise InvalidRequest("PR source identity mismatch")
     value["sourceDigest"] = actual_source_digest
     return value
 
@@ -443,21 +497,23 @@ def create_pr(root: Path, *, base: str, head: str, title: str, body: str,
               expected_repository: str | None = None, expected_base_sha: str | None = None,
               expected_head_sha: str | None = None, expected_source_digest: str | None = None) -> dict[str, Any]:
     if not base or not head or not title or len(title) > 256 or len(body) > 100000:
-        raise DeliveryError("invalid PR request")
+        raise InvalidRequest("invalid PR request")
     repository = remote_identity(root)
     if expected_repository and expected_repository.lower() != repository.lower():
         raise DeliveryError("repository expectation mismatch")
     base_sha = pushed_head(root, base)
     head_sha = pushed_head(root, head)
     if expected_base_sha and expected_base_sha != base_sha:
-        raise DeliveryError("base commit expectation mismatch")
+        raise InvalidRequest("base commit expectation mismatch")
     if expected_head_sha and expected_head_sha != head_sha:
-        raise DeliveryError("head commit expectation mismatch")
+        raise InvalidRequest("head commit expectation mismatch")
     if not SHA_RE.fullmatch(base_sha) or not SHA_RE.fullmatch(head_sha):
-        raise DeliveryError("PR commit expectation is not a full Git object id")
-    digest = expected_source_digest or source_identity(root, head_sha)
+        raise InvalidRequest("PR commit expectation is not a full Git object id")
+    digest = source_identity(root, head_sha)
+    if expected_source_digest is not None and expected_source_digest != digest:
+        raise InvalidRequest("PR source identity expectation mismatch")
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
-        raise DeliveryError("PR source identity is invalid")
+        raise InvalidRequest("PR source identity is invalid")
     existing = _existing_open(root, repository, base, head, base_sha, head_sha, digest)
     if existing is not None:
         return existing
