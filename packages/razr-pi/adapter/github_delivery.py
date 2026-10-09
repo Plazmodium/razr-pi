@@ -160,6 +160,8 @@ def _terminate_group(process: subprocess.Popen[bytes]) -> None:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             group_alive = False
+        except PermissionError as exc:
+            raise DeliveryError("process-group cleanup could not be verified") from exc
         if group_alive:
             try:
                 process.wait(timeout=0.25)
