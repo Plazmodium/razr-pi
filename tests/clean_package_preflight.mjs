@@ -31,10 +31,15 @@ assert.equal(process.env.HOME, join(fixture, 'home'));
 assert.equal(process.env.PI_CODING_AGENT_DIR, agentDir);
 assert.equal(process.env.PI_OFFLINE, '1');
 const manifest = JSON.parse(readFileSync(join(pkg, 'package.json'), 'utf8'));
-assert.deepEqual(manifest.pi, { skills: ['./skills'] });
-assert.deepEqual(Object.keys(manifest).sort(), ['description','files','keywords','name','pi','private','version']);
+assert.deepEqual(manifest.pi, { extensions: ['./extensions/razr.ts'], skills: ['./skills'] });
+assert.deepEqual(Object.keys(manifest).sort(), ['description','files','keywords','name','peerDependencies','pi','private','version']);
+assert.deepEqual(manifest.peerDependencies, {
+  '@earendil-works/pi-ai': '*',
+  '@earendil-works/pi-coding-agent': '*',
+  typebox: '*',
+});
 assert.equal(manifest.private, true);
-assert.deepEqual(manifest.files, ['skills','runtime','scripts','adapter','README.md']);
+assert.deepEqual(manifest.files, ['extensions','skills','runtime','scripts','adapter','README.md']);
 const skillStat = lstatSync(join(pkg, 'skills/razr/SKILL.md'));
 assert.ok(skillStat.isFile() && !skillStat.isSymbolicLink(), 'missing/linked declared skill');
 const installed = JSON.parse(readFileSync(join(piDir, 'package.json'), 'utf8'));
@@ -62,16 +67,16 @@ assert.deepEqual(before.home, {});
 assert.deepEqual(before.xdg, {});
 // Public SDK export; missing installed layout/capability is an explicit failure.
 const { DefaultResourceLoader, SettingsManager } = await import(pathToFileURL(join(piDir, 'dist/index.js')));
-const settings = SettingsManager.inMemory({ packages: [], extensions: [], skills: [], prompts: [], themes: [] });
+const settings = SettingsManager.inMemory({ packages: [{ source: pkg }], extensions: [], skills: [], prompts: [], themes: [] });
 const loader = new DefaultResourceLoader({
   cwd, agentDir, settingsManager: settings,
-  additionalExtensionPaths: [pkg],
-  noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true,
+  noPromptTemplates: true, noThemes: true, noContextFiles: true,
 });
 await loader.reload();
 assert.deepEqual(settings.drainErrors(), []);
 assert.deepEqual(loader.getExtensions().errors, []);
-assert.equal(loader.getExtensions().extensions.length, 0);
+assert.equal(loader.getExtensions().extensions.length, 1);
+assert.equal(loader.getExtensions().extensions[0].path, join(pkg, 'extensions/razr.ts'));
 assert.deepEqual(loader.getSkills().diagnostics, []);
 const skills = loader.getSkills().skills;
 assert.equal(skills.length, 1);
@@ -88,7 +93,7 @@ for (const name of ['razr.yaml','.razr','AGENTS.md']) assert.equal(readdirSync(c
 assert.equal(networkAttempts, 0);
 console.log(JSON.stringify({
   status: 'PASS', kind: 'actual-installed-local-package-resolver-no-model',
-  loaded: { skills: 1, extensions: 0, prompts: 0, themes: 0, contextFiles: 0 },
+  loaded: { skills: 1, extensions: 1, prompts: 0, themes: 0, contextFiles: 0 },
   adopted: false, unchanged: true, networkAttempts, modelInvocations: 0,
   piVersionDiagnostic: installed.version ?? null,
   skill_sha256: hash(readFileSync(skills[0].filePath)), before, after,

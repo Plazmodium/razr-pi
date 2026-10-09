@@ -1,6 +1,10 @@
 # Razr for Pi: public bootstrap
 
-Review [the skill](skills/razr/SKILL.md) and [managed routing](runtime/AGENTS.project-razr.md) before loading. This skill-only, private package supports explicit adoption/discovery. Loading does not authorize writes or adopt a project. Do not install automatically.
+Pi concept: a skill supplies instructions, while an extension registers executable commands. Loading either resource does not adopt a project or authorize writes. The extension is a thin dispatcher to the existing core and Memory adapter; it does not reimplement lifecycle authority, workers, authentication, or automatic adoption.
+
+The package registers `/razr-status`, `/razr-context`, `/razr-remember`, `/razr-recall`, and `/razr-memory-inspect`. Status/context are read-only; context delegates bounded selection to the M03 `ContextEngine`, while remember is the one explicit append operation and requires the M02 Memory adapter's closed JSON request. There is deliberately no worker command: the M04 provider remains unavailable unless a separately reviewed capability is authorized.
+
+Review [the skill](skills/razr/SKILL.md) and [managed routing](runtime/AGENTS.project-razr.md) before loading. This private package provides the primary skill plus a thin command extension for explicit inspection/adoption workflows. Loading does not authorize writes or adopt a project. Do not install automatically.
 
 The package resolves helpers and runtime internally. The core and five canonical templates are unchanged snapshots identified by [provenance](runtime/provenance.json). Provenance is not execution proof or licensing clearance.
 

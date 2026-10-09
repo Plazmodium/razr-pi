@@ -203,7 +203,7 @@ def main():
                                                         pi_root, run], project, env))
         require(loader['status'] == 'PASS' and loader['adopted'] is False and loader['unchanged'] is True,
                 'loader did not prove read-only package resolution')
-        require(loader['loaded'] == {'skills': 1, 'extensions': 0, 'prompts': 0, 'themes': 0, 'contextFiles': 0},
+        require(loader['loaded'] == {'skills': 1, 'extensions': 1, 'prompts': 0, 'themes': 0, 'contextFiles': 0},
                 'unexpected loaded resources')
         require(loader['networkAttempts'] == loader['modelInvocations'] == 0, 'unexpected external/model activity')
         require(snapshot(project) == initial_project, 'package loading adopted or changed project')

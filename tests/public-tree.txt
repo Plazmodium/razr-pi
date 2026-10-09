@@ -17,6 +17,7 @@ docs/design/execution-provider.md
 docs/testing.md
 packages/razr-pi/README.md
 packages/razr-pi/adapter/context.py
+packages/razr-pi/extensions/razr.ts
 packages/razr-pi/adapter/core_subprocess.py
 packages/razr-pi/adapter/herdr_provider.py
 packages/razr-pi/adapter/memory.py
@@ -34,6 +35,7 @@ packages/razr-pi/scripts/adopt.py
 packages/razr-pi/scripts/contract-preflight.py
 packages/razr-pi/scripts/named-regressions.py
 packages/razr-pi/scripts/primary.py
+packages/razr-pi/scripts/pi-surface.py
 packages/razr-pi/skills/razr/SKILL.md
 packages/razr-pi/skills/razr/references/adoption.md
 templates/vertical-slice.md

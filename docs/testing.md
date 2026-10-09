@@ -28,7 +28,7 @@ The full runner exports exactly tests/public-tree.txt to an owned source directo
 
 ## Actual integration and regression scope
 
-The tracer uses the actual installed Pi local-package resolver, not direct skill injection. Exactly one razr skill, zero extensions/prompts/themes/context files, unchanged package/project/configuration and no implicit adoption are required. Network attempts in the loader child throw. No agent, auth store, client or model runtime is constructed. Explicit adoption then creates routing/configuration; discovery must contain only spec.md and validate through the actual core.
+The tracer uses the actual installed Pi local-package resolver, not direct skill injection. Exactly one razr skill and one Razr extension, zero prompts/themes/context files, unchanged package/project/configuration and no implicit adoption are required. Network attempts in the loader child throw. No agent, auth store, client or model runtime is constructed. Explicit adoption then creates routing/configuration; discovery must contain only spec.md and validate through the actual core.
 
 The selected public modules are:
 
