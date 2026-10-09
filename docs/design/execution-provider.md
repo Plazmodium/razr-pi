@@ -192,7 +192,7 @@ Role-specific packet construction and semantic audit remain caller responsibilit
 The M04/M09 Herdr provider:
 
 1. verifies the installed Herdr API capabilities and selects an explicitly owned pane/session topology;
-2. uses the Python core readback to fence current generation, node ordinal and candidate; rejects duplicate attempts before claims; then repeats current-state and candidate verification immediately before start;
+2. uses the Python core readback to fence current generation, node ordinal and candidate; rejects duplicate attempts before claims; transactionally stages evidence, makes STARTED the durable attempt/resource-ID claim, and materializes replayable private path claims only afterward; then repeats current-state and candidate verification immediately before start;
 3. starts a fresh Pi session with explicit `--no-session`, the same reviewed cwd, runtime constraints, resource policy, and neutral input contract under one end-to-end deadline;
 4. streams independently bounded stdout/stderr in a dedicated process group and verifies cleanup on timeout/overflow; linked executable paths refuse;
 5. retains Herdr pane/agent identity only as operational provenance;

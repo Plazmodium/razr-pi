@@ -450,7 +450,7 @@ class HerdrProviderTests(unittest.TestCase):
                      patch.object(provider, "_resolve_existing_worktree") as resolve, \
                      patch.object(provider, "worktree_open") as opened, \
                      patch("adapter.herdr_provider.verify_candidate_identity") as git_verify, \
-                     patch.object(provider, "_claim_roots") as claims:
+                     patch.object(provider, "_prepare_launch_material") as claims:
                     with self.assertRaises(ProtocolError) as caught: provider.launch(request)
                 self.assertEqual(caught.exception.code, code)
                 resolve.assert_not_called(); opened.assert_not_called(); git_verify.assert_not_called()
@@ -470,7 +470,7 @@ class HerdrProviderTests(unittest.TestCase):
             started["record_digest"] = raw_file_digest(canonical_json(started)); ledger.append(started)
             before = ledger.path.read_bytes()
             with patch.object(provider, "probe", return_value=probe), patch.object(provider, "_verify_candidate") as verify, \
-                 patch.object(provider, "_claim_roots") as claims:
+                 patch.object(provider, "_prepare_launch_material") as claims:
                 with self.assertRaises(ProtocolError) as caught: provider.launch(request)
             self.assertEqual(caught.exception.code, "DUPLICATE_ATTEMPT")
             verify.assert_not_called(); claims.assert_not_called(); self.assertEqual(ledger.path.read_bytes(), before)
@@ -576,7 +576,7 @@ class HerdrProviderTests(unittest.TestCase):
                      patch.object(provider, "_resolve_existing_worktree") as resolve, \
                      patch.object(provider, "worktree_open") as opened, \
                      patch("adapter.herdr_provider.verify_candidate_identity") as git_verify, \
-                     patch.object(provider, "_claim_roots") as claims:
+                     patch.object(provider, "_prepare_launch_material") as claims:
                     with self.assertRaises(ProtocolError) as caught:
                         provider.launch(request)
                 self.assertEqual(caught.exception.code, code)
@@ -586,6 +586,149 @@ class HerdrProviderTests(unittest.TestCase):
             self.assertFalse(ledger.path.exists())
             self.assertFalse((worktree / ".razr").exists())
             self.assertEqual(list(output.iterdir()), []); self.assertEqual(list(session.iterdir()), [])
+
+    def test_dispatch_transaction_failures_retry_or_settle_without_double_launch(self):
+        def run(provider, request, current, probe):
+            with patch.object(provider, "probe", return_value=probe), \
+                 patch.object(provider, "_verify_candidate"), \
+                 patch.object(provider, "_read_current_work", return_value=current):
+                return provider.launch(request)
+
+        # Each pre-START evidence step is transactional: ordinary failure leaves
+        # no claim/evidence, and the exact request can retry once.
+        for failing_link in (1, 2, 3):
+            with self.subTest(kind="evidence", step=failing_link), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp).resolve(); request, current, probe, private, worktree, _, _ = request_fixture(base, f"att-evidence-{failing_link}")
+                ledger = AttemptLedger(base / "attempts.jsonl"); starts = []
+                def runner(argv, **kwargs):
+                    if argv[:3] == ["herdr", "agent", "start"]:
+                        starts.append(argv); return subprocess.CompletedProcess(argv, 7, b"", b"failed")
+                    raise AssertionError(argv)
+                provider = HerdrProvider(runner=runner, ledger=ledger, private_root=private)
+                actual_link = os.link; calls = {"count": 0}
+                def fail_link(source, target, *args, **kwargs):
+                    result = actual_link(source, target, *args, **kwargs); calls["count"] += 1
+                    if calls["count"] == failing_link: raise OSError("injected post-evidence failure")
+                    return result
+                with patch("adapter.herdr_provider.os.link", side_effect=fail_link):
+                    with self.assertRaises(ProtocolError) as caught: run(provider, request, current, probe)
+                self.assertEqual(caught.exception.code, "ARTIFACT_UNAVAILABLE")
+                self.assertFalse(ledger.path.exists()); self.assertFalse((private / "root-claims.jsonl").exists())
+                self.assertEqual(list(private.glob("dispatch-prepared-*.json")), [])
+                evidence = worktree / ".razr/evidence"
+                self.assertFalse(evidence.exists() and any(evidence.iterdir()))
+                with self.assertRaises(ProtocolError) as caught: run(provider, request, current, probe)
+                self.assertEqual(caught.exception.code, "LAUNCH_FAILED")
+                self.assertEqual(len(starts), 1)
+                self.assertEqual([row["event"] for row in ledger.records()], ["STARTED", "SETTLED"])
+                with self.assertRaises(ProtocolError) as caught: run(provider, request, current, probe)
+                self.assertEqual(caught.exception.code, "DUPLICATE_ATTEMPT"); self.assertEqual(len(starts), 1)
+
+        # A failed STARTED append is known-not-committed, cleans staging, and is exactly retryable.
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve(); request, current, probe, private, worktree, _, _ = request_fixture(base, "att-start-append")
+            ledger = AttemptLedger(base / "attempts.jsonl"); starts = []
+            def runner(argv, **kwargs):
+                if argv[:3] == ["herdr", "agent", "start"]:
+                    starts.append(argv); return subprocess.CompletedProcess(argv, 7, b"", b"failed")
+                raise AssertionError(argv)
+            provider = HerdrProvider(runner=runner, ledger=ledger, private_root=private)
+            with patch.object(ledger, "append", side_effect=ProtocolError("LOCK_UNAVAILABLE", "injected STARTED failure")):
+                with self.assertRaises(ProtocolError) as caught: run(provider, request, current, probe)
+            self.assertEqual(caught.exception.code, "LOCK_UNAVAILABLE")
+            self.assertFalse(ledger.path.exists()); self.assertFalse((private / "root-claims.jsonl").exists())
+            self.assertEqual(list(private.glob("dispatch-prepared-*.json")), [])
+            self.assertFalse((worktree / ".razr/evidence").exists())
+            with self.assertRaises(ProtocolError): run(provider, request, current, probe)
+            self.assertEqual(len(starts), 1)
+            self.assertEqual([row["event"] for row in ledger.records()], ["STARTED", "SETTLED"])
+
+        # Root-claim and marker failures happen only after STARTED. They settle
+        # that exact attempt and can never produce a second agent start.
+        for kind, failing_step in (("claim", 1), ("claim", 2), ("marker", 1), ("marker", 2)):
+            with self.subTest(kind=kind, step=failing_step), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp).resolve(); request, current, probe, private, _, _, _ = request_fixture(base, f"att-{kind}-{failing_step}")
+                ledger = AttemptLedger(base / "attempts.jsonl"); starts = []
+                provider = HerdrProvider(runner=lambda argv, **kwargs: starts.append(argv), ledger=ledger, private_root=private)
+                calls = {"count": 0}
+                if kind == "claim":
+                    original = provider._claim_root_identity
+                    def fail_after(*args, **kwargs):
+                        result = original(*args, **kwargs); calls["count"] += 1
+                        if calls["count"] == failing_step: raise ProtocolError("ARTIFACT_UNAVAILABLE", "injected post-claim failure")
+                        return result
+                    boundary = patch.object(provider, "_claim_root_identity", side_effect=fail_after)
+                else:
+                    from adapter import herdr_provider as provider_module
+                    original_marker = provider_module._marker
+                    def fail_after(*args, **kwargs):
+                        result = original_marker(*args, **kwargs); calls["count"] += 1
+                        if calls["count"] == failing_step: raise ProtocolError("ARTIFACT_UNAVAILABLE", "injected post-marker failure")
+                        return result
+                    boundary = patch("adapter.herdr_provider._marker", side_effect=fail_after)
+                with boundary:
+                    with self.assertRaises(ProtocolError) as caught: run(provider, request, current, probe)
+                self.assertEqual(caught.exception.code, "ARTIFACT_UNAVAILABLE")
+                self.assertEqual([row["event"] for row in ledger.records()], ["STARTED", "SETTLED"])
+                restarted = HerdrProvider(runner=lambda argv, **kwargs: starts.append(argv), ledger=ledger, private_root=private)
+                with self.assertRaises(ProtocolError) as caught: run(restarted, request, current, probe)
+                self.assertEqual(caught.exception.code, "DUPLICATE_ATTEMPT")
+                self.assertEqual(starts, [])
+
+    def test_pre_started_crash_staging_is_reconciled_and_exactly_retryable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve(); request, current, probe, private, _, _, _ = request_fixture(base, "att-pre-start-crash")
+            ledger = AttemptLedger(base / "attempts.jsonl"); starts = []
+            def runner(argv, **kwargs):
+                if argv[:3] == ["herdr", "agent", "start"]:
+                    starts.append(argv); return subprocess.CompletedProcess(argv, 7, b"", b"failed")
+                raise AssertionError(argv)
+            provider = HerdrProvider(runner=runner, ledger=ledger, private_root=private)
+            with patch.object(provider, "probe", return_value=probe), patch.object(provider, "_verify_candidate"), \
+                 patch.object(provider, "_read_current_work", return_value=current), \
+                 patch.object(ledger, "append", side_effect=KeyboardInterrupt("crash before STARTED commit")):
+                with self.assertRaises(KeyboardInterrupt): provider.launch(request)
+            self.assertFalse(ledger.path.exists()); self.assertEqual(len(list(private.glob("dispatch-prepared-*.json"))), 1)
+            restarted = HerdrProvider(runner=runner, ledger=ledger, private_root=private)
+            with patch.object(restarted, "probe", return_value=probe), patch.object(restarted, "_verify_candidate"), \
+                 patch.object(restarted, "_read_current_work", return_value=current):
+                with self.assertRaises(ProtocolError) as caught: restarted.launch(request)
+            self.assertEqual(caught.exception.code, "LAUNCH_FAILED")
+            self.assertEqual(len(starts), 1); self.assertEqual(list(private.glob("dispatch-prepared-*.json")), [])
+            self.assertEqual([row["event"] for row in ledger.records()], ["STARTED", "SETTLED"])
+
+    def test_post_started_crash_is_reconciled_and_explicitly_recoverable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve(); request, current, probe, private, worktree, output, session = request_fixture(base, "att-crash-window")
+            ledger = AttemptLedger(base / "attempts.jsonl"); starts = []
+            provider = HerdrProvider(runner=lambda argv, **kwargs: starts.append(argv), ledger=ledger, private_root=private)
+            with patch.object(provider, "probe", return_value=probe), patch.object(provider, "_verify_candidate"), \
+                 patch.object(provider, "_read_current_work", return_value=current), \
+                 patch.object(provider, "_materialize_root_claims", side_effect=KeyboardInterrupt("crash")):
+                with self.assertRaises(KeyboardInterrupt): provider.launch(request)
+            self.assertEqual([row["event"] for row in ledger.records()], ["STARTED"])
+            self.assertEqual(len(list(private.glob("dispatch-prepared-*.json"))), 1)
+            self.assertEqual(starts, [])
+
+            restarted = HerdrProvider(runner=lambda argv, **kwargs: starts.append(argv), ledger=ledger, private_root=private)
+            with patch.object(restarted, "probe", return_value=probe), patch.object(restarted, "_verify_candidate"), \
+                 patch.object(restarted, "_read_current_work", return_value=current):
+                with self.assertRaises(ProtocolError) as caught: restarted.launch(request)
+            self.assertEqual(caught.exception.code, "DUPLICATE_ATTEMPT")
+            self.assertEqual(starts, []); self.assertEqual(list(private.glob("dispatch-prepared-*.json")), [])
+            self.assertTrue((output / ".razr-herdr-root.json").is_file())
+            self.assertTrue((session / ".razr-herdr-root.json").is_file())
+            claims = (private / "root-claims.jsonl").read_text().splitlines()
+            self.assertEqual(len(claims), 2)
+            boundary = worktree / ".razr/evidence/launch-boundary-att-crash-window.json"
+            retained = {"ref": ".razr/evidence/" + boundary.name, "digest_domain": "raw_file",
+                        "digest": raw_file_digest(boundary.read_bytes()), "kind": "event"}
+            result = restarted.recover_unmatched({"schema_version": 1, "request_id": "recover-crash-window",
+                "attempt_id": request["attempt_id"], "worktree": str(worktree),
+                "recovery_authority": {"kind": "explicit", "authority_id": "human-crash-recovery", "asserted": True, "reason": "confirmed pre-launch crash"},
+                "retained_evidence": [retained]})
+            self.assertEqual(result["result"]["outcome"], "UNKNOWN")
+            self.assertEqual([row["event"] for row in ledger.records()], ["STARTED", "SETTLED"])
 
     def test_end_to_end_deadline_includes_final_authority_preflight(self):
         with tempfile.TemporaryDirectory() as tmp:

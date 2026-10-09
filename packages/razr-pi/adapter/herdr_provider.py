@@ -922,74 +922,235 @@ class HerdrProvider:
                         _id(row["root_id"], "root_id"); _digest(row["root_digest"], "root_digest"); _digest(row["request_digest"], "request_digest"); _digest(row["prev_digest"], "prev_digest"); _digest(row["record_digest"], "record_digest")
                         if not isinstance(row["path"], str) or not os.path.isabs(row["path"]): raise _fail("LEDGER_CORRUPT", "invalid root claim path")
                         rows.append(row); previous = row["record_digest"]
-                    if any(row["root_id"] == root_id or row["path"] == str(root) for row in rows): raise _fail("RESOURCE_REUSED", "root identity or canonical path was previously claimed")
+                    if self.ledger is None:
+                        raise _fail("INVALID_REQUEST", "attempt ledger is required for root claims")
+                    started_attempts = {item["attempt_id"] for item in self.ledger.records() if item["event"] == "STARTED"}
+                    if attempt_id not in started_attempts:
+                        raise _fail("INVALID_ORDER", "root claim requires durable STARTED")
+                    exact = next((row for row in rows if row["attempt_id"] == attempt_id and row["root_id"] == root_id
+                                  and row["root_digest"] == root_digest and row["path"] == str(root)
+                                  and row["request_digest"] == request_digest), None)
+                    if exact is not None:
+                        return
+                    active = [row for row in rows if row["attempt_id"] in started_attempts]
+                    if any(row["root_id"] == root_id or row["path"] == str(root) for row in active):
+                        raise _fail("RESOURCE_REUSED", "root identity or canonical path was previously claimed")
                     row = {"schema_version": 1, "root_id": root_id, "root_digest": root_digest, "path": str(root), "attempt_id": attempt_id, "request_digest": request_digest, "claimed_at": _now(), "prev_digest": previous}
                     row["record_digest"] = raw_file_digest(canonical_json(row)); stream.seek(0, 2); stream.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"); stream.flush(); os.fsync(stream.fileno()); fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
             except (OSError, UnicodeDecodeError) as exc: raise _fail("LEDGER_CORRUPT", "root claims cannot be locked or written") from exc
         finally: os.close(dirfd)
 
-    def _claim_roots(self, request: ProviderRequest, capability_report_digest: str,
-                     current: WorkflowRead) -> dict[str, object]:
-        values = request.value
-        markers = []
-        for root_key in ("output_root", "session_root"):
-            root = _canonical_dir(values[root_key], root_key); markers.append((root, root / ".razr-herdr-root.json", (root / ".razr-herdr-root.json").exists()))
-        evidence_dir = _canonical_dir(values["worktree"], "worktree") / ".razr" / "evidence"
-        before = set(evidence_dir.iterdir()) if evidence_dir.is_dir() else set()
-        try:
-            return self._claim_roots_unprotected(request, capability_report_digest, current)
-        except BaseException:
-            for root, marker, existed in markers:
-                if not existed and marker.is_file():
-                    try: marker.unlink()
-                    except OSError: pass
-            if evidence_dir.is_dir():
-                for child in set(evidence_dir.iterdir()) - before:
-                    try:
-                        if child.is_file() and not child.is_symlink(): child.unlink()
-                    except OSError: pass
-            raise
-
-    def _claim_roots_unprotected(self, request: ProviderRequest, capability_report_digest: str,
+    def _prepare_launch_material(self, request: ProviderRequest, capability_report_digest: str,
                                  current: WorkflowRead) -> dict[str, object]:
+        """Validate empty roots and construct deterministic evidence without durable claims."""
         values = request.value
-        prior = [] if self.ledger is None else self.ledger.records()
         for root_key, id_key in (("output_root", "output_root_id"), ("session_root", "session_root_id")):
             root = _canonical_dir(values[root_key], root_key)
-            if any(row.get(root_key + "_id") == values[id_key] for row in prior):
-                raise _fail("RESOURCE_REUSED", f"{root_key} identity was previously used")
             digest, entries = _manifest(root)
-            if digest != values[root_key + "_digest"] or entries: raise _fail("RESOURCE_REUSED", f"{root_key} manifest differs or is non-empty")
-            root_id = _id(values[id_key], id_key); self._claim_root_identity(root, root_id, digest, values["attempt_id"], raw_file_digest(canonical_json(values)))
-            _marker(root, root_id, digest, create=True)
+            if digest != values[root_key + "_digest"] or entries:
+                raise _fail("RESOURCE_REUSED", f"{root_key} manifest differs or is non-empty")
+            if (root / ".razr-herdr-root.json").exists():
+                raise _fail("RESOURCE_REUSED", f"{root_key} was previously claimed")
+            _id(values[id_key], id_key)
         packet = {key: values[key] for key in ("schema_version", "request_id", "attempt_id", "role", "work", "worker_id", "branch", "candidate", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "fresh_context", "neutral_input_digest", "environment_policy_digest", "tool_policy_digest", "required_capabilities", "runtime", "limits", "allowance_id")}
         _digest(capability_report_digest, "capability_report_digest")
         packet["capability_report_digest"] = capability_report_digest
         packet["request_digest"] = raw_file_digest(canonical_json(packet))
-        evidence = _canonical_dir(values["worktree"], "worktree") / ".razr" / "evidence"
+        worktree = _canonical_dir(values["worktree"], "worktree")
+        evidence = worktree / ".razr" / "evidence"
+        candidate_path = evidence / ("candidate-" + values["attempt_id"] + ".json")
+        packet_path = evidence / ("attempt-" + values["attempt_id"] + ".json")
+        boundary_path = evidence / ("launch-boundary-" + values["attempt_id"] + ".json")
+        candidate_bytes = canonical_json(values["candidate"])
+        packet_bytes = canonical_json(packet)
+        boundary_bytes = canonical_json({"schema_version": 1, "kind": "launch_boundary", "attempt_id": values["attempt_id"],
+                                         "request_digest": packet["request_digest"],
+                                         "work": {"work_id": current.work_id, "node_id": current.node_id,
+                                                  "generation": current.generation, "ordinal": current.node_attempt},
+                                         "candidate": {"repository": current.candidate_repository,
+                                                       "branch": current.candidate_branch,
+                                                       "commit": current.candidate_commit,
+                                                       "source_digest": current.candidate_source_digest},
+                                         "core_readback": {"state_digest": current.raw_state_digest,
+                                                           "core_identity": current.raw_state_core_identity}})
+        return {"candidate": {"ref": str(candidate_path.relative_to(worktree)), "digest_domain": "canonical_json", "digest": raw_file_digest(candidate_bytes)},
+                "packet": {"ref": str(packet_path.relative_to(worktree)), "digest_domain": "canonical_json", "digest": raw_file_digest(packet_bytes)},
+                "launch_boundary": {"ref": str(boundary_path.relative_to(worktree)), "digest_domain": "raw_file", "digest": raw_file_digest(boundary_bytes)},
+                "request_digest": packet["request_digest"], "capability_report_digest": capability_report_digest,
+                "files": ((candidate_path, candidate_bytes), (packet_path, packet_bytes), (boundary_path, boundary_bytes))}
+
+    def _cleanup_staged_evidence(self, material: Mapping[str, object]) -> None:
+        files = material["files"]
+        for path, data in files:
+            try:
+                if path.is_file() and not path.is_symlink() and path.read_bytes() == data:
+                    path.unlink()
+                temporary = path.with_name("." + path.name + ".staging")
+                if temporary.is_file() and not temporary.is_symlink():
+                    temporary.unlink()
+            except OSError:
+                continue
+        evidence = files[0][0].parent
+        try:
+            if evidence.is_dir() and not any(evidence.iterdir()): evidence.rmdir()
+            razr = evidence.parent
+            if razr.is_dir() and not any(razr.iterdir()): razr.rmdir()
+        except OSError:
+            pass
+
+    def _stage_attempt_evidence(self, material: Mapping[str, object]) -> None:
+        """Atomically stage exact evidence; crash remnants are idempotently adoptable."""
+        files = material["files"]
+        evidence = files[0][0].parent
         try:
             evidence.mkdir(parents=True, exist_ok=True)
-            candidate_path = evidence / ("candidate-" + values["attempt_id"] + ".json")
-            packet_path = evidence / ("attempt-" + values["attempt_id"] + ".json")
-            candidate_bytes = canonical_json(values["candidate"])
-            packet_bytes = canonical_json(packet)
-            boundary_path = evidence / ("launch-boundary-" + values["attempt_id"] + ".json")
-            boundary_bytes = canonical_json({"schema_version": 1, "kind": "launch_boundary", "attempt_id": values["attempt_id"],
-                                             "request_digest": packet["request_digest"],
-                                             "work": {"work_id": current.work_id, "node_id": current.node_id,
-                                                      "generation": current.generation, "ordinal": current.node_attempt},
-                                             "candidate": {"repository": current.candidate_repository,
-                                                           "branch": current.candidate_branch,
-                                                           "commit": current.candidate_commit,
-                                                           "source_digest": current.candidate_source_digest},
-                                             "core_readback": {"state_digest": current.raw_state_digest,
-                                                               "core_identity": current.raw_state_core_identity}})
-            for path, data in ((candidate_path, candidate_bytes), (packet_path, packet_bytes), (boundary_path, boundary_bytes)):
-                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                with os.fdopen(fd, "wb") as stream: stream.write(data); stream.flush(); os.fsync(stream.fileno())
-        except FileExistsError as exc: raise _fail("RESOURCE_REUSED", "attempt evidence already exists") from exc
-        return {"candidate": {"ref": str(candidate_path.relative_to(_canonical_dir(values["worktree"], "worktree"))), "digest_domain": "canonical_json", "digest": raw_file_digest(candidate_bytes)},
-                "packet": {"ref": str(packet_path.relative_to(_canonical_dir(values["worktree"], "worktree"))), "digest_domain": "canonical_json", "digest": raw_file_digest(packet_bytes)}, "launch_boundary": {"ref": str(boundary_path.relative_to(_canonical_dir(values["worktree"], "worktree"))), "digest_domain": "raw_file", "digest": raw_file_digest(boundary_bytes)}, "request_digest": packet["request_digest"], "capability_report_digest": capability_report_digest}
+            dirfd = os.open(evidence, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                for path, data in files:
+                    temporary = path.with_name("." + path.name + ".staging")
+                    if path.exists():
+                        if path.is_symlink() or not path.is_file() or path.read_bytes() != data:
+                            raise _fail("RESOURCE_REUSED", "attempt evidence identity conflicts")
+                        if temporary.exists() and temporary.is_file() and not temporary.is_symlink(): temporary.unlink()
+                        continue
+                    if temporary.exists():
+                        if temporary.is_symlink() or not temporary.is_file():
+                            raise _fail("RESOURCE_REUSED", "attempt evidence staging path is unsafe")
+                        temporary.unlink()
+                    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                    with os.fdopen(fd, "wb") as stream:
+                        stream.write(data); stream.flush(); os.fsync(stream.fileno())
+                    try: os.link(temporary, path)
+                    except FileExistsError as exc: raise _fail("RESOURCE_REUSED", "attempt evidence raced") from exc
+                    temporary.unlink(); os.fsync(dirfd)
+            finally:
+                os.close(dirfd)
+        except ProtocolError:
+            self._cleanup_staged_evidence(material)
+            raise
+        except OSError as exc:
+            self._cleanup_staged_evidence(material)
+            raise _fail("ARTIFACT_UNAVAILABLE", "attempt evidence could not be staged") from exc
+
+    def _prepared_path(self, attempt_id: str) -> Path:
+        if self.private_root is None: raise _fail("INVALID_REQUEST", "private root unavailable")
+        return _canonical_dir(str(self.private_root), "private_root") / ("dispatch-prepared-" + _id(attempt_id, "attempt_id") + ".json")
+
+    def _stage_prepared(self, request: ProviderRequest, material: Mapping[str, object]) -> Path:
+        values = request.value
+        rows = []
+        for path, data in material["files"]:
+            rows.append({"ref": str(path.relative_to(_canonical_dir(values["worktree"], "worktree"))),
+                         "digest": raw_file_digest(data)})
+        record = {"schema_version": 1, "kind": "dispatch_prepared", "attempt_id": values["attempt_id"],
+                  "request_digest": material["request_digest"], "worktree": values["worktree"],
+                  "roots": [{"path": values["output_root"], "root_id": values["output_root_id"], "root_digest": values["output_root_digest"]},
+                            {"path": values["session_root"], "root_id": values["session_root_id"], "root_digest": values["session_root_digest"]}],
+                  "evidence": rows}
+        data = canonical_json(record); path = self._prepared_path(values["attempt_id"])
+        if path.exists():
+            try:
+                if path.is_symlink() or not path.is_file() or path.read_bytes() != data:
+                    raise _fail("RESOURCE_REUSED", "prepared dispatch identity conflicts")
+            except OSError as exc: raise _fail("ARTIFACT_UNAVAILABLE", "prepared dispatch is unavailable") from exc
+            return path
+        created = False
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600); created = True
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data); stream.flush(); os.fsync(stream.fileno())
+            dirfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try: os.fsync(dirfd)
+            finally: os.close(dirfd)
+            return path
+        except OSError as exc:
+            if created:
+                try:
+                    if path.is_file() and not path.is_symlink(): path.unlink()
+                except OSError: pass
+            raise _fail("ARTIFACT_UNAVAILABLE", "prepared dispatch could not be persisted") from exc
+
+    @staticmethod
+    def _remove_prepared(path: Path) -> None:
+        try:
+            if path.is_file() and not path.is_symlink(): path.unlink()
+            dirfd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try: os.fsync(dirfd)
+            finally: os.close(dirfd)
+        except OSError as exc: raise _fail("ARTIFACT_UNAVAILABLE", "prepared dispatch could not be cleared") from exc
+
+    def _materialize_claim_values(self, *, attempt_id: str, request_digest: str,
+                                  roots: Sequence[Mapping[str, object]]) -> None:
+        for index, item in enumerate(roots):
+            if not isinstance(item, Mapping) or set(item) != {"path", "root_id", "root_digest"}:
+                raise _fail("LEDGER_CORRUPT", "prepared root claim is malformed")
+            root = _canonical_dir(item["path"], f"prepared root {index}")
+            root_id = _id(item["root_id"], "root_id"); digest = _digest(item["root_digest"], "root_digest")
+            marker = root / ".razr-herdr-root.json"
+            if marker.exists():
+                _marker(root, root_id, digest, create=False)
+            else:
+                actual, entries = _manifest(root)
+                if actual != digest or entries:
+                    raise _fail("RESOURCE_REUSED", "prepared root changed before claim materialization")
+            self._claim_root_identity(root, root_id, digest, attempt_id, request_digest)
+            if not marker.exists(): _marker(root, root_id, digest, create=True)
+
+    def _materialize_root_claims(self, request: ProviderRequest, request_digest: str) -> None:
+        """Materialize private path claims only after STARTED is durable; replay is idempotent."""
+        values = request.value
+        roots = [{"path": values["output_root"], "root_id": values["output_root_id"], "root_digest": values["output_root_digest"]},
+                 {"path": values["session_root"], "root_id": values["session_root_id"], "root_digest": values["session_root_digest"]}]
+        self._materialize_claim_values(attempt_id=values["attempt_id"], request_digest=request_digest, roots=roots)
+
+    def _reconcile_prepared(self) -> None:
+        """Recover crash windows under the dispatch lock without erasing chronology."""
+        if self.private_root is None or self.ledger is None: return
+        private = _canonical_dir(str(self.private_root), "private_root")
+        paths = sorted(private.glob("dispatch-prepared-*.json"))
+        if len(paths) > 10_000: raise _fail("LIMIT_EXCEEDED", "too many prepared dispatch records")
+        records = self.ledger.records()
+        for path in paths:
+            if path.is_symlink() or not path.is_file(): raise _fail("LEDGER_CORRUPT", "prepared dispatch path is unsafe")
+            try: value = _strict_json(path.read_bytes())
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+                raise _fail("LEDGER_CORRUPT", "prepared dispatch record is malformed") from exc
+            expected = {"schema_version", "kind", "attempt_id", "request_digest", "worktree", "roots", "evidence"}
+            if not isinstance(value, dict) or set(value) != expected or value["schema_version"] != 1 or value["kind"] != "dispatch_prepared":
+                raise _fail("LEDGER_CORRUPT", "prepared dispatch record is not closed")
+            attempt_id = _id(value["attempt_id"], "attempt_id"); request_digest = _digest(value["request_digest"], "request_digest")
+            started = any(row["attempt_id"] == attempt_id and row["event"] == "STARTED" for row in records)
+            if started:
+                # STARTED permanently owns both root identities and canonical paths,
+                # even when a post-START materialization failure was already settled.
+                self._materialize_claim_values(attempt_id=attempt_id, request_digest=request_digest, roots=value["roots"])
+            else:
+                try: worktree = _canonical_dir(value["worktree"], "prepared worktree")
+                except ProtocolError:
+                    # No STARTED means no durable claim; an unavailable staging
+                    # checkout cannot block unrelated future dispatches.
+                    self._remove_prepared(path)
+                    continue
+                if not isinstance(value["evidence"], list) or len(value["evidence"]) != 3:
+                    raise _fail("LEDGER_CORRUPT", "prepared evidence list is malformed")
+                evidence_parent: Path | None = None
+                for item in value["evidence"]:
+                    if not isinstance(item, dict) or set(item) != {"ref", "digest"}: raise _fail("LEDGER_CORRUPT", "prepared evidence is malformed")
+                    ref = PurePosixPath(item["ref"]); _digest(item["digest"], "prepared evidence digest")
+                    if ref.is_absolute() or ".." in ref.parts: raise _fail("PATH_ESCAPE", "prepared evidence escapes worktree")
+                    evidence_path = worktree.joinpath(*ref.parts); evidence_parent = evidence_path.parent
+                    temporary = evidence_path.with_name("." + evidence_path.name + ".staging")
+                    try:
+                        if evidence_path.is_file() and not evidence_path.is_symlink() and raw_file_digest(evidence_path.read_bytes()) == item["digest"]:
+                            evidence_path.unlink()
+                        if temporary.is_file() and not temporary.is_symlink() and temporary.stat().st_nlink <= 2:
+                            temporary.unlink()
+                    except OSError as exc: raise _fail("ARTIFACT_UNAVAILABLE", "prepared evidence cleanup failed") from exc
+                try:
+                    if evidence_parent is not None and evidence_parent.is_dir() and not any(evidence_parent.iterdir()): evidence_parent.rmdir()
+                    if evidence_parent is not None and evidence_parent.parent.is_dir() and not any(evidence_parent.parent.iterdir()): evidence_parent.parent.rmdir()
+                except OSError: pass
+            self._remove_prepared(path)
 
     @contextmanager
     def _dispatch_lock(self):
@@ -1020,14 +1181,6 @@ class HerdrProvider:
                 try: os.close(dirfd)
                 except OSError: pass
 
-    def _release_unlaunched_claims(self, value: Mapping[str, object]) -> None:
-        for root_key, id_key in (("output_root", "output_root_id"), ("session_root", "session_root_id")):
-            try:
-                root = _canonical_dir(value[root_key], root_key); marker = root / ".razr-herdr-root.json"
-                if marker.is_file() and _strict_json(marker.read_bytes()).get("root_id") == value[id_key]: marker.unlink()
-            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError, ProtocolError):
-                continue
-
     def launch(self, request: Mapping[str, object]) -> dict[str, object]:
         operation_started = time.monotonic()
         limits = request.get("limits") if isinstance(request, Mapping) else None
@@ -1050,22 +1203,35 @@ class HerdrProvider:
             root = _canonical_dir(parsed.value[key], key)
             if root == private_root or not root.is_relative_to(private_root): raise _fail("PATH_ESCAPE", f"{key} is outside provider private root")
         with self._dispatch_lock():
+            self._reconcile_prepared()
             self.ledger.assert_start_available(attempt_id=value["attempt_id"], allowance_id=value["allowance_id"],
                                                output_root_id=value["output_root_id"], session_root_id=value["session_root_id"])
             # Razr authority is read before worktree_open or any other dispatch mutation.
             current = self._read_current_work(parsed, deadline_at=deadline_at)
             self._verify_candidate(parsed, deadline_at=deadline_at)
-            evidence = self._claim_roots(parsed, probe_report["result"]["report_digest"], current)
+            evidence = self._prepare_launch_material(parsed, probe_report["result"]["report_digest"], current)
+            prepared = self._stage_prepared(parsed, evidence)
+            try:
+                self._stage_attempt_evidence(evidence)
+            except BaseException:
+                self._remove_prepared(prepared)
+                raise
             started = {"schema_version": 1, "event": "STARTED", "attempt_id": value["attempt_id"], "work_id": value["work"]["work_id"], "node_id": value["work"]["node_id"], "observed_generation": value["work"]["generation"], "observed_ordinal": value["work"]["ordinal"], "worker_id": value["worker_id"], "branch": value["branch"], "worktree_ref": ".", "allowance_id": value["allowance_id"], "provider_id": self.provider_id, "started_at": _now(), "started_at_source": "adapter_observed", "candidate": {"commit": value["candidate"]["commit"], "source_digest": value["candidate"]["source_digest"]}, "candidate_evidence": evidence["candidate"], "request_packet": evidence["packet"], "output_root_id": value["output_root_id"], "output_root_digest": value["output_root_digest"], "session_root_id": value["session_root_id"], "session_root_digest": value["session_root_digest"], "request_digest": evidence["request_digest"], "herdr": _ledger_host(value["host"]), "prev_digest": "sha256:" + "0" * 64}
             try:
                 started = self.ledger.append(started)
-            except ProtocolError:
-                self._release_unlaunched_claims(value)
+            except ProtocolError as exc:
+                if exc.code != "LEDGER_CORRUPT":
+                    self._cleanup_staged_evidence(evidence)
+                    self._remove_prepared(prepared)
                 raise
             self._attempt_paths[value["attempt_id"]] = _canonical_dir(value["worktree"], "worktree")
             self._attempt_sessions[value["attempt_id"]] = _canonical_dir(value["session_root"], "session_root")
             self._attempt_roots[value["attempt_id"]] = (_canonical_dir(value["output_root"], "output_root"), _canonical_dir(value["session_root"], "session_root"))
             try:
+                # STARTED is the durable attempt/root-ID claim. Private path claims are a
+                # replayable post-START materialization, never pre-START authority.
+                self._materialize_root_claims(parsed, evidence["request_digest"])
+                self._remove_prepared(prepared)
                 final = self._read_current_work(parsed, deadline_at=deadline_at)
                 if (final.raw_state_digest != current.raw_state_digest or final.raw_state_core_identity != current.raw_state_core_identity):
                     raise _fail("STALE_GENERATION", "core state changed at final launch fence")
