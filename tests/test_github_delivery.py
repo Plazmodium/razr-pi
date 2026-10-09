@@ -84,15 +84,22 @@ class GithubDeliveryTests(unittest.TestCase):
         with patch.object(delivery, "_required_checks", return_value=([], "none")), \
              patch.object(delivery, "_threads", return_value=[]), \
              patch.object(delivery, "remote_identity", return_value="o/r"), \
-             patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA, "b" * 40, SHA]), \
-             patch.object(delivery, "source_identity", side_effect=[DIGEST, DIGEST]), \
-             patch.object(delivery, "_json", side_effect=[pr_value(), pr_value()]):
+             patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA, "b" * 40, SHA, "b" * 40, SHA]), \
+             patch.object(delivery, "source_identity", side_effect=[DIGEST, DIGEST, DIGEST]), \
+             patch.object(delivery, "_json", side_effect=[pr_value(), pr_value(),
+                 {"number": 1, "url": URL, "state": "OPEN", "isDraft": False,
+                  "baseRefName": "campaign/razr-pi-next", "baseRefOid": "b" * 40,
+                  "headRefName": "feature", "headRefOid": SHA, "mergeStateStatus": "CLEAN",
+                  "mergeable": "MERGEABLE", "reviewDecision": "", "mergedAt": None,
+                  "closedAt": None, "updatedAt": "2026-01-01T00:00:00Z"}]):
             result = delivery.read_pr(Path("."), URL, expected_repository="o/r",
                                       expected_base="campaign/razr-pi-next", expected_base_sha="b" * 40,
                                       expected_head="feature", expected_head_sha=SHA,
                                       expected_source_digest=DIGEST)
             self.assertEqual(result["repository"], "o/r")
             self.assertEqual(result["sourceDigest"], DIGEST)
+            self.assertFalse(result["collectionCompleteness"]["reviews"]["complete"])
+            self.assertEqual(delivery._stable_collection("truncated", list(range(101)), list(range(101))), list(range(101)))
 
     def test_provider_review_and_reaction_enums_are_closed(self):
         for decision in ("", "APPROVED", "CHANGES_REQUESTED", "REVIEW_REQUIRED"):
@@ -171,6 +178,21 @@ class GithubDeliveryTests(unittest.TestCase):
                 delivery.read_pr(Path("."), URL, expected_repository="o/r", expected_base="campaign/razr-pi-next",
                                  expected_base_sha="b" * 40, expected_head="feature", expected_head_sha=SHA,
                                  expected_source_digest=DIGEST)
+
+    def test_trailing_fence_rejects_head_move_during_final_checks(self):
+        fence = {"number": 1, "url": URL, "state": "OPEN", "isDraft": False,
+                 "baseRefName": "campaign/razr-pi-next", "baseRefOid": "b" * 40,
+                 "headRefName": "feature", "headRefOid": SHA, "mergeStateStatus": "CLEAN",
+                 "mergeable": "MERGEABLE", "reviewDecision": "", "mergedAt": None,
+                 "closedAt": None, "updatedAt": "2026-01-01T00:00:00Z"}
+        with patch.object(delivery, "_json", side_effect=[pr_value(), pr_value(), fence]), \
+             patch.object(delivery, "_required_checks", side_effect=[([], "none"), ([], "none")]), \
+             patch.object(delivery, "_threads", side_effect=[[], []]), \
+             patch.object(delivery, "remote_identity", return_value="o/r"), \
+             patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA, "b" * 40, SHA, "b" * 40, "d" * 40]), \
+             patch.object(delivery, "source_identity", side_effect=[DIGEST, DIGEST, DIGEST]):
+            with self.assertRaises(delivery.CandidateChanged):
+                delivery.read_pr(Path("."), URL, expected_repository="o/r")
 
     def test_hostile_gh_host_is_overridden(self):
         with patch.dict(delivery.os.environ, {"GH_HOST": "evil.invalid"}):

@@ -697,6 +697,30 @@ def read_pr(root: Path, url: str, *, expected_repository: str | None = None,
         raise CandidateChanged("final head identity mismatch")
     if expected_source_digest is not None and final_digest != expected_source_digest:
         raise CandidateChanged("final source identity mismatch")
+    # Authoritative trailing fence: no provider/network read follows this
+    # candidate PR/ref/source observation.
+    fence_fields = ("number,url,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,"
+                    "mergeStateStatus,mergeable,reviewDecision,mergedAt,closedAt,updatedAt")
+    fence = _json("gh", ["pr", "view", url, "--repo", _repo_arg(actual_repository), "--json", fence_fields], root)
+    allowed_fence = {"number", "url", "state", "isDraft", "baseRefName", "baseRefOid", "headRefName", "headRefOid",
+                     "mergeStateStatus", "mergeable", "reviewDecision", "mergedAt", "closedAt", "updatedAt"}
+    if not isinstance(fence, dict) or set(fence) != allowed_fence:
+        raise DeliveryError("final PR fence schema is invalid")
+    fenced_base_sha = pushed_head(root, fence["baseRefName"])
+    fenced_head_sha = pushed_head(root, fence["headRefName"])
+    fenced_digest = source_identity(root, fenced_head_sha)
+    scalar_fields = ("number", "url", "state", "isDraft", "baseRefName", "baseRefOid", "headRefName", "headRefOid",
+                     "mergeStateStatus", "mergeable", "reviewDecision", "mergedAt", "closedAt", "updatedAt")
+    if any(fence[field] != final_value[field] for field in scalar_fields) \
+            or fenced_base_sha != final_base_sha or fenced_head_sha != final_head_sha \
+            or fenced_digest != final_digest:
+        raise CandidateChanged("PR or remote branch identity changed during trailing readback fence")
+    if expected_base_sha is not None and fenced_base_sha != expected_base_sha:
+        raise CandidateChanged("trailing base identity mismatch")
+    if expected_head_sha is not None and fenced_head_sha != expected_head_sha:
+        raise CandidateChanged("trailing head identity mismatch")
+    if expected_source_digest is not None and fenced_digest != expected_source_digest:
+        raise CandidateChanged("trailing source identity mismatch")
     final_value["requiredChecks"] = final_checks
     final_value["requiredChecksStatus"] = final_status
     final_value["reviewThreads"] = final_threads
@@ -707,6 +731,10 @@ def read_pr(root: Path, url: str, *, expected_repository: str | None = None,
         "atomic": False,
         "dynamicCollections": ["reviews", "comments", "reviewRequests", "statusCheckRollup",
                                 "requiredChecks", "reviewThreads"],
+    }
+    final_value["collectionCompleteness"] = {
+        field: {"complete": False, "omitted": "unknown", "reason": "gh pr view bounded response has no pageInfo"}
+        for field in ("reviews", "comments", "reviewRequests", "statusCheckRollup")
     }
     return final_value
 

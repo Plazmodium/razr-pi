@@ -42,6 +42,7 @@ The selected public modules are:
 | test_public_boundary | Exact tree, ignored private extras, missing fixtures before execution, synthetic privacy patterns, links, traversal, output ownership, imports, resources and fixture drift; genuine normal/linked repository identity, ambient-Git override isolation, malformed/outside/missing/linked administration and query-error refusals |
 | test_context | M03 tracer and deterministic bounded selector: source/tests/config/Git selection, omission limits, stale Memory labels and closed safe-path requests |
 | test_named_regressions | Actual callback outcomes, subcases, fixture errors, skips/failures and explicit coverage mappings |
+| test_github_delivery | Bounded GitHub snapshot/read/create boundary: exact repository/base/head/source identity, host-pinned refs, required-check vocabulary/exits, provider schemas, two-pass stability, explicit incomplete collection metadata, candidate-bound recovery/compensation, and subprocess cleanup |
 
 Missing prerequisites/fixtures, import errors, failed tests, unexpected top-level skips/expected failures and unobserved module categories fail the runner. It retains named observations, source identities and raw-log hashes. Nested collector probes deliberately exercise failures/skips in isolated in-memory results; they are not outer-suite acceptance failures. Module observations identify selected coverage, not exhaustive security or semantic certification.
 
@@ -50,6 +51,16 @@ The public contract is newly authored, synthetic and unapproved. Test-owned copi
 ### M04 Herdr proof scope
 
 M04 is implemented and covered by focused provider regressions plus the full public runner. The proof includes structured capability/model/worktree/agent parsing, exact host identity, pending/bound private session evidence, append-only attempt settlement, bounded artifact collection, idempotent interruption, delegated cleanup, equal empty-root manifest digests with distinct root IDs/paths, and truthful UNKNOWN handling. It does not certify live Herdr/two-worker acceptance, execution of a model turn, human approval, independent critique, or campaign release gates.
+
+## M07 GitHub delivery proof scope
+
+`tests/test_github_delivery.py` is the focused regression suite for the shipped `packages/razr-pi/scripts/github-delivery.py` helper and its adapter. It covers the read-only `snapshot` and `read` operations plus the explicitly requested `create` boundary in mocked/owned fixtures. The helper requires explicit repository, base branch, head branch, full base/head SHAs, and source digest for create/read binding; it performs `gh auth status` but does not expose credentials.
+
+The delivery observation is bounded and non-atomic. PR scalar identity, GitHub API base/head refs, source digest, required checks, review threads, and visible PR collections are observed in two passes and movement refuses. Review/comment/request/status-rollup collections returned through `gh pr view` carry explicit `complete: false` metadata because that provider response supplies no page information; identical bounded prefixes are not treated as complete collections. Review-thread pagination is separately bounded and validates page advancement and total limits.
+
+Required checks are classified from actual `gh` exit semantics. No checks is an observed `none` status, not proof that tests ran or passed. Create requires separate explicit authority and may report `created-but-unverified` with compensation unavailable/uncertain after transport/output/recovery failures. Confirmed compensation closes only a target independently bound to the attempted repository, PR number/URL, base/head branch names, and base/head OIDs. The helper is not a PR factory and does not merge, deploy, mutate Razr lifecycle state, infer approval, launch critics, or replace final human PR review.
+
+The focused suite and authenticated product read prove only the exact source, provider observations, fixtures, and commands actually executed. They do not prove atomic GitHub snapshots, complete provider collections, human approval, tests having run remotely, merge authorization, deployment authorization, or final campaign acceptance.
 
 ## Proof limitations
 
