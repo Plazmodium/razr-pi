@@ -388,6 +388,39 @@ class MemoryTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "LEDGER_CORRUPT")
             self.assertFalse((root / ".razr/memory.jsonl").exists())
 
+    def test_post_flock_lock_path_replacement_fails_closed_without_race_proof(self):
+        actual_flock = __import__("fcntl").flock
+        replaced = {"done": False}
+        def replace_after_flock(fd, operation):
+            result = actual_flock(fd, operation)
+            if operation == __import__("fcntl").LOCK_EX and not replaced["done"]:
+                replaced["done"] = True
+                old = self.store.lock_path.with_name("memory.lock.old")
+                self.store.lock_path.rename(old)
+                self.store.lock_path.write_bytes(b"")
+            return result
+        with patch("adapter.memory.fcntl.flock", side_effect=replace_after_flock):
+            with self.assertRaises(ProtocolError) as caught:
+                self.store.remember(kind="learning", summary="pre-yield replacement", repository=self.repo)
+        self.assertEqual(caught.exception.code, "PATH_ESCAPE")
+        self.assertFalse(self.store.path.exists())
+        self.store.lock_path.unlink(); self.store.lock_path.with_name("memory.lock.old").unlink()
+
+        original_append = self.store._append_locked
+        def append_then_replace(storage_fd, record, rows):
+            result = original_append(storage_fd, record, rows)
+            old = self.store.lock_path.with_name("memory.lock.old")
+            self.store.lock_path.rename(old); self.store.lock_path.write_bytes(b"")
+            return result
+        with patch.object(self.store, "_append_locked", side_effect=append_then_replace):
+            with self.assertRaises(ProtocolError) as caught:
+                self.store.remember(kind="learning", summary="post-write replacement", repository=self.repo)
+        self.assertEqual(caught.exception.code, "PATH_ESCAPE")
+        self.store.lock_path.with_name("memory.lock.old").unlink()
+        with MemoryStore(self.root, repository=self.repo) as reopened:
+            records = reopened.inspect()
+        self.assertEqual([row["summary"] for row in records], ["post-write replacement"])
+
     def test_portable_paths_and_validate(self):
         record = self.store.remember(kind="preference", summary="portable", repository=self.repo,
                                      paths=["a/b.txt"])

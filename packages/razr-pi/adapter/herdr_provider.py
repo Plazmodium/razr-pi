@@ -22,7 +22,7 @@ import subprocess
 import shutil
 import stat
 import time
-from typing import Callable, Mapping, Sequence
+from typing import Callable, Iterator, Mapping, Sequence
 
 from .protocol import (ERROR_CODES, CoreRequest, ProtocolError, WorkflowRead,
                        canonical_json, raw_file_digest)
@@ -195,6 +195,96 @@ def _read_private_bytes(path: Path, private_root: Path, maximum: int = 1_048_576
     except OSError as exc: raise _fail("IDENTITY_MISMATCH", "private record is unavailable") from exc
 
 
+@contextmanager
+def _evidence_directory(root: Path, *, create: bool) -> Iterator[int]:
+    """Open worktree/.razr/evidence without following any pathname component."""
+    root = _canonical_dir(str(root), "evidence worktree")
+    nofollow = getattr(os, "O_NOFOLLOW", 0); directory = getattr(os, "O_DIRECTORY", 0)
+    rootfd = razrfd = evidencefd = -1
+    try:
+        rootfd = os.open(root, os.O_RDONLY | directory | nofollow)
+        parent = rootfd
+        for name, mode in ((".razr", 0o700), ("evidence", 0o700)):
+            created = False
+            if create:
+                try: os.mkdir(name, mode, dir_fd=parent); created = True
+                except FileExistsError: pass
+            child = os.open(name, os.O_RDONLY | directory | nofollow, dir_fd=parent)
+            info = os.fstat(child); path_info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+            if (not stat.S_ISDIR(info.st_mode) or info.st_nlink < 1
+                    or (info.st_dev, info.st_ino) != (path_info.st_dev, path_info.st_ino)):
+                os.close(child); raise _fail("PATH_ESCAPE", "evidence directory identity changed")
+            if created:
+                os.fchmod(child, mode); os.fsync(child); os.fsync(parent)
+            if name == ".razr": razrfd = child
+            else: evidencefd = child
+            parent = child
+        yield evidencefd
+    except ProtocolError:
+        raise
+    except FileNotFoundError as exc:
+        raise _fail("ARTIFACT_UNAVAILABLE", "evidence directory is unavailable") from exc
+    except OSError as exc:
+        raise _fail("PATH_ESCAPE", "evidence directory is linked or unavailable") from exc
+    finally:
+        for fd in (evidencefd, razrfd, rootfd):
+            if fd >= 0:
+                try: os.close(fd)
+                except OSError: pass
+
+
+def _evidence_name(name: str) -> str:
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,240}", name):
+        raise _fail("INVALID_REQUEST", "invalid evidence filename")
+    return name
+
+
+def _read_evidence_at(dirfd: int, name: str, maximum: int = 1_048_576) -> bytes:
+    name = _evidence_name(name)
+    try: fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+    except FileNotFoundError: raise
+    except OSError as exc: raise _fail("PATH_ESCAPE", "evidence file is linked or unavailable") from exc
+    try:
+        before = os.fstat(fd); path_info = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+        if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                or (before.st_dev, before.st_ino) != (path_info.st_dev, path_info.st_ino)):
+            raise _fail("PATH_ESCAPE", "evidence file identity is unsafe")
+        data = os.read(fd, maximum + 1); after = os.fstat(fd)
+        if len(data) > maximum: raise _fail("OUTPUT_LIMIT", "evidence file exceeds bound")
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            raise _fail("ARTIFACT_UNAVAILABLE", "evidence file changed during read")
+        return data
+    except FileNotFoundError: raise
+    except ProtocolError: raise
+    except OSError as exc: raise _fail("PATH_ESCAPE", "evidence file identity changed") from exc
+    finally: os.close(fd)
+
+
+def _write_evidence(root: Path, name: str, data: bytes, *, existing_ok: bool = False) -> str:
+    name = _evidence_name(name)
+    with _evidence_directory(root, create=True) as dirfd:
+        try:
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dirfd)
+        except FileExistsError:
+            if not existing_ok: raise
+            if _read_evidence_at(dirfd, name, len(data)) != data:
+                raise _fail("IDENTITY_MISMATCH", "existing evidence differs")
+            return ".razr/evidence/" + name
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data); stream.flush(); os.fsync(stream.fileno())
+        os.fsync(dirfd)
+    return ".razr/evidence/" + name
+
+
+def _evidence_ref_bytes(root: Path, ref: Mapping[str, object], maximum: int = 1_048_576) -> bytes:
+    relative = PurePosixPath(str(ref.get("ref", "")))
+    if len(relative.parts) != 3 or relative.parts[:2] != (".razr", "evidence"):
+        raise _fail("PATH_ESCAPE", "evidence reference escapes boundary")
+    name = _evidence_name(relative.parts[2])
+    with _evidence_directory(root, create=False) as dirfd:
+        return _read_evidence_at(dirfd, name, maximum)
+
+
 def _marker(root: Path, root_id: str, digest: str, *, create: bool) -> None:
     marker = root / ".razr-herdr-root.json"
     if marker.exists():
@@ -349,25 +439,10 @@ class AttemptLedger:
             try: root = self.path.parent.parent.resolve(strict=True)
             except OSError as exc: raise _fail("LEDGER_CORRUPT", "attempt worktree is unavailable") from exc
         for ref in event["evidence_refs"]:
-            relative = PurePosixPath(ref["ref"])
-            if len(relative.parts) < 3 or relative.parts[:2] != (".razr", "evidence"):
-                raise _fail("LEDGER_CORRUPT", "settlement evidence escapes attempt boundary")
-            fds = []
-            try:
-                current = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW); fds.append(current)
-                for part in relative.parts[:-1]:
-                    current = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=current); fds.append(current)
-                fd = os.open(relative.parts[-1], os.O_RDONLY | os.O_NOFOLLOW, dir_fd=current); fds.append(fd)
-                info = os.fstat(fd)
-                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1: raise _fail("LEDGER_CORRUPT", "settlement evidence is not a private regular file")
-                data = os.read(fd, 1_048_577)
-                if len(data) > 1_048_576: raise _fail("OUTPUT_LIMIT", "settlement evidence exceeds bound")
-            except ProtocolError: raise
-            except OSError as exc: raise _fail("LEDGER_CORRUPT", "settlement evidence is unavailable") from exc
-            finally:
-                for fd in reversed(fds):
-                    try: os.close(fd)
-                    except OSError: pass
+            try: data = _evidence_ref_bytes(root, ref)
+            except ProtocolError as exc:
+                if exc.code == "OUTPUT_LIMIT": raise
+                raise _fail("LEDGER_CORRUPT", "settlement evidence is unavailable") from exc
             actual = raw_file_digest(data)
             if ref["digest_domain"] == "canonical_json":
                 try:
@@ -932,8 +1007,8 @@ class HerdrProvider:
                                   and row["request_digest"] == request_digest), None)
                     if exact is not None:
                         return
-                    active = [row for row in rows if row["attempt_id"] in started_attempts]
-                    if any(row["root_id"] == root_id or row["path"] == str(root) for row in active):
+                    committed = [row for row in rows if row["attempt_id"] in started_attempts]
+                    if any(row["root_id"] == root_id or row["path"] == str(root) for row in committed):
                         raise _fail("RESOURCE_REUSED", "root identity or canonical path was previously claimed")
                     row = {"schema_version": 1, "root_id": root_id, "root_digest": root_digest, "path": str(root), "attempt_id": attempt_id, "request_digest": request_digest, "claimed_at": _now(), "prev_digest": previous}
                     row["record_digest"] = raw_file_digest(canonical_json(row)); stream.seek(0, 2); stream.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"); stream.flush(); os.fsync(stream.fileno()); fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
@@ -980,51 +1055,57 @@ class HerdrProvider:
                 "files": ((candidate_path, candidate_bytes), (packet_path, packet_bytes), (boundary_path, boundary_bytes))}
 
     def _cleanup_staged_evidence(self, material: Mapping[str, object]) -> None:
-        files = material["files"]
-        for path, data in files:
-            try:
-                if path.is_file() and not path.is_symlink() and path.read_bytes() == data:
-                    path.unlink()
-                temporary = path.with_name("." + path.name + ".staging")
-                if temporary.is_file() and not temporary.is_symlink():
-                    temporary.unlink()
-            except OSError:
-                continue
-        evidence = files[0][0].parent
+        files = material["files"]; root = files[0][0].parents[2]
         try:
-            if evidence.is_dir() and not any(evidence.iterdir()): evidence.rmdir()
-            razr = evidence.parent
-            if razr.is_dir() and not any(razr.iterdir()): razr.rmdir()
-        except OSError:
-            pass
+            with _evidence_directory(root, create=False) as dirfd:
+                for path, data in files:
+                    name = _evidence_name(path.name); temporary = "." + name + ".staging"
+                    try:
+                        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+                        try:
+                            info = os.fstat(fd); existing = os.read(fd, len(data) + 1)
+                            if stat.S_ISREG(info.st_mode) and info.st_nlink <= 2 and existing == data:
+                                os.unlink(name, dir_fd=dirfd)
+                        finally: os.close(fd)
+                    except FileNotFoundError: pass
+                    try:
+                        info = os.stat(temporary, dir_fd=dirfd, follow_symlinks=False)
+                        if stat.S_ISREG(info.st_mode) and info.st_nlink <= 2: os.unlink(temporary, dir_fd=dirfd)
+                    except FileNotFoundError: pass
+                os.fsync(dirfd)
+        except ProtocolError as exc:
+            if exc.code != "ARTIFACT_UNAVAILABLE": raise
 
     def _stage_attempt_evidence(self, material: Mapping[str, object]) -> None:
-        """Atomically stage exact evidence; crash remnants are idempotently adoptable."""
-        files = material["files"]
-        evidence = files[0][0].parent
+        """Atomically stage exact evidence through a no-follow worktree boundary."""
+        files = material["files"]; root = files[0][0].parents[2]
         try:
-            evidence.mkdir(parents=True, exist_ok=True)
-            dirfd = os.open(evidence, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            try:
+            with _evidence_directory(root, create=True) as dirfd:
                 for path, data in files:
-                    temporary = path.with_name("." + path.name + ".staging")
-                    if path.exists():
-                        if path.is_symlink() or not path.is_file() or path.read_bytes() != data:
-                            raise _fail("RESOURCE_REUSED", "attempt evidence identity conflicts")
-                        if temporary.exists() and temporary.is_file() and not temporary.is_symlink(): temporary.unlink()
+                    name = _evidence_name(path.name); temporary = "." + name + ".staging"
+                    try:
+                        existing = _read_evidence_at(dirfd, name, len(data))
+                    except FileNotFoundError:
+                        existing = None
+                    if existing is not None:
+                        if existing != data: raise _fail("RESOURCE_REUSED", "attempt evidence identity conflicts")
+                        try:
+                            info = os.stat(temporary, dir_fd=dirfd, follow_symlinks=False)
+                            if not stat.S_ISREG(info.st_mode) or info.st_nlink > 2: raise _fail("PATH_ESCAPE", "attempt evidence staging path is unsafe")
+                            os.unlink(temporary, dir_fd=dirfd)
+                        except FileNotFoundError: pass
                         continue
-                    if temporary.exists():
-                        if temporary.is_symlink() or not temporary.is_file():
-                            raise _fail("RESOURCE_REUSED", "attempt evidence staging path is unsafe")
-                        temporary.unlink()
-                    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                    try:
+                        info = os.stat(temporary, dir_fd=dirfd, follow_symlinks=False)
+                        if not stat.S_ISREG(info.st_mode) or info.st_nlink > 2: raise _fail("PATH_ESCAPE", "attempt evidence staging path is unsafe")
+                        os.unlink(temporary, dir_fd=dirfd)
+                    except FileNotFoundError: pass
+                    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dirfd)
                     with os.fdopen(fd, "wb") as stream:
                         stream.write(data); stream.flush(); os.fsync(stream.fileno())
-                    try: os.link(temporary, path)
+                    try: os.link(temporary, name, src_dir_fd=dirfd, dst_dir_fd=dirfd, follow_symlinks=False)
                     except FileExistsError as exc: raise _fail("RESOURCE_REUSED", "attempt evidence raced") from exc
-                    temporary.unlink(); os.fsync(dirfd)
-            finally:
-                os.close(dirfd)
+                    os.unlink(temporary, dir_fd=dirfd); os.fsync(dirfd)
         except ProtocolError:
             self._cleanup_staged_evidence(material)
             raise
@@ -1133,23 +1214,23 @@ class HerdrProvider:
                     continue
                 if not isinstance(value["evidence"], list) or len(value["evidence"]) != 3:
                     raise _fail("LEDGER_CORRUPT", "prepared evidence list is malformed")
-                evidence_parent: Path | None = None
-                for item in value["evidence"]:
-                    if not isinstance(item, dict) or set(item) != {"ref", "digest"}: raise _fail("LEDGER_CORRUPT", "prepared evidence is malformed")
-                    ref = PurePosixPath(item["ref"]); _digest(item["digest"], "prepared evidence digest")
-                    if ref.is_absolute() or ".." in ref.parts: raise _fail("PATH_ESCAPE", "prepared evidence escapes worktree")
-                    evidence_path = worktree.joinpath(*ref.parts); evidence_parent = evidence_path.parent
-                    temporary = evidence_path.with_name("." + evidence_path.name + ".staging")
-                    try:
-                        if evidence_path.is_file() and not evidence_path.is_symlink() and raw_file_digest(evidence_path.read_bytes()) == item["digest"]:
-                            evidence_path.unlink()
-                        if temporary.is_file() and not temporary.is_symlink() and temporary.stat().st_nlink <= 2:
-                            temporary.unlink()
-                    except OSError as exc: raise _fail("ARTIFACT_UNAVAILABLE", "prepared evidence cleanup failed") from exc
                 try:
-                    if evidence_parent is not None and evidence_parent.is_dir() and not any(evidence_parent.iterdir()): evidence_parent.rmdir()
-                    if evidence_parent is not None and evidence_parent.parent.is_dir() and not any(evidence_parent.parent.iterdir()): evidence_parent.parent.rmdir()
-                except OSError: pass
+                    with _evidence_directory(worktree, create=False) as dirfd:
+                        for item in value["evidence"]:
+                            if not isinstance(item, dict) or set(item) != {"ref", "digest"}: raise _fail("LEDGER_CORRUPT", "prepared evidence is malformed")
+                            ref = PurePosixPath(item["ref"]); _digest(item["digest"], "prepared evidence digest")
+                            if ref.parts[:2] != (".razr", "evidence") or len(ref.parts) != 3: raise _fail("PATH_ESCAPE", "prepared evidence escapes worktree")
+                            name = _evidence_name(ref.name); temporary = "." + name + ".staging"
+                            try:
+                                if raw_file_digest(_read_evidence_at(dirfd, name)) == item["digest"]: os.unlink(name, dir_fd=dirfd)
+                            except FileNotFoundError: pass
+                            try:
+                                info = os.stat(temporary, dir_fd=dirfd, follow_symlinks=False)
+                                if stat.S_ISREG(info.st_mode) and info.st_nlink <= 2: os.unlink(temporary, dir_fd=dirfd)
+                            except FileNotFoundError: pass
+                        os.fsync(dirfd)
+                except ProtocolError as exc:
+                    if exc.code != "ARTIFACT_UNAVAILABLE": raise
             self._remove_prepared(path)
 
     @contextmanager
@@ -1239,14 +1320,12 @@ class HerdrProvider:
                 remaining = self._remaining_ms(deadline_at, deadline)
                 response = self._exec([self.herdr, "agent", "start", value["worker_id"], "--kind", "pi", "--pane", _target(value["host"])["pane_id"], "--timeout", str(remaining), "--", "--model", _MODEL, "--thinking", "medium", "--session-dir", value["session_root"], "--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve"], timeout_ms=remaining, cwd=_canonical_dir(value["cwd"], "cwd"), max_output=value["limits"]["max_output_bytes"], deadline_at=deadline_at)
             except ProtocolError as exc:
-                failure = _canonical_dir(value["worktree"], "worktree") / ".razr" / "evidence" / ("launch-failure-" + value["attempt_id"] + ".json")
                 launch_code = exc.code if exc.code in _LAUNCH_EVIDENCE_CODES else "LAUNCH_FAILED"
                 data = canonical_json({"error_code": launch_code, "cause": exc.code, "message": str(exc)[:500]}) + b"\n"
                 try:
-                    fd = os.open(failure, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                    with os.fdopen(fd, "wb") as stream: stream.write(data); stream.flush(); os.fsync(stream.fileno())
-                    failure_ref = {"ref": str(failure.relative_to(_canonical_dir(value["worktree"], "worktree"))), "digest_domain": "raw_file", "digest": raw_file_digest(data), "kind": "launch_failure", "error_code": launch_code}
-                except OSError:
+                    failure_ref = {"ref": _write_evidence(_canonical_dir(value["worktree"], "worktree"), "launch-failure-" + value["attempt_id"] + ".json", data),
+                                   "digest_domain": "raw_file", "digest": raw_file_digest(data), "kind": "launch_failure", "error_code": launch_code}
+                except (OSError, ProtocolError):
                     failure_ref = dict(evidence["launch_boundary"]); failure_ref.update({"kind": "launch_failure", "error_code": "LAUNCH_FAILED"})
                 settled = {key: started[key] for key in ("schema_version", "attempt_id", "work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "worktree_ref", "branch", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest", "herdr")}
                 settled.update({"event": "SETTLED", "settled_at": _now(), "outcome": "UNKNOWN" if exc.code in {"TIMEOUT", "CLEANUP_UNKNOWN"} else "FAILED", "evidence_refs": [failure_ref], "prev_digest": started["record_digest"], "cleanup": "uncertain" if exc.code == "CLEANUP_UNKNOWN" else "not_applicable"})
@@ -1335,13 +1414,11 @@ class HerdrProvider:
             raise
 
     def _public_evidence(self, attempt_id: str, name: str, summary: Mapping[str, object]) -> dict[str, object]:
-        root = self._attempt_paths[attempt_id]; directory = root / ".razr" / "evidence"; directory.mkdir(parents=True, exist_ok=True)
+        root = self._attempt_paths[attempt_id]
         data = canonical_json({"schema_version": 1, "attempt_id": attempt_id, "summary": dict(summary)})
         if len(data) > 65_536: raise _fail("OUTPUT_LIMIT", "sanitized evidence exceeds bound")
-        path = directory / (name + "-" + attempt_id + ".json")
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as stream: stream.write(data); stream.flush(); os.fsync(stream.fileno())
-        return {"ref": str(path.relative_to(root)), "kind": str(summary["kind"]), "digest_domain": "raw_file", "digest": raw_file_digest(data)}
+        ref = _write_evidence(root, name + "-" + attempt_id + ".json", data)
+        return {"ref": ref, "kind": str(summary["kind"]), "digest_domain": "raw_file", "digest": raw_file_digest(data)}
 
     def _settle(self, handle: Mapping[str, object], outcome: str, *, cleanup: str = "not_applicable", reason: str = "", evidence_refs: Sequence[Mapping[str, object]] = (), synthetic: bool = True) -> None:
         if self.ledger is None: raise _fail("LEDGER_CORRUPT", "settlement ledger is unavailable")
@@ -1351,29 +1428,16 @@ class HerdrProvider:
             return
         root = self._attempt_paths.get(handle["attempt_id"])
         if root is None: raise _fail("ARTIFACT_UNAVAILABLE", "attempt worktree is not retained")
-        evidence_dir = root / ".razr" / "evidence"; evidence_dir.mkdir(parents=True, exist_ok=True)
-        artifact = evidence_dir / ("settled-" + handle["attempt_id"] + ".json")
+        artifact_name = "settled-" + handle["attempt_id"] + ".json"
         data = canonical_json({"attempt_id": handle["attempt_id"], "outcome": outcome, "reason": reason[:500]})
         collected = [dict(ref) for ref in evidence_refs]
         for ref in collected: AttemptLedger._ref(ref, "evidence_ref")
         if synthetic:
-            try:
-                fd = os.open(artifact, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                with os.fdopen(fd, "wb") as stream: stream.write(data); stream.flush(); os.fsync(stream.fileno())
-            except FileExistsError:
-                existing = b""
-                try:
-                    for _ in range(20):
-                        existing = artifact.read_bytes()
-                        if existing == data: break
-                        time.sleep(0.005)
-                except OSError as exc: raise _fail("ARTIFACT_UNAVAILABLE", "settlement evidence raced and is unavailable") from exc
-                if existing != data:
-                    raise _fail("IDENTITY_MISMATCH", "settlement evidence raced with a different outcome")
+            _write_evidence(root, artifact_name, data, existing_ok=True)
         started = next((row for row in durable if row["attempt_id"] == handle["attempt_id"] and row["event"] == "STARTED"), None)
         if started is None: raise _fail("INVALID_ORDER", "settlement has no STARTED event")
         settled = {key: started[key] for key in ("schema_version", "attempt_id", "work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "worktree_ref", "branch", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest", "herdr")}
-        supplemental = [{"ref": str(artifact.relative_to(root)), "digest_domain": "raw_file", "digest": raw_file_digest(data), "kind": "result"}] if synthetic else []
+        supplemental = [{"ref": ".razr/evidence/" + artifact_name, "digest_domain": "raw_file", "digest": raw_file_digest(data), "kind": "result"}] if synthetic else []
         settled.update({"event": "SETTLED", "settled_at": _now(), "outcome": outcome, "evidence_refs": collected + supplemental, "prev_digest": started["record_digest"], "cleanup": cleanup})
         self.ledger._verify_settlement_evidence(settled, root)
         settled["record_digest"] = raw_file_digest(canonical_json(settled))
@@ -1391,12 +1455,21 @@ class HerdrProvider:
         if private is None or private["session_status"] == "bound": return True
         private_base = _canonical_dir(str(self.private_root), "private_root")
         existing_record = private_base / private["session_record_ref"]
-        if existing_record.exists():
+        binding_path = private_base / private["session_binding_ref"]
+        if existing_record.exists() and binding_path.exists():
             self._handle(value)
             return True
+        if binding_path.exists() and not existing_record.exists():
+            raise _fail("IDENTITY_MISMATCH", "session binding exists without its session record")
         session_root = _canonical_dir(private["paths"]["session_root"], "session_root")
         candidate_path = None
-        for attempt in range(3):
+        if existing_record.exists():
+            try: staged = _strict_json(_read_private_bytes(existing_record, private_base))
+            except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+                raise _fail("IDENTITY_MISMATCH", "staged session record is malformed") from exc
+            if isinstance(staged, dict) and isinstance(staged.get("pi_session_path"), str):
+                candidate_path = Path(staged["pi_session_path"])
+        for attempt in range(3 if candidate_path is None else 0):
             observed = _envelope(self._exec([self.herdr, "agent", "get", value["handle_id"]], timeout_ms=_CLI_TIMEOUT_MS), "agent get", {"cli:agent:get"})["result"]
             agent = observed.get("agent") if isinstance(observed, dict) and isinstance(observed.get("agent"), dict) else observed
             session = agent.get("agent_session") if isinstance(agent, dict) else None
@@ -1406,6 +1479,13 @@ class HerdrProvider:
                 except OSError: canonical = None
                 if canonical is not None and path == canonical and canonical.is_relative_to(session_root) and canonical.is_file() and not canonical.is_symlink() and stat_result.st_nlink == 1: candidate_path = canonical; break
             if attempt < 2: time.sleep(0.05)
+        if candidate_path is not None:
+            try: candidate_stat = candidate_path.stat()
+            except OSError as exc: raise _fail("IDENTITY_MISMATCH", "staged session path is unavailable") from exc
+            if (not candidate_path.is_absolute() or candidate_path != candidate_path.resolve(strict=False)
+                    or not candidate_path.is_relative_to(session_root) or candidate_path.parent != session_root
+                    or not candidate_path.is_file() or candidate_path.is_symlink() or candidate_stat.st_nlink != 1):
+                raise _fail("IDENTITY_MISMATCH", "staged session path identity differs")
         if candidate_path is None:
             dirfd = os.open(session_root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             try:
@@ -1430,17 +1510,23 @@ class HerdrProvider:
         record = {"schema_version": 1, "kind": "pi_session", "handle_id": value["handle_id"], "attempt_id": value["attempt_id"], "request_digest": value["request_digest"], "host": value["host"], "pi_session_path": str(candidate_path), "pi_session_id": opaque}
         record["record_digest"] = raw_file_digest(canonical_json(record))
         path = private_base / private["session_record_ref"]
-        try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "wb") as stream: stream.write(canonical_json(record)); stream.flush(); os.fsync(stream.fileno())
-        except FileExistsError as exc: raise _fail("RESOURCE_REUSED", "session binding already exists") from exc
-        binding = {"schema_version": 1, "kind": "pi_session_binding", "handle_record_digest": private["record_digest"], "session_record_digest": record["record_digest"], "attempt_id": value["attempt_id"], "request_digest": value["request_digest"], "host": value["host"], "bound_at": _now()}
-        binding["record_digest"] = raw_file_digest(canonical_json(binding))
-        binding_path = private_base / private["session_binding_ref"]
-        try:
-            fd = os.open(binding_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "wb") as stream: stream.write(canonical_json(binding)); stream.flush(); os.fsync(stream.fileno())
-        except FileExistsError as exc: raise _fail("RESOURCE_REUSED", "session binding event already exists") from exc
+        with self._dispatch_lock():
+            if path.exists():
+                try: existing = _strict_json(_read_private_bytes(path, private_base))
+                except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError) as exc: raise _fail("IDENTITY_MISMATCH", "session record is malformed") from exc
+                if existing != record: raise _fail("IDENTITY_MISMATCH", "session record identity conflicts")
+            else:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, "wb") as stream: stream.write(canonical_json(record)); stream.flush(); os.fsync(stream.fileno())
+            if not binding_path.exists():
+                binding = {"schema_version": 1, "kind": "pi_session_binding", "handle_record_digest": private["record_digest"], "session_record_digest": record["record_digest"], "attempt_id": value["attempt_id"], "request_digest": value["request_digest"], "host": value["host"], "bound_at": _now()}
+                binding["record_digest"] = raw_file_digest(canonical_json(binding))
+                fd = os.open(binding_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, "wb") as stream: stream.write(canonical_json(binding)); stream.flush(); os.fsync(stream.fileno())
+            handles_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try: os.fsync(handles_fd)
+            finally: os.close(handles_fd)
+        self._handle(value)
         return True
 
     def _verify_root_claim(self, root: Path, root_id: str, root_digest: str) -> None:
@@ -1533,6 +1619,21 @@ class HerdrProvider:
         if not isinstance(binding_ref, str) or PurePosixPath(binding_ref).is_absolute() or ".." in PurePosixPath(binding_ref).parts: raise _fail("PATH_ESCAPE", "session binding reference escapes root")
         binding_path = private_base / binding_ref
         session_exists = session_record_path.exists(); binding_exists = binding_path.exists()
+        if session_exists and not binding_exists and private["session_status"] == "pending" and "pending_record" in locals():
+            # The session record is recoverable staging; publish the authoritative
+            # binding under the provider lock before accepting durable bound state.
+            recovered_binding = {"schema_version": 1, "kind": "pi_session_binding", "handle_record_digest": private["record_digest"],
+                                 "session_record_digest": pending_record["record_digest"], "attempt_id": value["attempt_id"],
+                                 "request_digest": value["request_digest"], "host": value["host"], "bound_at": _now()}
+            recovered_binding["record_digest"] = raw_file_digest(canonical_json(recovered_binding))
+            with self._dispatch_lock():
+                if not binding_path.exists():
+                    fd = os.open(binding_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                    with os.fdopen(fd, "wb") as stream: stream.write(canonical_json(recovered_binding)); stream.flush(); os.fsync(stream.fileno())
+                    handles_fd = os.open(binding_path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                    try: os.fsync(handles_fd)
+                    finally: os.close(handles_fd)
+            binding_exists = binding_path.exists()
         if session_exists != binding_exists: raise _fail("IDENTITY_MISMATCH", "incomplete session binding chain")
         if session_exists:
             try: binding = _strict_json(_read_private_bytes(binding_path, private_base))
@@ -1557,11 +1658,10 @@ class HerdrProvider:
         started = next((row for row in records if row["event"] == "STARTED" and row["attempt_id"] == value["attempt_id"]), None)
         settled = next((row for row in records if row["event"] == "SETTLED" and row["attempt_id"] == value["attempt_id"]), None)
         if settled is not None: self._settled.add(value["attempt_id"])
-        packet_path = Path(paths["worktree"]) / started["request_packet"]["ref"] if started is not None else Path("/")
         try:
-            packet_bytes = packet_path.read_bytes()
+            packet_bytes = _evidence_ref_bytes(Path(paths["worktree"]), started["request_packet"]) if started is not None else b""
             packet = _strict_json(packet_bytes)
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError, ProtocolError) as exc:
             raise _fail("IDENTITY_MISMATCH", "request packet is unavailable") from exc
         if started is not None and raw_file_digest(packet_bytes) != started["request_packet"]["digest"]:
             raise _fail("DIGEST_MISMATCH", "request packet digest differs")
@@ -1583,26 +1683,12 @@ class HerdrProvider:
         evidence = request["retained_evidence"]
         if not isinstance(evidence, list) or not evidence: raise _fail("ARTIFACT_UNAVAILABLE", "retained recovery evidence is required")
         checked_evidence = []
-        evidence_root = worktree / ".razr" / "evidence"
         for ref in evidence:
             try: AttemptLedger._ref(ref, "evidence_ref")
             except ProtocolError as exc:
                 if exc.code == "PATH_ESCAPE": raise
                 raise _fail("ARTIFACT_UNAVAILABLE", "invalid retained evidence reference") from exc
-            relative = PurePosixPath(ref["ref"])
-            if len(relative.parts) < 3 or relative.parts[:2] != (".razr", "evidence"):
-                raise _fail("PATH_ESCAPE", "retained evidence is outside the evidence boundary")
-            path = worktree.joinpath(*relative.parts)
-            cursor = worktree
-            for part in relative.parts:
-                cursor = cursor / part
-                if cursor.is_symlink(): raise _fail("PATH_ESCAPE", "retained evidence contains a symlink")
-            try: resolved = path.resolve(strict=True)
-            except OSError as exc: raise _fail("ARTIFACT_UNAVAILABLE", "retained evidence is missing") from exc
-            if not resolved.is_relative_to(evidence_root) or resolved.is_symlink() or not resolved.is_file(): raise _fail("PATH_ESCAPE", "retained evidence escapes boundary")
-            try:
-                data = resolved.read_bytes()
-            except OSError as exc: raise _fail("ARTIFACT_UNAVAILABLE", "retained evidence cannot be read") from exc
+            data = _evidence_ref_bytes(worktree, ref)
             if len(data) > 1_048_576: raise _fail("OUTPUT_LIMIT", "retained evidence exceeds bound")
             actual = raw_file_digest(data) if ref["digest_domain"] == "raw_file" else None
             if ref["digest_domain"] == "canonical_json":

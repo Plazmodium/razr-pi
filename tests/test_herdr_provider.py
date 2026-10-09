@@ -344,7 +344,15 @@ class HerdrProviderTests(unittest.TestCase):
             self.assertEqual(len(settled["evidence_refs"][:2]), 2)
             self.assertTrue(all(ref["ref"].startswith(".razr/evidence/") and not ref["ref"].startswith("private/") for ref in settled["evidence_refs"][:2]))
             self.assertTrue(all(set(ref) == {"ref", "kind", "digest_domain", "digest"} for ref in settled["evidence_refs"][:2]))
-            cleanup_result = collected.cleanup(handle)
+            self.assertEqual(json.loads((private / "handles/handle-worker-1.json").read_text())["session_status"], "pending")
+            binding_path = private / "handles/pi-binding-worker-1.json"
+            self.assertTrue(binding_path.is_file())
+            binding_path.unlink()  # simulate interruption after the durable session record
+            restarted = HerdrProvider(runner=run, ledger=ledger, private_root=private)
+            self.assertEqual(restarted.inspect({"schema_version": 1, "request_id": "inspect-after-bind", "handle": handle})["request_id"], "inspect-after-bind")
+            self.assertTrue(binding_path.is_file())
+            self.assertEqual(sum(row["event"] == "SETTLED" for row in ledger.records()), 1)
+            cleanup_result = restarted.cleanup(handle)
             self.assertEqual(cleanup_result["cleanup"], "confirmed"); self.assertEqual(cleanup_result["status"], "ACTIVE")
             with self.assertRaises(ProtocolError): collected._handle({**handle, "request_digest": "sha256:" + "d" * 64})
             self.assertEqual(len(ledger.path.read_text().splitlines()), 2)
@@ -358,7 +366,7 @@ class HerdrProviderTests(unittest.TestCase):
 
     def test_interrupt_repeat_is_idempotent_and_conflict_refuses_reuse(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp); session = root / "session"; session.mkdir()
+            root = Path(tmp).resolve(); session = root / "session"; session.mkdir()
             value = {"attempt_id": "att-repeat", "handle_id": "agent-repeat", "request_digest": "sha256:" + "a" * 64, "host": execution_host()}
             provider = HerdrProvider(runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, b"", b""))
             provider._attempt_sessions[value["attempt_id"]] = session; provider._attempt_paths[value["attempt_id"]] = root
@@ -371,7 +379,7 @@ class HerdrProviderTests(unittest.TestCase):
 
     def test_successful_interrupt_uses_real_settlement_without_response_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp); session = root / "session"; session.mkdir(); evidence = root / ".razr" / "evidence"; evidence.mkdir(parents=True)
+            root = Path(tmp).resolve(); session = root / "session"; session.mkdir(); evidence = root / ".razr" / "evidence"; evidence.mkdir(parents=True)
             packet = root / ".razr" / "request.json"; packet.write_bytes(b"{}")
             candidate_file = evidence / "candidate.json"; candidate_file.write_bytes(b"{}")
             digest = "sha256:" + "a" * 64; ref = {"ref": ".razr/evidence/candidate.json", "digest_domain": "canonical_json", "digest": raw_file_digest(b"{}")}; packet_ref = {"ref": ".razr/request.json", "digest_domain": "canonical_json", "digest": raw_file_digest(b"{}")}
@@ -587,6 +595,41 @@ class HerdrProviderTests(unittest.TestCase):
             self.assertFalse((worktree / ".razr").exists())
             self.assertEqual(list(output.iterdir()), []); self.assertEqual(list(session.iterdir()), [])
 
+    def test_evidence_parent_symlinks_refuse_without_outside_write_or_event(self):
+        for linked_component in (".razr", "evidence"):
+            with self.subTest(component=linked_component), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp).resolve(); request, current, probe, private, worktree, _, _ = request_fixture(base, "att-linked-" + linked_component.strip("."))
+                outside = base / "outside"; outside.mkdir()
+                if linked_component == ".razr":
+                    (worktree / ".razr").symlink_to(outside, target_is_directory=True)
+                else:
+                    (worktree / ".razr").mkdir(); (worktree / ".razr/evidence").symlink_to(outside, target_is_directory=True)
+                ledger = AttemptLedger(base / "attempts.jsonl")
+                provider = HerdrProvider(runner=lambda argv, **kwargs: (_ for _ in ()).throw(AssertionError(argv)), ledger=ledger, private_root=private)
+                with patch.object(provider, "probe", return_value=probe), patch.object(provider, "_verify_candidate"), \
+                     patch.object(provider, "_read_current_work", return_value=current):
+                    with self.assertRaises(ProtocolError) as caught: provider.launch(request)
+                self.assertEqual(caught.exception.code, "PATH_ESCAPE")
+                self.assertEqual(list(outside.iterdir()), []); self.assertFalse(ledger.path.exists())
+                self.assertFalse((private / "root-claims.jsonl").exists())
+
+    def test_launch_failure_evidence_refuses_swapped_parent_without_outside_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve(); request, current, probe, private, worktree, _, _ = request_fixture(base, "att-launch-link")
+            outside = base / "outside"; outside.mkdir(); ledger = AttemptLedger(base / "attempts.jsonl")
+            provider = HerdrProvider(runner=lambda argv, **kwargs: subprocess.CompletedProcess(argv, 7, b"", b"failed"), ledger=ledger, private_root=private)
+            checks = {"count": 0}
+            def swap_before_start(*args, **kwargs):
+                checks["count"] += 1
+                if checks["count"] == 2:
+                    evidence = worktree / ".razr/evidence"; evidence.rename(worktree / ".razr/evidence-retained")
+                    evidence.symlink_to(outside, target_is_directory=True)
+            with patch.object(provider, "probe", return_value=probe), patch.object(provider, "_verify_candidate", side_effect=swap_before_start), \
+                 patch.object(provider, "_read_current_work", return_value=current):
+                with self.assertRaises(ProtocolError): provider.launch(request)
+            self.assertFalse(any(path.name.startswith("launch-failure-") for path in outside.iterdir()))
+            self.assertEqual([row["event"] for row in ledger.records()], ["STARTED"])
+
     def test_dispatch_transaction_failures_retry_or_settle_without_double_launch(self):
         def run(provider, request, current, probe):
             with patch.object(provider, "probe", return_value=probe), \
@@ -612,7 +655,7 @@ class HerdrProviderTests(unittest.TestCase):
                     return result
                 with patch("adapter.herdr_provider.os.link", side_effect=fail_link):
                     with self.assertRaises(ProtocolError) as caught: run(provider, request, current, probe)
-                self.assertEqual(caught.exception.code, "ARTIFACT_UNAVAILABLE")
+                self.assertIn(caught.exception.code, {"ARTIFACT_UNAVAILABLE", "PATH_ESCAPE"})
                 self.assertFalse(ledger.path.exists()); self.assertFalse((private / "root-claims.jsonl").exists())
                 self.assertEqual(list(private.glob("dispatch-prepared-*.json")), [])
                 evidence = worktree / ".razr/evidence"
@@ -638,7 +681,7 @@ class HerdrProviderTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, "LOCK_UNAVAILABLE")
             self.assertFalse(ledger.path.exists()); self.assertFalse((private / "root-claims.jsonl").exists())
             self.assertEqual(list(private.glob("dispatch-prepared-*.json")), [])
-            self.assertFalse((worktree / ".razr/evidence").exists())
+            self.assertFalse(any((worktree / ".razr/evidence").iterdir()))
             with self.assertRaises(ProtocolError): run(provider, request, current, probe)
             self.assertEqual(len(starts), 1)
             self.assertEqual([row["event"] for row in ledger.records()], ["STARTED", "SETTLED"])
@@ -674,6 +717,34 @@ class HerdrProviderTests(unittest.TestCase):
                 with self.assertRaises(ProtocolError) as caught: run(restarted, request, current, probe)
                 self.assertEqual(caught.exception.code, "DUPLICATE_ATTEMPT")
                 self.assertEqual(starts, [])
+
+    def test_committed_root_path_remains_consumed_after_settlement_and_recreation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve(); request, current, probe, private, _, output, _ = request_fixture(base, "att-root-original")
+            ledger = AttemptLedger(base / "attempts.jsonl"); starts = []
+            def runner(argv, **kwargs):
+                if argv[:3] == ["herdr", "agent", "start"]:
+                    starts.append(argv); return subprocess.CompletedProcess(argv, 7, b"", b"failed")
+                raise AssertionError(argv)
+            provider = HerdrProvider(runner=runner, ledger=ledger, private_root=private)
+            def launch(instance, value):
+                with patch.object(instance, "probe", return_value=probe), patch.object(instance, "_verify_candidate"), \
+                     patch.object(instance, "_read_current_work", return_value=current):
+                    return instance.launch(value)
+            with self.assertRaises(ProtocolError): launch(provider, request)
+            self.assertEqual(len(starts), 1); self.assertEqual([row["event"] for row in ledger.records()], ["STARTED", "SETTLED"])
+            __import__("shutil").rmtree(output); output.mkdir()
+            session2 = private / "session-recreated"; session2.mkdir()
+            second = json.loads(json.dumps(request)); second.update({"request_id": "exec-root-recreated", "attempt_id": "att-root-recreated",
+                "allowance_id": "allow-root-recreated", "worker_id": "worker-root-recreated",
+                "output_root_id": "out-root-recreated", "session_root": str(session2), "session_root_id": "sess-root-recreated"})
+            restarted = HerdrProvider(runner=runner, ledger=ledger, private_root=private)
+            with self.assertRaises(ProtocolError) as caught: launch(restarted, second)
+            self.assertEqual(caught.exception.code, "RESOURCE_REUSED")
+            self.assertEqual(len(starts), 1)
+            self.assertEqual([row["event"] for row in ledger.records()], ["STARTED", "SETTLED", "STARTED", "SETTLED"])
+            claims = [json.loads(line) for line in (private / "root-claims.jsonl").read_text().splitlines()]
+            self.assertEqual(sum(row["path"] == str(output) for row in claims), 1)
 
     def test_pre_started_crash_staging_is_reconciled_and_exactly_retryable(self):
         with tempfile.TemporaryDirectory() as tmp:
