@@ -38,6 +38,34 @@ class GithubDeliveryTests(unittest.TestCase):
              patch.object(delivery, "_run", return_value=SHA):
             self.assertEqual(delivery.pushed_head(Path("."), "feature"), SHA)
 
+    def test_source_identity_matches_core_for_default_and_custom_work_roots(self):
+        from adapter.core_subprocess import _source_digest
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=root, check=True)
+            config = {"schema_version": 1, "work_root": ".razr/work", "retention": "commit",
+                      "adapter": {"mode": "process-local", "max_active_work_items": 5,
+                                  "queue_order": ["priority", "approved_at", "id"]}}
+            (root / "razr.yaml").write_text(json.dumps(config) + "\n")
+            (root / "source.txt").write_text("source")
+            (root / ".razr/work").mkdir(parents=True)
+            (root / ".razr/work/hidden.txt").write_text("hidden")
+            (root / "AGENTS.md").write_text("instructions")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "fixture"], cwd=root, check=True)
+            commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            self.assertEqual(delivery.source_identity(root, commit), _source_digest(root, commit))
+            config["work_root"] = ".workflow/data"
+            (root / "razr.yaml").write_text(json.dumps(config) + "\n")
+            (root / ".workflow/data").mkdir(parents=True)
+            (root / ".workflow/data/hidden.txt").write_text("hidden")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "custom"], cwd=root, check=True)
+            commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            self.assertEqual(delivery.source_identity(root, commit), _source_digest(root, commit))
+
     def test_snapshot_has_source_identity_and_base_head(self):
         with patch.object(delivery, "remote_identity", return_value="o/r"), \
              patch.object(delivery, "pushed_head", side_effect=[SHA, "b" * 40]), \
@@ -59,6 +87,13 @@ class GithubDeliveryTests(unittest.TestCase):
                                       expected_source_digest=DIGEST)
             self.assertEqual(result["repository"], "o/r")
             self.assertEqual(result["sourceDigest"], DIGEST)
+
+    def test_merge_state_uses_live_graphql_enum(self):
+        delivery._validate_pr(pr_value(mergeStateStatus="HAS_HOOKS"), URL, "o", "r", 1)
+        with self.assertRaises(delivery.DeliveryError):
+            delivery._validate_pr(pr_value(mergeStateStatus="HAS_HOOK_ERRORS"), URL, "o", "r", 1)
+        with self.assertRaises(delivery.DeliveryError):
+            delivery._validate_pr(pr_value(mergeStateStatus="DRAFT"), URL, "o", "r", 1)
 
     def test_realistic_populated_pr_schema_validates(self):
         realistic = pr_value(
@@ -88,6 +123,20 @@ class GithubDeliveryTests(unittest.TestCase):
                  patch.object(delivery, "source_identity", return_value=DIGEST):
                 with self.assertRaises(delivery.DeliveryError):
                     delivery.read_pr(Path("."), URL, **kwargs)
+
+    def test_final_readback_fence_rejects_dynamic_collection_change(self):
+        changed = pr_value(comments=[{"id": "c", "author": None, "authorAssociation": "NONE", "body": "x",
+                                      "createdAt": None, "includesCreatedEdit": False, "isMinimized": False,
+                                      "minimizedReason": None, "reactionGroups": [], "updatedAt": None,
+                                      "url": None, "viewerDidAuthor": False}])
+        with patch.object(delivery, "_json", side_effect=[pr_value(), changed]), \
+             patch.object(delivery, "_required_checks", return_value=([], "none")), \
+             patch.object(delivery, "_threads", return_value=[]), \
+             patch.object(delivery, "remote_identity", return_value="o/r"), \
+             patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA, "b" * 40, SHA]), \
+             patch.object(delivery, "source_identity", side_effect=[DIGEST, DIGEST]):
+            with self.assertRaises(delivery.CandidateChanged):
+                delivery.read_pr(Path("."), URL, expected_repository="o/r")
 
     def test_final_readback_fence_rejects_moved_head(self):
         moved = "d" * 40
@@ -193,12 +242,36 @@ class GithubDeliveryTests(unittest.TestCase):
              patch.object(delivery, "_json", return_value=[]), patch.object(delivery, "_run", return_value=URL), \
              patch.object(delivery, "read_pr", side_effect=delivery.IdentityMismatch("PR head commit mismatch")), \
              patch.object(delivery, "_close_created", side_effect=delivery.DeliveryError("close failed")) as close:
-            with self.assertRaises(delivery.CandidateChanged) as raised:
+            with self.assertRaises(delivery.IdentityMismatch) as raised:
                 delivery.create_pr(Path("."), base="base", head="feature", title="t", body="b",
                                    expected_repository="o/r", expected_base_sha="b" * 40,
                                    expected_head_sha=SHA, expected_source_digest=DIGEST)
             self.assertIn("uncertain", str(raised.exception))
             close.assert_called_once()
+
+    def test_general_post_create_failure_is_compensated(self):
+        with patch.object(delivery, "remote_identity", return_value="o/r"), \
+             patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA, "b" * 40, SHA]), \
+             patch.object(delivery, "source_identity", side_effect=[DIGEST, DIGEST]), \
+             patch.object(delivery, "_json", return_value=[]), patch.object(delivery, "_run", return_value=URL), \
+             patch.object(delivery, "read_pr", side_effect=delivery.DeliveryError("checks unavailable")), \
+             patch.object(delivery, "_close_created", return_value="confirmed") as close:
+            with self.assertRaisesRegex(delivery.DeliveryError, "compensation confirmed"):
+                delivery.create_pr(Path("."), base="base", head="feature", title="t", body="b",
+                                   expected_repository="o/r", expected_base_sha="b" * 40,
+                                   expected_head_sha=SHA, expected_source_digest=DIGEST)
+            close.assert_called_once()
+
+    def test_malformed_create_output_is_explicitly_unverified(self):
+        with patch.object(delivery, "remote_identity", return_value="o/r"), \
+             patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA, "b" * 40, SHA]), \
+             patch.object(delivery, "source_identity", side_effect=[DIGEST, DIGEST]), \
+             patch.object(delivery, "_json", return_value=[]), patch.object(delivery, "_run", return_value="not-a-url") as run:
+            with self.assertRaisesRegex(delivery.DeliveryError, "created-but-unverified"):
+                delivery.create_pr(Path("."), base="base", head="feature", title="t", body="b",
+                                   expected_repository="o/r", expected_base_sha="b" * 40,
+                                   expected_head_sha=SHA, expected_source_digest=DIGEST)
+            self.assertEqual(run.call_count, 1)
 
     def test_new_mismatched_pr_is_closed_but_race_recovery_is_not(self):
         with patch.object(delivery, "remote_identity", return_value="o/r"), \
@@ -226,19 +299,30 @@ class GithubDeliveryTests(unittest.TestCase):
                                    expected_source_digest=DIGEST)
 
     def test_required_check_states_are_truthful(self):
-        cases = [("", "none"), ('[{"name":"ci","state":"SUCCESS","bucket":"pass"}]', "passing"),
-                 ('[{"name":"ci","state":"QUEUED","bucket":"PENDING"}]', "pending"),
-                 ('[{"name":"ci","state":"COMPLETED","bucket":"FAIL"}]', "failing"),
-                 ('[{"name":"ci","state":"COMPLETED","bucket":"PASS"}]', "passing"),
-                 ('[{"name":"ci","state":"completed","bucket":"skipping"}]', "skipping"),
-                 ('[{"name":"ci","state":"COMPLETED","bucket":"cancel"}]', "failing")]
-        for raw, expected in cases:
-            with self.subTest(expected=expected), patch.object(delivery, "_run_result", return_value=(raw, "", 0)):
+        cases = [("", "none", 0), ('[{"name":"ci","state":"SUCCESS","bucket":"pass"}]', "passing", 0),
+                 ('[{"name":"ci","state":"QUEUED","bucket":"PENDING"}]', "pending", 8),
+                 ('[{"name":"ci","state":"COMPLETED","bucket":"FAIL"}]', "failing", 1),
+                 ('[{"name":"ci","state":"COMPLETED","bucket":"PASS"}]', "passing", 0),
+                 ('[{"name":"ci","state":"SKIPPED","bucket":"skipping"}]', "skipping", 0),
+                 ('[{"name":"ci","state":"CANCELLED","bucket":"cancel"}]', "failing", 0)]
+        for raw, expected, code in cases:
+            with self.subTest(expected=expected), patch.object(delivery, "_run_result", return_value=(raw, "", code)):
+                self.assertEqual(delivery._required_checks(Path("."), URL, "o/r")[1], expected)
+
+    def test_required_check_accepts_shipped_state_vocabulary(self):
+        for state, bucket, code, expected in (
+                ("SKIPPED", "skipping", 0, "skipping"), ("NEUTRAL", "pass", 0, "passing"),
+                ("CANCELLED", "cancel", 0, "failing"), ("TIMED_OUT", "fail", 1, "failing"),
+                ("ACTION_REQUIRED", "fail", 1, "failing"), ("STALE", "pending", 8, "pending"),
+                ("STARTUP_FAILURE", "fail", 1, "failing")):
+            raw = json.dumps([{"name": "ci", "state": state, "bucket": bucket}])
+            with self.subTest(state=state), patch.object(delivery, "_run_result", return_value=(raw, "", code)):
                 self.assertEqual(delivery._required_checks(Path("."), URL, "o/r")[1], expected)
 
     def test_required_check_exit_one_requires_exact_no_checks_diagnostic(self):
-        with patch.object(delivery, "_run_result", return_value=("", "no checks reported on the 'feature' branch\n", 1)):
-            self.assertEqual(delivery._required_checks(Path("."), URL, "o/r")[1], "none")
+        for diagnostic in ("no checks reported on the 'feature' branch\n", "no required checks reported on the 'feature' branch\n"):
+            with patch.object(delivery, "_run_result", return_value=("", diagnostic, 1)):
+                self.assertEqual(delivery._required_checks(Path("."), URL, "o/r")[1], "none")
         failing = '[{"name":"ci","state":"FAILURE","bucket":"fail"}]'
         with patch.object(delivery, "_run_result", return_value=(failing, "", 1)):
             self.assertEqual(delivery._required_checks(Path("."), URL, "o/r")[1], "failing")

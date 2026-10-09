@@ -22,9 +22,11 @@ MAX_THREADS_PAGES = 10
 MAX_THREAD_COMMENTS = 100
 PR_STATES = {"OPEN", "CLOSED", "MERGED"}
 MERGEABLE = {"CONFLICTING", "MERGEABLE", "UNKNOWN"}
-MERGE_STATES = {"BEHIND", "BLOCKED", "CLEAN", "DIRTY", "DRAFT", "HAS_HOOK_ERRORS", "UNKNOWN", "UNSTABLE"}
+MERGE_STATES = {"BEHIND", "BLOCKED", "CLEAN", "DIRTY", "HAS_HOOKS", "UNKNOWN", "UNSTABLE"}
 CHECK_BUCKETS = {"PASS", "FAIL", "PENDING", "SKIPPING", "CANCEL"}
-CHECK_STATES = {"QUEUED", "IN_PROGRESS", "COMPLETED", "EXPECTED", "REQUESTED", "WAITING", "PENDING", "SUCCESS", "FAILURE", "ERROR"}
+CHECK_STATES = {"QUEUED", "IN_PROGRESS", "COMPLETED", "EXPECTED", "REQUESTED", "WAITING", "PENDING",
+                "SUCCESS", "FAILURE", "ERROR", "SKIPPED", "NEUTRAL", "CANCELLED", "TIMED_OUT",
+                "ACTION_REQUIRED", "STALE", "STARTUP_FAILURE"}
 
 
 class DeliveryError(RuntimeError):
@@ -261,14 +263,31 @@ def pushed_head(root: Path, branch: str, remote: str = "origin") -> str:
     return value
 
 
-def source_identity(root: Path, commit: str, work_root: str = ".razr") -> str:
+def _configured_work_root(root: Path, commit: str) -> str:
+    # Use the frozen core's config authority. Unadopted public source trees do
+    # not contain a live razr.yaml, so use the core's shipped default rather
+    # than inventing a delivery-specific .razr exclusion.
+    if (root / "razr.yaml").exists():
+        try:
+            from .core_subprocess import _core_work_root
+            return _core_work_root(root, commit)
+        except Exception as exc:
+            raise DeliveryError("validated Razr work root is unavailable") from exc
+    from runtime.scripts.razr import DEFAULT_CONFIG
+    work_root = DEFAULT_CONFIG.get("work_root")
+    if not isinstance(work_root, str) or not work_root:
+        raise DeliveryError("core default work root is unavailable")
+    return work_root
+
+
+def source_identity(root: Path, commit: str, work_root: str | None = None) -> str:
     if not SHA_RE.fullmatch(commit):
         raise InvalidRequest("candidate commit must be a full Git object id")
     out, _ = _capture("git", ["ls-tree", "-r", "-z", "--full-tree", commit], root,
                       timeout=30)
     if len(out) > MAX_STDOUT * 8:
         raise DeliveryError("candidate tree unavailable")
-    prefix = work_root.rstrip("/") + "/"
+    prefix = (work_root if work_root is not None else _configured_work_root(root, commit)).rstrip("/") + "/"
     entries = []
     for row in out.split(b"\0"):
         if not row:
@@ -442,14 +461,15 @@ def _repo_arg(repository: str) -> str:
 def _required_checks(root: Path, url: str, repository: str) -> tuple[list[dict[str, str]], str]:
     raw, diagnostic, code = _run_result("gh", ["pr", "checks", url, "--repo", _repo_arg(repository), "--required", "--json", "name,state,bucket"], root,
                                          accepted_codes={0, 1, 8})
+    no_checks = r"no (?:required )?checks reported on the '[^'\n]{1,255}' branch\n?"
     if code == 1 and not raw:
-        if not re.fullmatch(r"no checks reported on the '[^'\n]{1,255}' branch\n?", diagnostic):
+        if not re.fullmatch(no_checks, diagnostic):
             raise DeliveryError("required-check provider request failed")
         rows = []
     else:
-        if code == 8 and not raw:
-            raise DeliveryError("required-check provider request failed")
-        if re.search(r"(?i)(fatal|error|denied|permission|unauthori)", diagnostic):
+        if diagnostic.strip():
+            raise DeliveryError("required-check output contradicts provider diagnostic")
+        if not raw and code != 0:
             raise DeliveryError("required-check provider request failed")
         try:
             rows = [] if not raw else json.loads(raw)
@@ -467,19 +487,27 @@ def _required_checks(root: Path, url: str, repository: str) -> tuple[list[dict[s
         if state not in CHECK_STATES or bucket not in CHECK_BUCKETS:
             raise DeliveryError("unknown check state/bucket")
         result.append({"name": row["name"], "state": state, "bucket": bucket})
+    failing = any(row["bucket"] == "FAIL" or row["state"] in {
+        "FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"} for row in result)
+    pending = any(row["bucket"] == "PENDING" or row["state"] in {
+        "QUEUED", "IN_PROGRESS", "EXPECTED", "REQUESTED", "WAITING", "PENDING", "STALE"} for row in result)
+    cancelled = any(row["bucket"] == "CANCEL" or row["state"] == "CANCELLED" for row in result)
     if not result:
         return result, "none"
-    if any(row["bucket"] in {"FAIL", "CANCEL"} for row in result):
+    # gh's transport contract is exact: failure=1, pending-only=8, and all
+    # other complete/skipped/cancelled output=0. Contradictions fail closed.
+    expected = 1 if failing else 8 if pending else 0
+    if code != expected:
+        raise DeliveryError("required-check exit contradicts populated checks")
+    if failing and pending:
+        raise DeliveryError("required-check result is both failing and pending")
+    if failing:
         return result, "failing"
-    if any(row["bucket"] == "PENDING" for row in result):
+    if pending:
         return result, "pending"
-    if code == 1 and not any(row["bucket"] in {"FAIL", "CANCEL"} for row in result):
-        raise DeliveryError("exit 1 populated checks are not failing")
-    if code == 8 and not any(row["bucket"] == "PENDING" or row["state"] in {"QUEUED", "IN_PROGRESS", "PENDING", "REQUESTED", "WAITING"} for row in result):
-        raise DeliveryError("exit 8 required-check result is not pending")
-    if any(row["bucket"] == "CANCEL" for row in result):
+    if cancelled:
         return result, "failing"
-    if any(row["bucket"] == "SKIPPING" for row in result):
+    if any(row["bucket"] == "SKIPPING" or row["state"] == "SKIPPED" for row in result):
         return result, "skipping"
     return result, "passing"
 
@@ -585,6 +613,16 @@ def _threads(root: Path, owner: str, repo: str, number: int) -> list[dict[str, A
     raise DeliveryError("review-thread pagination exceeds bound")
 
 
+def _canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _stable_collection(label: str, first: Any, second: Any) -> Any:
+    if _canonical(first) != _canonical(second):
+        raise CandidateChanged(f"{label} changed during bounded observation")
+    return second
+
+
 def read_pr(root: Path, url: str, *, expected_repository: str | None = None,
             expected_base: str | None = None, expected_base_sha: str | None = None,
             expected_head: str | None = None, expected_head_sha: str | None = None,
@@ -613,9 +651,10 @@ def read_pr(root: Path, url: str, *, expected_repository: str | None = None,
     if expected_head_sha is not None and actual_head_sha != expected_head_sha:
         raise IdentityMismatch("PR head commit mismatch")
     checks, status = _required_checks(root, url, actual_repository)
+    threads = _threads(root, owner, repo, number)
     value["requiredChecks"] = checks
     value["requiredChecksStatus"] = status
-    value["reviewThreads"] = _threads(root, owner, repo, number)
+    value["reviewThreads"] = threads
     actual_source_digest = source_identity(root, actual_head_sha)
     if expected_source_digest is not None and actual_source_digest != expected_source_digest:
         raise IdentityMismatch("PR source identity mismatch")
@@ -625,6 +664,13 @@ def read_pr(root: Path, url: str, *, expected_repository: str | None = None,
     final_base_sha = pushed_head(root, final_value["baseRefName"])
     final_head_sha = pushed_head(root, final_value["headRefName"])
     final_digest = source_identity(root, final_head_sha)
+    final_checks, final_status = _required_checks(root, url, actual_repository)
+    final_threads = _threads(root, owner, repo, number)
+    for field in ("reviews", "comments", "reviewRequests", "statusCheckRollup"):
+        _stable_collection("PR " + field, value[field], final_value[field])
+    _stable_collection("required checks", value["requiredChecks"], final_checks)
+    _stable_collection("required-check status", value["requiredChecksStatus"], final_status)
+    _stable_collection("review threads", value["reviewThreads"], final_threads)
     if (final_value["baseRefName"] != value["baseRefName"] or final_value["headRefName"] != value["headRefName"]
             or final_value["baseRefOid"] != value["baseRefOid"] or final_value["headRefOid"] != value["headRefOid"]
             or final_value["url"] != value["url"] or final_value["number"] != value["number"]
@@ -641,10 +687,17 @@ def read_pr(root: Path, url: str, *, expected_repository: str | None = None,
         raise CandidateChanged("final head identity mismatch")
     if expected_source_digest is not None and final_digest != expected_source_digest:
         raise CandidateChanged("final source identity mismatch")
-    final_value["requiredChecks"] = value["requiredChecks"]
-    final_value["requiredChecksStatus"] = value["requiredChecksStatus"]
-    final_value["reviewThreads"] = value["reviewThreads"]
+    final_value["requiredChecks"] = final_checks
+    final_value["requiredChecksStatus"] = final_status
+    final_value["reviewThreads"] = final_threads
     final_value["sourceDigest"] = final_digest
+    final_value["observation"] = {
+        "mode": "bounded-two-pass-stability",
+        "passes": 2,
+        "atomic": False,
+        "dynamicCollections": ["reviews", "comments", "reviewRequests", "statusCheckRollup",
+                                "requiredChecks", "reviewThreads"],
+    }
     return final_value
 
 
@@ -733,27 +786,30 @@ def create_pr(root: Path, *, base: str, head: str, title: str, body: str,
         # Validate the provider's returned text before it can reach close.
         created_owner, created_name, _ = _pr_url(url)
         if f"{created_owner}/{created_name}".lower() != repository.lower():
-            raise IdentityMismatch("created PR repository differs from verified repository")
+            raise DeliveryError("created-but-unverified; returned PR repository differs and cannot be safely closed")
     except InvalidRequest as exc:
-        raise DeliveryError("gh create returned malformed PR URL") from exc
+        # gh has mutated remotely but supplied no safe close target. Perform
+        # one exact candidate lookup; never pass malformed text to gh close.
+        try:
+            recovered = _existing_open(root, repository, base, head, base_sha, head_sha, digest)
+        except DeliveryError as recovery_error:
+            raise DeliveryError(f"created-but-unverified; exact recovery failed: {recovery_error}") from exc
+        if recovered is not None:
+            return recovered
+        raise DeliveryError("created-but-unverified; no exact PR URL was recoverable and compensation is unavailable") from exc
+
     try:
         return read_pr(root, url, expected_repository=repository, expected_base=base,
                        expected_base_sha=base_sha, expected_head=head, expected_head_sha=head_sha,
                        expected_source_digest=digest)
-    except CandidateChanged as exc:
+    except DeliveryError as exc:
         try:
             outcome = _close_created(root, repository, url)
         except DeliveryError as close_error:
-            raise CandidateChanged(f"candidate mismatch; compensation uncertain: {close_error}") from exc
-        raise CandidateChanged(f"candidate mismatch; compensation {outcome}") from exc
-    except IdentityMismatch as exc:
-        if not _candidate_identity_mismatch(exc):
-            raise
-        try:
-            outcome = _close_created(root, repository, url)
-        except DeliveryError as close_error:
-            raise CandidateChanged(f"candidate identity mismatch; compensation uncertain: {close_error}") from exc
-        raise CandidateChanged(f"candidate identity mismatch; compensation {outcome}") from exc
+            message = f"post-create verification failed: {exc}; compensation uncertain: {close_error}"
+            raise type(exc)(message) from exc
+        message = f"post-create verification failed: {exc}; compensation {outcome}"
+        raise type(exc)(message) from exc
 
 
 def snapshot(root: Path, *, branch: str, base: str = "campaign/razr-pi-next") -> dict[str, Any]:
