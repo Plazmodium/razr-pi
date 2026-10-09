@@ -223,14 +223,25 @@ class HerdrProviderTests(unittest.TestCase):
             with self.assertRaises(ProtocolError) as caught: ledger.append(started)
             self.assertEqual(caught.exception.code, "DUPLICATE_ATTEMPT")
             self.assertEqual(len(path.read_text().splitlines()), 2)
+            append_crash = {**started, "attempt_id": "append-crash", "allowance_id": "append-crash-allow",
+                            "output_root_id": "append-crash-out", "session_root_id": "append-crash-session"}
+            original_state_write = AttemptLedger._write_attempt_sidecar; injected = {"done": False}
+            def fail_existing_state(dirfd, name, body):
+                if name == ledger.state_path.name and body.get("records") == 3 and not injected["done"]:
+                    injected["done"] = True; raise ProtocolError("LEDGER_CORRUPT", "injected existing append crash")
+                return original_state_write(dirfd, name, body)
+            with patch.object(AttemptLedger, "_write_attempt_sidecar", side_effect=fail_existing_state):
+                with self.assertRaises(ProtocolError) as append_error: ledger.append(append_crash)
+            self.assertEqual(append_error.exception.code, "LEDGER_CORRUPT"); self.assertTrue(ledger.intent_path.is_file())
+            self.assertEqual(len(AttemptLedger(path).records()), 3); self.assertFalse(ledger.intent_path.exists())
             with patch("adapter.herdr_provider.fcntl.flock", side_effect=OSError("lock")):
                 with self.assertRaises(ProtocolError) as lock_error: ledger.append({**started, "attempt_id": "lock-fail", "allowance_id": "lock-allow"})
             self.assertEqual(lock_error.exception.code, "LOCK_UNAVAILABLE")
             original_bytes = path.read_bytes()
-            with patch("adapter.herdr_provider.os.fsync", side_effect=[OSError("disk"), None]):
+            with patch("adapter.herdr_provider.os.write", side_effect=OSError("disk")):
                 with self.assertRaises(ProtocolError) as write_error: ledger.append({**started, "attempt_id": "write-fail", "allowance_id": "write-allow"})
             self.assertEqual(write_error.exception.code, "LOCK_UNAVAILABLE"); self.assertEqual(path.read_bytes(), original_bytes)
-            with patch("adapter.herdr_provider.os.fsync", side_effect=[OSError("disk"), OSError("rollback"), OSError("close")]):
+            with patch("adapter.herdr_provider.os.write", side_effect=OSError("disk")), patch("adapter.herdr_provider.os.ftruncate", side_effect=OSError("rollback")):
                 with self.assertRaises(ProtocolError) as rollback_error: ledger.append({**started, "attempt_id": "rollback-fail", "allowance_id": "rollback-allow"})
             self.assertEqual(rollback_error.exception.code, "LEDGER_CORRUPT")
 
@@ -747,7 +758,7 @@ class HerdrProviderTests(unittest.TestCase):
             self.assertEqual(sum(row["path"] == str(output) for row in claims), 1)
 
     def test_lost_or_replaced_root_claim_journal_refuses_before_new_started_or_launch(self):
-        for damage in ("deleted", "replaced"):
+        for damage in ("deleted", "replaced", "state-deleted"):
             with self.subTest(damage=damage), tempfile.TemporaryDirectory() as tmp:
                 base = Path(tmp).resolve(); request, current, probe, private, _, output, _ = request_fixture(base, "att-journal-original-" + damage)
                 ledger = AttemptLedger(base / "attempts.jsonl"); starts = []
@@ -763,8 +774,10 @@ class HerdrProviderTests(unittest.TestCase):
                 journal = private / "root-claims.jsonl"; original = journal.read_bytes()
                 if damage == "deleted":
                     journal.unlink(); (private / "root-claims.state.json").unlink()
-                else:
+                elif damage == "replaced":
                     journal.rename(private / "root-claims.replaced"); journal.write_bytes(original)
+                else:
+                    (private / "root-claims.state.json").unlink()
                 __import__("shutil").rmtree(output); output.mkdir()
                 session2 = private / ("session-journal-" + damage); session2.mkdir()
                 second = json.loads(json.dumps(request)); second.update({"request_id": "exec-journal-" + damage,
@@ -778,6 +791,62 @@ class HerdrProviderTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, "LEDGER_CORRUPT")
                 authority.assert_not_called(); candidate.assert_not_called()
                 self.assertEqual(len(starts), 1); self.assertEqual([row["event"] for row in ledger.records()], ["STARTED", "SETTLED"])
+
+    def test_lost_replaced_truncated_or_reset_attempt_journal_refuses_before_dispatch(self):
+        for damage in ("missing", "replaced", "truncated", "prefix-reset", "state-missing"):
+            with self.subTest(damage=damage), tempfile.TemporaryDirectory() as tmp:
+                base = Path(tmp).resolve(); request, current, probe, private, worktree, _, _ = request_fixture(base, "att-attempt-original-" + damage)
+                ledger = AttemptLedger(base / "attempts.jsonl"); starts = []
+                def runner(argv, **kwargs):
+                    if argv[:3] == ["herdr", "agent", "start"]:
+                        starts.append(argv); return subprocess.CompletedProcess(argv, 7, b"", b"failed")
+                    raise AssertionError(argv)
+                provider = HerdrProvider(runner=runner, ledger=ledger, private_root=private)
+                with patch.object(provider, "probe", return_value=probe), patch.object(provider, "_verify_candidate"), patch.object(provider, "_read_current_work", return_value=current):
+                    with self.assertRaises(ProtocolError): provider.launch(request)
+                original = ledger.path.read_bytes(); self.assertEqual(len(starts), 1); self.assertTrue(ledger.state_path.is_file())
+                if damage == "missing":
+                    ledger.path.unlink()
+                elif damage == "replaced":
+                    ledger.path.rename(base / "attempts.replaced"); ledger.path.write_bytes(original)
+                elif damage == "truncated":
+                    ledger.path.write_bytes(original[:len(original) // 2])
+                elif damage == "prefix-reset":
+                    ledger.path.write_bytes(original.splitlines(keepends=True)[0])
+                else:
+                    ledger.state_path.unlink()
+                output2 = private / ("output-attempt-" + damage); session2 = private / ("session-attempt-" + damage); output2.mkdir(); session2.mkdir()
+                second = json.loads(json.dumps(request)); second.update({"request_id": "exec-attempt-" + damage,
+                    "attempt_id": "att-attempt-new-" + damage, "allowance_id": "allow-attempt-" + damage,
+                    "worker_id": "worker-attempt-" + damage, "output_root": str(output2), "output_root_id": "out-attempt-" + damage,
+                    "session_root": str(session2), "session_root_id": "sess-attempt-" + damage})
+                restarted = HerdrProvider(runner=runner, ledger=ledger, private_root=private)
+                with patch.object(restarted, "probe", return_value=probe), patch.object(restarted, "_read_current_work") as authority, patch.object(restarted, "_verify_candidate") as candidate:
+                    with self.assertRaises(ProtocolError) as caught: restarted.launch(second)
+                self.assertEqual(caught.exception.code, "LEDGER_CORRUPT"); authority.assert_not_called(); candidate.assert_not_called()
+                self.assertEqual(len(starts), 1); self.assertNotIn(second["attempt_id"].encode("utf-8"), ledger.path.read_bytes() if ledger.path.exists() else b"")
+                self.assertFalse((worktree / ".razr/evidence" / ("attempt-" + second["attempt_id"] + ".json")).exists())
+
+    def test_first_attempt_append_state_crash_recovers_only_authenticated_intent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp).resolve(); request, current, probe, private, _, _, _ = request_fixture(base, "att-attempt-intent")
+            ledger = AttemptLedger(base / "attempts.jsonl"); starts = []; provider = HerdrProvider(runner=lambda argv, **kwargs: starts.append(argv), ledger=ledger, private_root=private)
+            original_write = AttemptLedger._write_attempt_sidecar; failed = {"done": False}
+            def fail_first_state(dirfd, name, body):
+                if name == ledger.state_path.name and body.get("records") == 1 and not failed["done"]:
+                    failed["done"] = True; raise ProtocolError("LEDGER_CORRUPT", "injected state crash")
+                return original_write(dirfd, name, body)
+            with patch.object(provider, "probe", return_value=probe), patch.object(provider, "_verify_candidate"), patch.object(provider, "_read_current_work", return_value=current), \
+                 patch.object(AttemptLedger, "_write_attempt_sidecar", side_effect=fail_first_state):
+                with self.assertRaises(ProtocolError) as caught: provider.launch(request)
+            self.assertEqual(caught.exception.code, "LEDGER_CORRUPT"); self.assertEqual(starts, [])
+            self.assertTrue(ledger.path.is_file()); self.assertFalse(ledger.state_path.exists()); self.assertTrue(ledger.intent_path.is_file())
+            restarted = HerdrProvider(runner=lambda argv, **kwargs: starts.append(argv), ledger=ledger, private_root=private)
+            with patch.object(restarted, "probe", return_value=probe), patch.object(restarted, "_read_current_work") as authority, patch.object(restarted, "_verify_candidate") as candidate:
+                with self.assertRaises(ProtocolError) as caught: restarted.launch(request)
+            self.assertEqual(caught.exception.code, "DUPLICATE_ATTEMPT"); authority.assert_not_called(); candidate.assert_not_called()
+            self.assertEqual([row["event"] for row in ledger.records()], ["STARTED"]); self.assertTrue(ledger.state_path.is_file()); self.assertFalse(ledger.intent_path.exists())
+            self.assertEqual(starts, []); self.assertEqual(list(private.glob("dispatch-prepared-*.json")), [])
 
     def test_pre_started_crash_staging_is_reconciled_and_exactly_retryable(self):
         with tempfile.TemporaryDirectory() as tmp:

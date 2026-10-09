@@ -459,135 +459,227 @@ class AttemptLedger:
                 except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "settlement canonical evidence is malformed") from exc
             if actual != ref["digest"]: raise _fail("LEDGER_CORRUPT", "settlement evidence digest differs")
 
-    def records(self) -> list[dict[str, object]]:
-        """Read one validated durable chronology under the ledger lock."""
-        if not self.path.exists():
-            return []
+    @property
+    def state_path(self) -> Path:
+        return self.path.with_name(self.path.name + ".state.json")
+
+    @property
+    def intent_path(self) -> Path:
+        return self.path.with_name(self.path.name + ".append-intent.json")
+
+    @contextmanager
+    def _authority_lock(self, *, create_parent: bool) -> Iterator[int]:
+        if create_parent:
+            try: self.path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as exc: raise _fail("LOCK_UNAVAILABLE", "attempt ledger cannot create its parent") from exc
+        try: parent = self.path.parent.resolve(strict=True)
+        except OSError as exc: raise _fail("LEDGER_CORRUPT", "attempt ledger parent is unavailable") from exc
+        if not parent.is_dir(): raise _fail("LEDGER_CORRUPT", "attempt ledger parent is not a directory")
+        basename = self.path.name
+        if not basename or basename in {".", ".."} or "/" in basename or "\\" in basename: raise _fail("LEDGER_CORRUPT", "attempt ledger basename is unsafe")
+        dirfd = lockfd = -1
         try:
-            parent = self.path.parent.resolve(strict=True)
             dirfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            fd = os.open(self.path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-                raise _fail("LEDGER_CORRUPT", "attempt ledger is not a private regular file")
-            with os.fdopen(fd, "rb") as stream:
-                fcntl.flock(stream.fileno(), fcntl.LOCK_SH)
-                raw = stream.read(16 * 1024 * 1024 + 1)
-                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-            os.close(dirfd)
-        except ProtocolError:
-            try: os.close(dirfd)
-            except (NameError, OSError): pass
-            raise
-        except OSError as exc:
-            try: os.close(fd)
-            except (NameError, OSError): pass
-            try: os.close(dirfd)
-            except (NameError, OSError): pass
-            raise _fail("LEDGER_CORRUPT", "attempt ledger cannot be read") from exc
-        if len(raw) > 16 * 1024 * 1024 or (raw and not raw.endswith(b"\n")):
-            raise _fail("LEDGER_CORRUPT", "attempt ledger is oversized or partial")
+            lockfd = os.open(basename + ".authority.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=dirfd)
+            info = os.fstat(lockfd)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1: raise _fail("LOCK_UNAVAILABLE", "attempt authority lock is unsafe")
+            os.fchmod(lockfd, 0o600); fcntl.flock(lockfd, fcntl.LOCK_EX)
+            yield dirfd
+        except ProtocolError: raise
+        except OSError as exc: raise _fail("LOCK_UNAVAILABLE", "attempt authority lock is unavailable") from exc
+        finally:
+            if lockfd >= 0:
+                try: fcntl.flock(lockfd, fcntl.LOCK_UN)
+                except OSError: pass
+                try: os.close(lockfd)
+                except OSError: pass
+            if dirfd >= 0:
+                try: os.close(dirfd)
+                except OSError: pass
+
+    @staticmethod
+    def _attempt_sidecar(dirfd: int, name: str, kind: str) -> dict[str, object] | None:
+        try: fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+        except FileNotFoundError: return None
+        except OSError as exc: raise _fail("LEDGER_CORRUPT", f"{kind} is unsafe") from exc
+        try:
+            info = os.fstat(fd); data = os.read(fd, 1_048_577)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or len(data) > 1_048_576: raise _fail("LEDGER_CORRUPT", f"{kind} is unsafe")
+            value = _strict_json(data)
+            if canonical_json(value) != data: raise ValueError("noncanonical sidecar")
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError, TypeError) as exc: raise _fail("LEDGER_CORRUPT", f"{kind} is malformed") from exc
+        finally: os.close(fd)
+        if not isinstance(value, dict) or value.get("kind") != kind or value.get("schema_version") != 1 or not isinstance(value.get("record_digest"), str):
+            raise _fail("LEDGER_CORRUPT", f"{kind} identity differs")
+        body = {key: value[key] for key in value if key != "record_digest"}
+        if value["record_digest"] != raw_file_digest(canonical_json(body)): raise _fail("LEDGER_CORRUPT", f"{kind} digest differs")
+        return value
+
+    @staticmethod
+    def _write_attempt_sidecar(dirfd: int, name: str, body: Mapping[str, object]) -> None:
+        value = dict(body); value["record_digest"] = raw_file_digest(canonical_json(value)); data = canonical_json(value); temporary = "." + name + ".staging"
+        try:
+            try: os.unlink(temporary, dir_fd=dirfd)
+            except FileNotFoundError: pass
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dirfd)
+            with os.fdopen(fd, "wb") as stream: stream.write(data); stream.flush(); os.fsync(stream.fileno())
+            os.replace(temporary, name, src_dir_fd=dirfd, dst_dir_fd=dirfd); os.fsync(dirfd)
+        except OSError as exc: raise _fail("LEDGER_CORRUPT", "attempt authority sidecar cannot be persisted") from exc
+
+    @staticmethod
+    def _remove_attempt_sidecar(dirfd: int, name: str) -> None:
+        try: os.unlink(name, dir_fd=dirfd); os.fsync(dirfd)
+        except FileNotFoundError: return
+        except OSError as exc: raise _fail("LEDGER_CORRUPT", "attempt append intent cannot be cleared") from exc
+
+    def _read_attempt_journal(self, dirfd: int) -> tuple[os.stat_result, list[dict[str, object]]] | None:
+        try: fd = os.open(self.path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dirfd)
+        except FileNotFoundError: return None
+        except OSError as exc: raise _fail("LEDGER_CORRUPT", "attempt ledger cannot be opened") from exc
+        try:
+            info = os.fstat(fd); raw = os.read(fd, 16 * 1024 * 1024 + 1)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1: raise _fail("LEDGER_CORRUPT", "attempt ledger is not a private regular file")
+        except OSError as exc: raise _fail("LEDGER_CORRUPT", "attempt ledger cannot be read") from exc
+        finally: os.close(fd)
+        if len(raw) > 16 * 1024 * 1024 or (raw and not raw.endswith(b"\n")): raise _fail("LEDGER_CORRUPT", "attempt ledger is oversized or partial")
         records = []
         for line in raw.splitlines():
             try: records.append(self._replay_validate(_strict_json(line)))
-            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError, ProtocolError) as exc:
-                raise _fail("LEDGER_CORRUPT", "malformed ledger JSON") from exc
-        return self._replay_chain(records)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError, ProtocolError) as exc: raise _fail("LEDGER_CORRUPT", "malformed ledger JSON") from exc
+        return info, self._replay_chain(records)
+
+    @staticmethod
+    def _state_body(info: os.stat_result, records: Sequence[Mapping[str, object]]) -> dict[str, object]:
+        return {"schema_version": 1, "kind": "attempt_ledger_state", "journal_device": info.st_dev, "journal_inode": info.st_ino,
+                "records": len(records), "head_digest": records[-1]["record_digest"] if records else "sha256:" + "0" * 64}
+
+    @classmethod
+    def _validate_attempt_state(cls, value: Mapping[str, object]) -> None:
+        expected = {"schema_version", "kind", "journal_device", "journal_inode", "records", "head_digest", "record_digest"}
+        if set(value) != expected or not all(isinstance(value[key], int) and not isinstance(value[key], bool) and value[key] >= 0 for key in ("journal_device", "journal_inode", "records")):
+            raise _fail("LEDGER_CORRUPT", "attempt ledger state is not closed")
+        try: _digest(value["head_digest"], "attempt state head"); _digest(value["record_digest"], "attempt state digest")
+        except ProtocolError as exc: raise _fail("LEDGER_CORRUPT", "attempt ledger state digest is invalid") from exc
+
+    @classmethod
+    def _validate_append_intent(cls, value: Mapping[str, object]) -> dict[str, object]:
+        expected = {"schema_version", "kind", "journal_exists", "journal_device", "journal_inode", "prior_records", "prior_head_digest", "event", "record_digest"}
+        if (set(value) != expected or not isinstance(value["journal_exists"], bool)
+                or not all(isinstance(value[key], int) and not isinstance(value[key], bool) and value[key] >= 0 for key in ("journal_device", "journal_inode", "prior_records"))):
+            raise _fail("LEDGER_CORRUPT", "attempt append intent is not closed")
+        try: _digest(value["prior_head_digest"], "attempt intent head"); _digest(value["record_digest"], "attempt intent digest")
+        except ProtocolError as exc: raise _fail("LEDGER_CORRUPT", "attempt append intent digest is invalid") from exc
+        return cls._replay_validate(value["event"], allow_legacy_herdr=False)
+
+    def _append_journal_event(self, dirfd: int, event: Mapping[str, object], *, create: bool) -> os.stat_result:
+        flags = os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW | (os.O_CREAT | os.O_EXCL if create else 0)
+        try: fd = os.open(self.path.name, flags, 0o600, dir_fd=dirfd)
+        except OSError as exc: raise _fail("LOCK_UNAVAILABLE", "attempt ledger cannot be opened for append") from exc
+        original = os.fstat(fd).st_size
+        try:
+            data = canonical_json(event) + b"\n"; written = 0
+            while written < len(data):
+                count = os.write(fd, data[written:])
+                if count <= 0: raise OSError("short attempt ledger write")
+                written += count
+            os.fsync(fd); return os.fstat(fd)
+        except OSError as exc:
+            try: os.ftruncate(fd, original); os.fsync(fd)
+            except OSError as rollback_exc: raise _fail("LEDGER_CORRUPT", "attempt ledger append rollback could not be established") from rollback_exc
+            raise _fail("LOCK_UNAVAILABLE", "attempt ledger append could not be durably completed") from exc
+        finally: os.close(fd)
+
+    def _recover_attempt_authority(self, dirfd: int) -> list[dict[str, object]]:
+        state_name = self.state_path.name; intent_name = self.intent_path.name
+        state = self._attempt_sidecar(dirfd, state_name, "attempt_ledger_state")
+        intent = self._attempt_sidecar(dirfd, intent_name, "attempt_append_intent")
+        if state is not None: self._validate_attempt_state(state)
+        intent_event = self._validate_append_intent(intent) if intent is not None else None
+        journal = self._read_attempt_journal(dirfd)
+        if journal is None:
+            if state is not None: raise _fail("LEDGER_CORRUPT", "established attempt ledger is missing")
+            if intent is None: return []
+            if intent["journal_exists"] or intent["prior_records"] != 0 or intent["prior_head_digest"] != "sha256:" + "0" * 64 or intent_event["event"] != "STARTED":
+                raise _fail("LEDGER_CORRUPT", "missing attempt ledger has invalid creation intent")
+            info = self._append_journal_event(dirfd, intent_event, create=True); records = self._replay_chain([intent_event])
+            self._write_attempt_sidecar(dirfd, state_name, self._state_body(info, records)); self._remove_attempt_sidecar(dirfd, intent_name)
+            return records
+        info, records = journal; head = records[-1]["record_digest"] if records else "sha256:" + "0" * 64
+        if state is None:
+            if (intent is None or intent["journal_exists"] or intent["prior_records"] != 0 or intent["prior_head_digest"] != "sha256:" + "0" * 64
+                    or len(records) != 1 or records[0] != intent_event):
+                raise _fail("LEDGER_CORRUPT", "attempt ledger state is missing")
+            self._write_attempt_sidecar(dirfd, state_name, self._state_body(info, records)); self._remove_attempt_sidecar(dirfd, intent_name)
+            return records
+        if (state["journal_device"], state["journal_inode"]) != (info.st_dev, info.st_ino) or state["records"] > len(records):
+            raise _fail("LEDGER_CORRUPT", "attempt ledger was replaced or truncated")
+        state_head = records[state["records"] - 1]["record_digest"] if state["records"] else "sha256:" + "0" * 64
+        if state["head_digest"] != state_head: raise _fail("LEDGER_CORRUPT", "attempt ledger reset differs from state")
+        if len(records) == state["records"]:
+            if intent is None: return records
+            if intent["journal_exists"] and (intent["journal_device"], intent["journal_inode"], intent["prior_records"], intent["prior_head_digest"]) == (info.st_dev, info.st_ino, len(records), head):
+                recovered = self._replay_chain(records + [intent_event]); info = self._append_journal_event(dirfd, intent_event, create=False)
+                self._write_attempt_sidecar(dirfd, state_name, self._state_body(info, recovered)); self._remove_attempt_sidecar(dirfd, intent_name)
+                return recovered
+            if (intent["prior_records"] + 1 == len(records) and records[-1] == intent_event
+                    and ((intent["journal_exists"] and (intent["journal_device"], intent["journal_inode"]) == (info.st_dev, info.st_ino))
+                         or (not intent["journal_exists"] and len(records) == 1))
+                    and intent["prior_head_digest"] == (records[-2]["record_digest"] if len(records) > 1 else "sha256:" + "0" * 64)):
+                self._remove_attempt_sidecar(dirfd, intent_name); return records
+            raise _fail("LEDGER_CORRUPT", "attempt append intent does not match established state")
+        if (len(records) == state["records"] + 1 and intent is not None and intent["journal_exists"]
+                and (intent["journal_device"], intent["journal_inode"], intent["prior_records"], intent["prior_head_digest"]) == (info.st_dev, info.st_ino, state["records"], state["head_digest"])
+                and records[-1] == intent_event):
+            self._write_attempt_sidecar(dirfd, state_name, self._state_body(info, records)); self._remove_attempt_sidecar(dirfd, intent_name); return records
+        raise _fail("LEDGER_CORRUPT", "attempt ledger history exceeds its authenticated state")
+
+    def records(self) -> list[dict[str, object]]:
+        """Read or narrowly recover one independently anchored durable chronology."""
+        if not self.path.parent.exists(): return []
+        with self._authority_lock(create_parent=False) as dirfd:
+            return self._recover_attempt_authority(dirfd)
 
     def assert_start_available(self, *, attempt_id: str, allowance_id: str,
                                output_root_id: str, session_root_id: str) -> None:
         records = self.records()
-        if any(row["attempt_id"] == attempt_id for row in records):
-            raise _fail("DUPLICATE_ATTEMPT", "duplicate attempt identity")
+        if any(row["attempt_id"] == attempt_id for row in records): raise _fail("DUPLICATE_ATTEMPT", "duplicate attempt identity")
         for row in records:
-            if row["event"] != "STARTED":
-                continue
-            if row.get("allowance_id") == allowance_id:
-                raise _fail("ALLOWANCE_REUSED", "allowance is already bound to another attempt")
-            if output_root_id in {row["output_root_id"], row["session_root_id"]} or session_root_id in {row["output_root_id"], row["session_root_id"]}:
-                raise _fail("RESOURCE_REUSED", "root identity was previously used")
+            if row["event"] != "STARTED": continue
+            if row.get("allowance_id") == allowance_id: raise _fail("ALLOWANCE_REUSED", "allowance is already bound to another attempt")
+            if output_root_id in {row["output_root_id"], row["session_root_id"]} or session_root_id in {row["output_root_id"], row["session_root_id"]}: raise _fail("RESOURCE_REUSED", "root identity was previously used")
 
     def append(self, event: Mapping[str, object]) -> dict[str, object]:
         import copy
         event = copy.deepcopy(dict(event))
-        if not isinstance(event, dict) or not isinstance(event.get("schema_version"), int) or isinstance(event.get("schema_version"), bool) or event.get("schema_version") != 1 or event.get("event") not in {"STARTED", "SETTLED"}:
-            raise _fail("LEDGER_CORRUPT", "invalid attempt event")
+        if not isinstance(event, dict) or not isinstance(event.get("schema_version"), int) or isinstance(event.get("schema_version"), bool) or event.get("schema_version") != 1 or event.get("event") not in {"STARTED", "SETTLED"}: raise _fail("LEDGER_CORRUPT", "invalid attempt event")
         event.pop("prev_digest", None); event.pop("record_digest", None)
-        try: self.path.parent.mkdir(parents=True, exist_ok=True)
-        except OSError as exc: raise _fail("LOCK_UNAVAILABLE", "attempt ledger cannot create its parent") from exc
-        try:
-            parent = self.path.parent.resolve(strict=True)
-            if not parent.is_dir(): raise _fail("LOCK_UNAVAILABLE", "attempt ledger parent is not a directory")
-            basename = self.path.name
-            if not basename or basename in {".", ".."} or "/" in basename or "\\" in basename: raise _fail("LOCK_UNAVAILABLE", "attempt ledger basename is unsafe")
-            dirfd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-            fd = os.open(basename, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600, dir_fd=dirfd)
-            file_stat = os.fstat(fd)
-            if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_nlink != 1: raise _fail("LOCK_UNAVAILABLE", "attempt ledger is not a private regular file")
-            stream = os.fdopen(fd, "a+", encoding="utf-8")
-        except ProtocolError:
-            try: os.close(fd)
-            except (NameError, OSError): pass
-            try: os.close(dirfd)
-            except (NameError, OSError): pass
-            raise
-        except OSError as exc:
-            try: os.close(fd)
-            except (NameError, OSError): pass
-            try: os.close(dirfd)
-            except (NameError, OSError): pass
-            raise _fail("LOCK_UNAVAILABLE", "attempt ledger cannot be opened") from exc
-        locked = False; committed = False; original_length = 0
-        try:
-            try: fcntl.flock(stream.fileno(), fcntl.LOCK_EX); locked = True
-            except OSError as exc: raise _fail("LOCK_UNAVAILABLE", "attempt ledger cannot be locked") from exc
-            try:
-                stream.seek(0, 2); original_length = stream.tell(); stream.seek(0); records: list[dict[str, object]] = []
-                for line in stream:
-                    if not line.endswith("\n"): raise _fail("LEDGER_CORRUPT", "partial ledger line")
-                    try: row = _strict_json(line.rstrip("\n").encode("utf-8"))
-                    except (UnicodeDecodeError, json.JSONDecodeError, ValueError, TypeError) as exc: raise _fail("LEDGER_CORRUPT", "malformed ledger JSON") from exc
-                    records.append(self._replay_validate(row))
-            except OSError as exc: raise _fail("LOCK_UNAVAILABLE", "attempt ledger cannot be read") from exc
-            self._replay_chain(records)
-            previous = records[-1]["record_digest"] if records else "sha256:" + "0" * 64
-            event["prev_digest"] = previous
-            event["record_digest"] = raw_file_digest(canonical_json(event))
-            event = self._replay_validate(event, allow_legacy_herdr=False)
+        with self._authority_lock(create_parent=True) as dirfd:
+            records = self._recover_attempt_authority(dirfd); previous = records[-1]["record_digest"] if records else "sha256:" + "0" * 64
+            event["prev_digest"] = previous; event["record_digest"] = raw_file_digest(canonical_json(event)); event = self._replay_validate(event, allow_legacy_herdr=False)
             same = [row for row in records if row["attempt_id"] == event["attempt_id"]]
-            if event["event"] == "STARTED" and any(row["event"] == "STARTED" and row["allowance_id"] == event["allowance_id"] and row["attempt_id"] != event["attempt_id"] for row in records):
-                raise _fail("ALLOWANCE_REUSED", "allowance is already bound to another attempt")
+            if event["event"] == "STARTED" and any(row["event"] == "STARTED" and row["allowance_id"] == event["allowance_id"] and row["attempt_id"] != event["attempt_id"] for row in records): raise _fail("ALLOWANCE_REUSED", "allowance is already bound to another attempt")
             if event["event"] == "STARTED" and same: raise _fail("DUPLICATE_ATTEMPT", "duplicate STARTED")
-            if event["event"] == "SETTLED" and (len(same) != 1 or same[0]["event"] != "STARTED"):
-                raise _fail("INVALID_ORDER", "SETTLED requires one prior STARTED")
+            if event["event"] == "SETTLED" and (len(same) != 1 or same[0]["event"] != "STARTED"): raise _fail("INVALID_ORDER", "SETTLED requires one prior STARTED")
             if event["event"] == "SETTLED":
                 started = same[0]
                 for key in ("work_id", "node_id", "observed_generation", "observed_ordinal", "provider_id", "branch", "candidate", "candidate_evidence", "request_packet", "output_root_id", "output_root_digest", "session_root_id", "session_root_digest", "request_digest"):
                     if event.get(key) != started.get(key): raise _fail("IDENTITY_MISMATCH", f"settlement {key} differs")
                 if event.get("herdr") != started.get("herdr"): raise _fail("IDENTITY_MISMATCH", "settlement Herdr identity differs")
+            journal = self._read_attempt_journal(dirfd); info = journal[0] if journal is not None else None
+            intent = {"schema_version": 1, "kind": "attempt_append_intent", "journal_exists": info is not None,
+                      "journal_device": info.st_dev if info is not None else 0, "journal_inode": info.st_ino if info is not None else 0,
+                      "prior_records": len(records), "prior_head_digest": previous, "event": event}
+            self._write_attempt_sidecar(dirfd, self.intent_path.name, intent)
+            try: info = self._append_journal_event(dirfd, event, create=journal is None)
+            except ProtocolError as exc:
+                if exc.code == "LOCK_UNAVAILABLE": self._remove_attempt_sidecar(dirfd, self.intent_path.name)
+                raise
             try:
-                stream.seek(0, 2); stream.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n"); stream.flush(); os.fsync(stream.fileno()); committed = True
-            except OSError as exc:
-                try:
-                    stream.seek(original_length); stream.truncate(); stream.flush(); os.fsync(stream.fileno())
-                except OSError as rollback_exc:
-                    raise _fail("LEDGER_CORRUPT", "attempt ledger append rollback could not be established") from rollback_exc
-                raise _fail("LOCK_UNAVAILABLE", "attempt ledger append could not be durably completed") from exc
-        finally:
-            unlock_error = None
-            if locked:
-                try: fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-                except OSError as exc: unlock_error = exc
-            try: stream.close()
-            except OSError as exc:
-                try: os.close(stream.fileno())
-                except OSError: pass
-                if unlock_error is None: unlock_error = exc
-            try: os.close(dirfd)
-            except OSError as exc:
-                if unlock_error is None: unlock_error = exc
-            if unlock_error is not None and not committed: raise _fail("LOCK_UNAVAILABLE", "attempt ledger lock could not be released") from unlock_error
-        return event
+                self._write_attempt_sidecar(dirfd, self.state_path.name, self._state_body(info, records + [event]))
+                self._remove_attempt_sidecar(dirfd, self.intent_path.name)
+            except ProtocolError as exc:
+                raise _fail("LEDGER_CORRUPT", "attempt append committed but authority state requires recovery") from exc
+            return event
 
 
 @dataclass(frozen=True)
@@ -1091,6 +1183,8 @@ class HerdrProvider:
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1: raise _fail("LEDGER_CORRUPT", "root claims is not a private regular file")
                 fcntl.flock(stream.fileno(), fcntl.LOCK_SH); rows = self._root_claim_rows(stream)
             self._validate_root_claim_coverage(rows, started)
+            if state is None:
+                raise _fail("LEDGER_CORRUPT", "root claim state is missing")
             if state is not None:
                 head = rows[-1]["record_digest"] if rows else "sha256:" + "0" * 64
                 if (state["journal_device"], state["journal_inode"], state["records"], state["head_digest"]) != (info.st_dev, info.st_ino, len(rows), head):
@@ -1125,7 +1219,7 @@ class HerdrProvider:
                         if state["head_digest"] != state_head: raise _fail("LEDGER_CORRUPT", "root claim state chain differs")
                         if state["records"] != len(rows) and (not authorized or any(row["attempt_id"] != attempt_id for row in rows[state["records"]:])):
                             raise _fail("LEDGER_CORRUPT", "unauthenticated root claim state lag")
-                    elif rows and not (authorized or all(len({row["root_id"] for row in rows if row["attempt_id"] == key}) == 2 for key in started)):
+                    elif (rows or started) and not authorized:
                         raise _fail("LEDGER_CORRUPT", "root claim state is missing")
                     if state is None or state["records"] != len(rows): self._write_root_claim_state(dirfd, file_stat, rows)
                     exact = next((row for row in rows if row["attempt_id"] == attempt_id and row["root_id"] == root_id and row["root_digest"] == root_digest and row["path"] == str(root) and row["request_digest"] == request_digest), None)
