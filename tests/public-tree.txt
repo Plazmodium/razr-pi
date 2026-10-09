@@ -54,6 +54,7 @@ tests/test_contract_preflight.py
 tests/test_herdr_provider.py
 tests/test_memory.py
 tests/test_named_regressions.py
+tests/test_pi_surface.py
 tests/test_primary_execution.py
 tests/test_provenance.py
 tests/test_public_boundary.py

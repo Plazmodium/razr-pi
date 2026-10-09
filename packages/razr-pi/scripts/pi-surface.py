@@ -29,15 +29,39 @@ def _request(root: Path, argv: tuple[str, ...]):
         termination_grace_ms=5000, max_stdout_bytes=1_048_576, max_stderr_bytes=262_144)
 
 
-def core_status(root: Path, work_id: str | None = None) -> object:
+def _fanout_status() -> dict[str, object]:
     sys.path.insert(0, str(PACKAGE))
-    from adapter.core_subprocess import invoke_core
-    argv = ("status", *( (work_id,) if work_id else () ), "--json")
-    response = invoke_core(_request(root, argv))
+    from adapter.herdr_provider import HerdrProvider
+    from adapter.protocol import ProtocolError
+    request = {"schema_version": 1, "request_id": "probe-" + uuid.uuid4().hex,
+               "required_capabilities": ["fresh_context", "working_directory", "bounded_time",
+                                          "bounded_output", "runtime_identity"],
+               "runtime": {"provider": "openai-codex", "model": "openai-codex/gpt-5.6-luna", "thinking": "medium"}}
     try:
-        return json.loads(response.stdout.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("core status response was not valid JSON") from exc
+        result = HerdrProvider().probe(request)
+        report = result["result"]
+        return {"availability": "available", "provider_id": report["provider_id"],
+                "capabilities": report["capabilities"], "report_digest": report["report_digest"]}
+    except ProtocolError as exc:
+        return {"availability": "unavailable", "code": exc.code}
+
+
+def core_status(root: Path, work_id: str | None = None) -> object:
+    if not work_id:
+        raise ValueError("status requires an adopted, materialized work_id")
+    sys.path.insert(0, str(PACKAGE))
+    from adapter.core_subprocess import read_workflow_context
+    read = read_workflow_context(_request(root, ("status", work_id, "--json")), work_id)
+    return {"schema_version": 1, "work_id": read.work_id, "stage": read.stage, "status": read.status,
+            "generation": read.generation, "node_id": read.node_id, "node_status": read.node_status,
+            "node_attempt": read.node_attempt, "node_result_ref": read.node_result_ref,
+            "candidate": {"repository": read.candidate_repository, "branch": read.candidate_branch,
+                          "commit": read.candidate_commit, "source_digest": read.candidate_source_digest},
+            "status_row": read.status_row,
+            "raw_state": {"path": read.raw_state_path, "digest": read.raw_state_digest,
+                          "bytes": read.raw_state_bytes, "core_identity": read.raw_state_core_identity,
+                          "source_digest": read.raw_state_source_digest},
+            "fanout": _fanout_status()}
 
 
 def _object(raw: str, label: str) -> dict[str, object]:
