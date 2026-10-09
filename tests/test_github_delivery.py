@@ -215,7 +215,7 @@ class GithubDeliveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             pidfile = Path(directory) / "child.pid"
             script = ("import os,subprocess,sys,time; child=subprocess.Popen([sys.executable,'-c',"
-                      "'import os,sys,time; open(sys.argv[1],\\\"w\\\").write(str(os.getpid())); time.sleep(10)',"
+                      "'import os,sys,signal,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); open(sys.argv[1],\\\"w\\\").write(str(os.getpid())); time.sleep(10)',"
                       "'" + str(pidfile) + "']); os.write(1,b'x'); time.sleep(10)")
             started = time.monotonic()
             with self.assertRaisesRegex(delivery.DeliveryError, "timed out"):
