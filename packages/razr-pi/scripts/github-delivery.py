@@ -91,6 +91,10 @@ def main() -> int:
                                         expected_source_digest=request.get("source_digest"))
         print(json.dumps({"schema_version": 1, "ok": True, "result": result}, sort_keys=True))
         return 0
+    except delivery.CandidateChanged as exc:
+        return fail("CANDIDATE_CHANGED", str(exc))
+    except delivery.IdentityMismatch as exc:
+        return fail("IDENTITY_MISMATCH", str(exc))
     except (KeyError, TypeError, ValueError, delivery.InvalidRequest) as exc:
         return fail("INVALID_REQUEST", str(exc))
     except delivery.DeliveryError as exc:

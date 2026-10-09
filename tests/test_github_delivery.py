@@ -111,12 +111,29 @@ class GithubDeliveryTests(unittest.TestCase):
             run.assert_not_called()
             read.assert_called_once()
 
+    def test_create_rejects_malformed_required_expectations_before_provider(self):
+        cases = [{"expected_repository": ""}, {"expected_repository": "not-a-repo"},
+                 {"expected_base_sha": ""}, {"expected_base_sha": "bad"},
+                 {"expected_head_sha": ""}, {"expected_head_sha": "bad"},
+                 {"expected_source_digest": ""}, {"expected_source_digest": "sha256:bad"}]
+        for override in cases:
+            kwargs = {"expected_repository": "o/r", "expected_base_sha": "b" * 40,
+                      "expected_head_sha": SHA, "expected_source_digest": DIGEST}
+            kwargs.update(override)
+            with self.subTest(override=override), patch.object(delivery, "remote_identity") as remote, \
+                 patch.object(delivery, "pushed_head") as heads, patch.object(delivery, "source_identity") as source, \
+                 patch.object(delivery, "_json") as query, patch.object(delivery, "_run") as mutate:
+                with self.assertRaises(delivery.InvalidRequest):
+                    delivery.create_pr(Path("."), base="base", head="feature", title="t", body="b", **kwargs)
+                remote.assert_not_called(); heads.assert_not_called(); source.assert_not_called()
+                query.assert_not_called(); mutate.assert_not_called()
+
     def test_create_source_mismatch_prevents_mutation(self):
         with patch.object(delivery, "remote_identity", return_value="o/r"), \
              patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA]), \
              patch.object(delivery, "source_identity", return_value="sha256:" + "d" * 64), \
              patch.object(delivery, "_json") as query, patch.object(delivery, "_run") as mutate:
-            with self.assertRaises(delivery.InvalidRequest):
+            with self.assertRaises(delivery.IdentityMismatch):
                 delivery.create_pr(Path("."), base="base", head="feature", title="t", body="b",
                                    expected_repository="o/r", expected_base_sha="b" * 40,
                                    expected_head_sha=SHA, expected_source_digest=DIGEST)
@@ -185,11 +202,18 @@ class GithubDeliveryTests(unittest.TestCase):
                  ('[{"name":"ci","state":"COMPLETED","bucket":"PASS"}]', "passing"),
                  ('[{"name":"ci","state":"completed","bucket":"skipping"}]', "skipping")]
         for raw, expected in cases:
-            with self.subTest(expected=expected), patch.object(delivery, "_run", return_value=raw):
+            with self.subTest(expected=expected), patch.object(delivery, "_run_result", return_value=(raw, "", 0)):
                 self.assertEqual(delivery._required_checks(Path("."), URL, "o/r")[1], expected)
 
+    def test_required_check_exit_one_requires_exact_no_checks_diagnostic(self):
+        with patch.object(delivery, "_run_result", return_value=("", "no checks reported on the 'feature' branch\n", 1)):
+            self.assertEqual(delivery._required_checks(Path("."), URL, "o/r")[1], "none")
+        with patch.object(delivery, "_run_result", return_value=("", "permission denied\n", 1)):
+            with self.assertRaises(delivery.DeliveryError):
+                delivery._required_checks(Path("."), URL, "o/r")
+
     def test_required_check_schema_rejects_unknown_fields(self):
-        with patch.object(delivery, "_run", return_value='[{"name":"ci","state":"COMPLETED","bucket":"PASS","x":1}]'):
+        with patch.object(delivery, "_run_result", return_value=('[{"name":"ci","state":"COMPLETED","bucket":"PASS","x":1}]', "", 0)):
             with self.assertRaises(delivery.DeliveryError):
                 delivery._required_checks(Path("."), URL, "o/r")
 
@@ -225,6 +249,20 @@ class GithubDeliveryTests(unittest.TestCase):
                 pid = int(pidfile.read_text())
                 with self.assertRaises(ProcessLookupError):
                     os.kill(pid, 0)
+        with tempfile.TemporaryDirectory() as directory:
+            pidfile = Path(directory) / "success-child.pid"
+            script = ("import os,sys,subprocess; subprocess.Popen([sys.executable,'-c',"
+                      "'import os,sys,time; os.close(1); os.close(2); open(sys.argv[1],\\\"w\\\").write(str(os.getpid())); time.sleep(10)',"
+                      "'" + str(pidfile) + "'])")
+            with self.assertRaises(delivery.DeliveryError):
+                delivery._capture(sys.executable, ["-c", script], Path("."), timeout=.5)
+            for _ in range(20):
+                if pidfile.exists() and pidfile.read_text():
+                    break
+                time.sleep(.01)
+            if pidfile.exists() and pidfile.read_text():
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(int(pidfile.read_text()), 0)
 
     def test_cli_rejects_malformed_input_and_wraps_snapshot(self):
         spec = importlib.util.spec_from_file_location("github_delivery_cli", Path(__file__).parents[1] / "packages/razr-pi/scripts/github-delivery.py")
@@ -251,6 +289,15 @@ class GithubDeliveryTests(unittest.TestCase):
                 self.assertEqual(cli.main(), 1)
                 self.assertIn('"code": "INVALID_REQUEST"', stream.getvalue())
                 auth.assert_not_called()
+        valid_read = '{"schema_version":1,"operation":"read","url":"https://github.com/o/r/pull/1"}'
+        for error, code in ((cli.delivery.CandidateChanged("moved"), "CANDIDATE_CHANGED"),
+                            (cli.delivery.IdentityMismatch("identity"), "IDENTITY_MISMATCH"),
+                            (cli.delivery.DeliveryError("network"), "PROVIDER_UNAVAILABLE")):
+            with self.subTest(code=code), patch.object(cli.delivery, "auth_preflight"), \
+                 patch.object(cli.delivery, "read_pr", side_effect=error), patch.object(sys, "stdin", io.StringIO(valid_read)), \
+                 patch.object(sys, "stdout", io.StringIO()) as stream:
+                self.assertEqual(cli.main(), 1)
+                self.assertIn('"code": "' + code + '"', stream.getvalue())
 
     def test_thread_comment_pagination_reads_multiple_pages(self):
         first = {"data": {"repository": {"pullRequest": {"reviewThreads": {

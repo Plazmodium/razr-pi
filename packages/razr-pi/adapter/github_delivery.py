@@ -9,6 +9,7 @@ import re
 import selectors
 import signal
 import subprocess
+import time
 from typing import Any
 
 SHA_RE = re.compile(r"[0-9a-f]{40}\Z")
@@ -37,6 +38,10 @@ class CandidateChanged(DeliveryError):
     pass
 
 
+class IdentityMismatch(DeliveryError):
+    pass
+
+
 def _env() -> dict[str, str]:
     names = ("PATH", "HOME", "TMPDIR", "GH_HOST", "LANG", "LC_ALL", "LC_CTYPE",
              "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_OPTIONAL_LOCKS",
@@ -51,8 +56,8 @@ def _env() -> dict[str, str]:
     return result
 
 
-def _capture(program: str, args: list[str], cwd: Path, *, timeout: float = 30.0,
-             accepted_codes: set[int] | None = None) -> tuple[bytes, bytes]:
+def _capture_detailed(program: str, args: list[str], cwd: Path, *, timeout: float = 30.0,
+                     accepted_codes: set[int] | None = None, allow_nonzero: bool = False) -> tuple[bytes, bytes, int]:
     if len(args) > 32 or sum(len(x) for x in args) > 32768:
         raise DeliveryError("bounded request refused")
     try:
@@ -67,45 +72,61 @@ def _capture(program: str, args: list[str], cwd: Path, *, timeout: float = 30.0,
     selector.register(process.stderr, selectors.EVENT_READ, "err")
     buffers = {"out": bytearray(), "err": bytearray()}
     limits = {"out": MAX_STDOUT, "err": MAX_STDERR}
-    deadline = __import__("time").monotonic() + timeout
-    overflow = False
-    while selector.get_map():
-        remaining = deadline - __import__("time").monotonic()
-        if remaining <= 0:
-            _terminate_group(process)
-            raise DeliveryError(f"{program} timed out")
-        for key, _ in selector.select(remaining):
-            # Buffered pipe reads can wait for size bytes after select().
-            chunk = os.read(key.fileobj.fileno(), 4096)
-            if not chunk:
-                selector.unregister(key.fileobj)
-                continue
-            name = key.data
-            if len(buffers[name]) + len(chunk) > limits[name]:
-                overflow = True
+    deadline = time.monotonic() + timeout
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 _terminate_group(process)
-                break
-            buffers[name].extend(chunk)
-        if overflow:
-            break
-    if overflow:
-        _terminate_group(process)
-        raise DeliveryError("bounded response refused")
-    if process.poll() is None:
-        remaining = deadline - __import__("time").monotonic()
-        if remaining <= 0:
-            _terminate_group(process)
-            raise DeliveryError(f"{program} timed out")
-        try:
-            process.wait(timeout=remaining)
-        except subprocess.TimeoutExpired:
-            _terminate_group(process)
-            raise DeliveryError(f"{program} timed out")
-    code = process.returncode
-    if code not in (accepted_codes or {0}):
-        # stderr is deliberately never included: credential helpers can write there.
-        raise DeliveryError(f"{program} request failed")
-    return bytes(buffers["out"]), bytes(buffers["err"])
+                raise DeliveryError(f"{program} timed out")
+            for key, _ in selector.select(remaining):
+                chunk = os.read(key.fileobj.fileno(), 4096)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                name = key.data
+                if len(buffers[name]) + len(chunk) > limits[name]:
+                    _terminate_group(process)
+                    raise DeliveryError("bounded response refused")
+                buffers[name].extend(chunk)
+        if process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_group(process)
+                raise DeliveryError(f"{program} timed out")
+            try:
+                process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                _terminate_group(process)
+                raise DeliveryError(f"{program} timed out")
+        code = process.returncode
+        _verify_group_clear(process)
+        if not allow_nonzero and code not in (accepted_codes or {0}):
+            raise DeliveryError(f"{program} request failed")
+        return bytes(buffers["out"]), bytes(buffers["err"]), int(code)
+    finally:
+        selector.close()
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+
+
+def _capture(program: str, args: list[str], cwd: Path, *, timeout: float = 30.0,
+             accepted_codes: set[int] | None = None) -> tuple[bytes, bytes]:
+    stdout, stderr, _ = _capture_detailed(program, args, cwd, timeout=timeout,
+                                          accepted_codes=accepted_codes)
+    return stdout, stderr
+
+
+def _verify_group_clear(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, 0)
+    except ProcessLookupError:
+        return
+    except PermissionError as exc:
+        raise DeliveryError("process-group cleanup could not be verified") from exc
+    _terminate_group(process)
+    raise DeliveryError("process-group descendant survived leader exit")
 
 
 def _terminate_group(process: subprocess.Popen[bytes]) -> None:
@@ -153,6 +174,16 @@ def _terminate_group(process: subprocess.Popen[bytes]) -> None:
     for stream in (process.stdout, process.stderr):
         if stream is not None:
             stream.close()
+
+
+def _run_result(program: str, args: list[str], cwd: Path, *, timeout: float = 30.0,
+                accepted_codes: set[int]) -> tuple[str, str, int]:
+    stdout, stderr, code = _capture_detailed(program, args, cwd, timeout=timeout,
+                                               accepted_codes=accepted_codes, allow_nonzero=True)
+    try:
+        return stdout.decode("utf-8"), stderr.decode("utf-8"), code
+    except UnicodeDecodeError as exc:
+        raise DeliveryError("non-UTF-8 response") from exc
 
 
 def _run(program: str, args: list[str], cwd: Path, *, timeout: float = 30.0,
@@ -361,12 +392,21 @@ def _repo_arg(repository: str) -> str:
 
 
 def _required_checks(root: Path, url: str, repository: str) -> tuple[list[dict[str, str]], str]:
-    try:
-        raw = _run("gh", ["pr", "checks", url, "--repo", _repo_arg(repository), "--required", "--json", "name,state,bucket"], root,
-                   accepted_codes={0, 1, 8})
-        rows = [] if not raw else json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise DeliveryError("check read-back is malformed") from exc
+    raw, diagnostic, code = _run_result("gh", ["pr", "checks", url, "--repo", _repo_arg(repository), "--required", "--json", "name,state,bucket"], root,
+                                         accepted_codes={0, 1, 8})
+    if code == 1:
+        # This is the only accepted empty-result failure: the bounded gh
+        # no-checks diagnostic observed from the supported CLI.
+        if raw or not re.fullmatch(r"no checks reported on the '[^'\n]{1,255}' branch\n?", diagnostic):
+            raise DeliveryError("required-check provider request failed")
+        rows = []
+    elif code == 8 and not raw:
+        raise DeliveryError("required-check provider request failed")
+    else:
+        try:
+            rows = [] if not raw else json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise DeliveryError("check read-back is malformed") from exc
     if not isinstance(rows, list):
         raise DeliveryError("check read-back is invalid")
     result = []
@@ -499,7 +539,7 @@ def read_pr(root: Path, url: str, *, expected_repository: str | None = None,
     repository = f"{owner}/{repo}"
     actual_repository = remote_identity(root)
     if repository.lower() != actual_repository.lower():
-        raise DeliveryError("PR repository differs from configured remote")
+        raise IdentityMismatch("PR repository differs from configured remote")
     fields = ("number,url,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,"
               "mergeStateStatus,mergeable,reviewDecision,reviewRequests,reviews,comments,"
               "statusCheckRollup,mergedAt,closedAt,updatedAt")
@@ -509,22 +549,22 @@ def read_pr(root: Path, url: str, *, expected_repository: str | None = None,
     if value["baseRefOid"] != actual_base_sha or value["headRefOid"] != actual_head_sha:
         raise CandidateChanged("PR SHA differs from current remote branch")
     if expected_repository and actual_repository.lower() != expected_repository.lower():
-        raise DeliveryError("PR repository expectation mismatch")
+        raise IdentityMismatch("PR repository expectation mismatch")
     if expected_base is not None and value["baseRefName"] != expected_base:
-        raise DeliveryError("PR base branch mismatch")
+        raise IdentityMismatch("PR base branch mismatch")
     if expected_base_sha is not None and actual_base_sha != expected_base_sha:
-        raise DeliveryError("PR base commit mismatch")
+        raise IdentityMismatch("PR base commit mismatch")
     if expected_head is not None and value["headRefName"] != expected_head:
-        raise DeliveryError("PR head branch mismatch")
+        raise IdentityMismatch("PR head branch mismatch")
     if expected_head_sha is not None and actual_head_sha != expected_head_sha:
-        raise DeliveryError("PR head commit mismatch")
+        raise IdentityMismatch("PR head commit mismatch")
     checks, status = _required_checks(root, url, actual_repository)
     value["requiredChecks"] = checks
     value["requiredChecksStatus"] = status
     value["reviewThreads"] = _threads(root, owner, repo, number)
     actual_source_digest = source_identity(root, actual_head_sha)
     if expected_source_digest is not None and actual_source_digest != expected_source_digest:
-        raise InvalidRequest("PR source identity mismatch")
+        raise IdentityMismatch("PR source identity mismatch")
     value["sourceDigest"] = actual_source_digest
     return value
 
@@ -555,23 +595,25 @@ def create_pr(root: Path, *, base: str, head: str, title: str, body: str,
               expected_repository: str | None = None, expected_base_sha: str | None = None,
               expected_head_sha: str | None = None, expected_source_digest: str | None = None) -> dict[str, Any]:
     if not base or not head or not title or len(title) > 256 or len(body) > 100000 \
-            or not isinstance(expected_repository, str) or not isinstance(expected_base_sha, str) \
-            or not isinstance(expected_head_sha, str) or not isinstance(expected_source_digest, str):
+            or not isinstance(expected_repository, str) or not re.fullmatch(r"[^/\\s]+/[^/\\s]+", expected_repository) \
+            or not isinstance(expected_base_sha, str) or not SHA_RE.fullmatch(expected_base_sha) \
+            or not isinstance(expected_head_sha, str) or not SHA_RE.fullmatch(expected_head_sha) \
+            or not isinstance(expected_source_digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", expected_source_digest):
         raise InvalidRequest("create requires explicit repository, base_sha, head_sha, and source_digest")
     repository = remote_identity(root)
     if expected_repository and expected_repository.lower() != repository.lower():
-        raise InvalidRequest("repository expectation mismatch")
+        raise IdentityMismatch("repository expectation mismatch")
     base_sha = pushed_head(root, base)
     head_sha = pushed_head(root, head)
     if expected_base_sha and expected_base_sha != base_sha:
-        raise InvalidRequest("base commit expectation mismatch")
+        raise IdentityMismatch("base commit expectation mismatch")
     if expected_head_sha and expected_head_sha != head_sha:
-        raise InvalidRequest("head commit expectation mismatch")
+        raise IdentityMismatch("head commit expectation mismatch")
     if not SHA_RE.fullmatch(base_sha) or not SHA_RE.fullmatch(head_sha):
         raise InvalidRequest("PR commit expectation is not a full Git object id")
     digest = source_identity(root, head_sha)
     if expected_source_digest is not None and expected_source_digest != digest:
-        raise InvalidRequest("PR source identity expectation mismatch")
+        raise IdentityMismatch("PR source identity expectation mismatch")
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
         raise InvalidRequest("PR source identity is invalid")
     existing = _existing_open(root, repository, base, head, base_sha, head_sha, digest)
