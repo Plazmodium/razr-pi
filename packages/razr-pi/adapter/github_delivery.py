@@ -34,7 +34,8 @@ def _env() -> dict[str, str]:
     return result
 
 
-def _run(program: str, args: list[str], cwd: Path, *, timeout: float = 30.0) -> str:
+def _run(program: str, args: list[str], cwd: Path, *, timeout: float = 30.0,
+         accepted_codes: set[int] | None = None) -> str:
     if len(args) > 32 or sum(len(x) for x in args) > 32768:
         raise DeliveryError("bounded request refused")
     try:
@@ -45,7 +46,7 @@ def _run(program: str, args: list[str], cwd: Path, *, timeout: float = 30.0) -> 
         raise DeliveryError(f"{program} unavailable or timed out") from exc
     if len(completed.stdout.encode()) > MAX_OUTPUT or len(completed.stderr.encode()) > 262144:
         raise DeliveryError("bounded response refused")
-    if completed.returncode:
+    if completed.returncode not in (accepted_codes or {0}):
         # Never include gh stderr: it can contain credential-helper diagnostics.
         raise DeliveryError(f"{program} request failed")
     return completed.stdout.strip()
@@ -131,7 +132,11 @@ def read_pr(root: Path, url: str) -> dict[str, Any]:
     for key in ("reviews", "comments", "reviewRequests", "statusCheckRollup"):
         if not isinstance(value.get(key), list):
             raise DeliveryError("PR collection read-back is invalid")
-    checks = _json("gh", ["pr", "checks", url, "--json", "name,state,bucket"], root)
+    try:
+        checks = json.loads(_run("gh", ["pr", "checks", url, "--json", "name,state,bucket"], root,
+                                 accepted_codes={0, 1, 8}))
+    except json.JSONDecodeError as exc:
+        raise DeliveryError("check read-back is malformed") from exc
     if not isinstance(checks, list) or any(not isinstance(row, dict) for row in checks):
         raise DeliveryError("check read-back is invalid")
     value["requiredChecks"] = checks
