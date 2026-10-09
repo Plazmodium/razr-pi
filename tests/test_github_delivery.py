@@ -1,3 +1,6 @@
+import contextlib
+import importlib.util
+import io
 import json
 import subprocess
 import sys
@@ -42,6 +45,8 @@ class GithubDeliveryTests(unittest.TestCase):
         with patch.object(delivery, "_json", return_value=pr_value()), \
              patch.object(delivery, "_required_checks", return_value=([], "none")), \
              patch.object(delivery, "_threads", return_value=[]), \
+             patch.object(delivery, "remote_identity", return_value="o/r"), \
+             patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA]), \
              patch.object(delivery, "source_identity", return_value=DIGEST):
             result = delivery.read_pr(Path("."), URL, expected_repository="o/r",
                                       expected_base="campaign/razr-pi-next", expected_base_sha="b" * 40,
@@ -56,6 +61,8 @@ class GithubDeliveryTests(unittest.TestCase):
             with self.subTest(kwargs=kwargs), patch.object(delivery, "_json", return_value=pr_value()), \
                  patch.object(delivery, "_required_checks", return_value=([], "none")), \
                  patch.object(delivery, "_threads", return_value=[]), \
+                 patch.object(delivery, "remote_identity", return_value="o/r"), \
+                 patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA]), \
                  patch.object(delivery, "source_identity", return_value=DIGEST):
                 with self.assertRaises(delivery.DeliveryError):
                     delivery.read_pr(Path("."), URL, **kwargs)
@@ -93,12 +100,12 @@ class GithubDeliveryTests(unittest.TestCase):
                  ('[{"name":"ci","state":"COMPLETED","bucket":"PASS"}]', "passing")]
         for raw, expected in cases:
             with self.subTest(expected=expected), patch.object(delivery, "_run", return_value=raw):
-                self.assertEqual(delivery._required_checks(Path("."), URL)[1], expected)
+                self.assertEqual(delivery._required_checks(Path("."), URL, "o/r")[1], expected)
 
     def test_required_check_schema_rejects_unknown_fields(self):
-        with patch.object(delivery, "_run", return_value='[{"name":"ci","state":"PASS","bucket":"PASS","x":1}]'):
+        with patch.object(delivery, "_run", return_value='[{"name":"ci","state":"COMPLETED","bucket":"PASS","x":1}]'):
             with self.assertRaises(delivery.DeliveryError):
-                delivery._required_checks(Path("."), URL)
+                delivery._required_checks(Path("."), URL, "o/r")
 
     def test_thread_pagination_is_bounded_and_validated(self):
         page = {"data": {"repository": {"pullRequest": {"reviewThreads": {
@@ -121,6 +128,22 @@ class GithubDeliveryTests(unittest.TestCase):
                 delivery._capture(sys.executable, ["-c", script], Path("."))
         with self.assertRaisesRegex(delivery.DeliveryError, "timed out"):
             delivery._capture(sys.executable, ["-c", "import time; time.sleep(2)"], Path("."), timeout=.05)
+
+    def test_cli_rejects_malformed_input_and_wraps_snapshot(self):
+        spec = importlib.util.spec_from_file_location("github_delivery_cli", Path(__file__).parents[1] / "packages/razr-pi/scripts/github-delivery.py")
+        cli = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(cli)
+        output = io.StringIO()
+        with patch.object(cli, "sys", sys), patch.object(sys, "stdin", io.StringIO("[]")), patch.object(sys, "stdout", output):
+            self.assertEqual(cli.main(), 1)
+        self.assertIn('"ok": false', output.getvalue())
+        output = io.StringIO()
+        with patch.object(cli.delivery, "auth_preflight"), patch.object(cli.delivery, "snapshot", return_value={"commit": SHA}), \
+             patch.object(sys, "stdin", io.StringIO('{"schema_version":1,"operation":"snapshot","branch":"feature"}')), \
+             patch.object(sys, "stdout", output):
+            self.assertEqual(cli.main(), 0)
+        self.assertIn('"commit": "' + SHA, output.getvalue())
 
     def test_create_has_no_lifecycle_flags(self):
         with patch.object(delivery, "remote_identity", return_value="o/r"), \

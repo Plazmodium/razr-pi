@@ -17,6 +17,12 @@ PR_RE = re.compile(r"https://github\.com/([^/]+)/([^/]+)/pull/(\d+)/?\Z")
 MAX_STDOUT = 1024 * 1024
 MAX_STDERR = 262144
 MAX_THREADS_PAGES = 10
+MAX_THREAD_COMMENTS = 100
+PR_STATES = {"OPEN", "CLOSED", "MERGED"}
+MERGEABLE = {"CONFLICTING", "MERGEABLE", "UNKNOWN"}
+MERGE_STATES = {"BEHIND", "BLOCKED", "CLEAN", "DIRTY", "DRAFT", "HAS_HOOK_ERRORS", "UNKNOWN", "UNSTABLE"}
+CHECK_BUCKETS = {"PASS", "FAIL", "PENDING", "SKIPPING"}
+CHECK_STATES = {"QUEUED", "IN_PROGRESS", "COMPLETED", "EXPECTED", "REQUESTED", "WAITING", "PENDING"}
 
 
 class DeliveryError(RuntimeError):
@@ -41,7 +47,8 @@ def _capture(program: str, args: list[str], cwd: Path, *, timeout: float = 30.0,
         raise DeliveryError("bounded request refused")
     try:
         process = subprocess.Popen([program, *args], cwd=cwd, env=_env(), stdin=subprocess.DEVNULL,
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False,
+                                   start_new_session=True)
     except OSError as exc:
         raise DeliveryError(f"{program} unavailable") from exc
     assert process.stdout is not None and process.stderr is not None
@@ -55,8 +62,7 @@ def _capture(program: str, args: list[str], cwd: Path, *, timeout: float = 30.0,
     while selector.get_map():
         remaining = deadline - __import__("time").monotonic()
         if remaining <= 0:
-            process.kill()
-            process.wait()
+            _terminate_group(process)
             raise DeliveryError(f"{program} timed out")
         for key, _ in selector.select(remaining):
             chunk = key.fileobj.read(4096)
@@ -66,19 +72,44 @@ def _capture(program: str, args: list[str], cwd: Path, *, timeout: float = 30.0,
             name = key.data
             if len(buffers[name]) + len(chunk) > limits[name]:
                 overflow = True
-                process.kill()
+                _terminate_group(process)
                 break
             buffers[name].extend(chunk)
         if overflow:
             break
     if overflow:
-        process.wait()
+        _terminate_group(process)
         raise DeliveryError("bounded response refused")
     code = process.wait()
     if code not in (accepted_codes or {0}):
         # stderr is deliberately never included: credential helpers can write there.
         raise DeliveryError(f"{program} request failed")
     return bytes(buffers["out"]), bytes(buffers["err"])
+
+
+def _terminate_group(process: subprocess.Popen[bytes]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        try:
+            process.wait()
+        except subprocess.TimeoutExpired:
+            pass
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+        return
+    try:
+        process.wait(timeout=0.25)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        process.wait()
+    for stream in (process.stdout, process.stderr):
+        if stream is not None:
+            stream.close()
 
 
 def _run(program: str, args: list[str], cwd: Path, *, timeout: float = 30.0,
@@ -162,9 +193,15 @@ def _validate_collection(value: Any, field: str) -> list[dict[str, Any]]:
 
 
 def _validate_pr(value: Any, url: str, owner: str, repo: str, number: int) -> dict[str, Any]:
-    if not isinstance(value, dict) or value.get("url") != url or value.get("number") != number:
-        raise DeliveryError("PR identity read-back mismatch")
-    for field in ("state", "baseRefName", "headRefName", "mergeStateStatus", "mergeable"):
+    allowed = {"number", "url", "state", "isDraft", "baseRefName", "baseRefOid", "headRefName", "headRefOid",
+               "mergeStateStatus", "mergeable", "reviewDecision", "reviewRequests", "reviews", "comments",
+               "statusCheckRollup", "mergedAt", "closedAt", "updatedAt"}
+    if not isinstance(value, dict) or set(value) != allowed or value.get("url") != url or value.get("number") != number:
+        raise DeliveryError("PR identity/schema read-back mismatch")
+    if value["state"] not in PR_STATES or value["mergeStateStatus"] not in MERGE_STATES \
+            or value["mergeable"] not in MERGEABLE:
+        raise DeliveryError("unknown PR state enum")
+    for field in ("baseRefName", "headRefName"):
         _string(value.get(field), field)
     for field in ("baseRefOid", "headRefOid"):
         if not SHA_RE.fullmatch(_string(value.get(field), field)):
@@ -172,21 +209,31 @@ def _validate_pr(value: Any, url: str, owner: str, repo: str, number: int) -> di
     for field in ("reviews", "comments", "reviewRequests", "statusCheckRollup"):
         rows = _validate_collection(value.get(field), field)
         for row in rows:
-            if field == "reviewRequests" and not isinstance(row.get("login") or row.get("name"), str):
-                raise DeliveryError("malformed review request")
-            if field == "reviews" and not isinstance(row.get("state"), str):
-                raise DeliveryError("malformed review")
-            if field == "comments" and not isinstance(row.get("body"), str):
-                raise DeliveryError("malformed comment")
-    if not isinstance(value.get("isDraft"), bool):
-        raise DeliveryError("malformed draft state")
+            if field == "reviewRequests":
+                if set(row) - {"login", "name"} or not isinstance(row.get("login") or row.get("name"), str):
+                    raise DeliveryError("malformed review request")
+            elif field == "reviews":
+                if set(row) - {"id", "author", "body", "state", "submittedAt", "updatedAt"} \
+                        or not isinstance(row.get("state"), str) or row["state"] not in {"APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING"}:
+                    raise DeliveryError("malformed review")
+            elif field == "comments":
+                if set(row) - {"id", "author", "body", "createdAt", "updatedAt", "isMinimized"} \
+                        or not isinstance(row.get("body"), str):
+                    raise DeliveryError("malformed comment")
+            else:
+                if set(row) - {"context", "conclusion", "detailsUrl", "event", "group", "name", "startedAt", "state", "status", "workflowName"}:
+                    raise DeliveryError("malformed status check")
+                if not isinstance(row.get("name") or row.get("context"), str):
+                    raise DeliveryError("malformed status check")
+    if not isinstance(value.get("isDraft"), bool) or not isinstance(value.get("reviewDecision"), str):
+        raise DeliveryError("malformed draft/review state")
     value["repository"] = f"{owner}/{repo}"
     return value
 
 
-def _required_checks(root: Path, url: str) -> tuple[list[dict[str, str]], str]:
+def _required_checks(root: Path, url: str, repository: str) -> tuple[list[dict[str, str]], str]:
     try:
-        raw = _run("gh", ["pr", "checks", url, "--required", "--json", "name,state,bucket"], root,
+        raw = _run("gh", ["pr", "checks", url, "--repo", repository, "--required", "--json", "name,state,bucket"], root,
                    accepted_codes={0, 1, 8})
         rows = [] if not raw else json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -199,8 +246,8 @@ def _required_checks(root: Path, url: str) -> tuple[list[dict[str, str]], str]:
             raise DeliveryError("check row schema is invalid")
         if not all(isinstance(row[x], str) and row[x] for x in row):
             raise DeliveryError("check row is invalid")
-        if row["bucket"] not in {"PASS", "FAIL", "PENDING", "SKIPPING"}:
-            raise DeliveryError("unknown check bucket")
+        if row["state"] not in CHECK_STATES or row["bucket"] not in CHECK_BUCKETS:
+            raise DeliveryError("unknown check state/bucket")
         result.append({x: row[x] for x in ("name", "state", "bucket")})
     if not result:
         return result, "none"
@@ -208,6 +255,8 @@ def _required_checks(root: Path, url: str) -> tuple[list[dict[str, str]], str]:
         return result, "failing"
     if any(row["bucket"] == "PENDING" for row in result):
         return result, "pending"
+    if any(row["bucket"] == "SKIPPING" for row in result):
+        return result, "skipping"
     return result, "passing"
 
 
@@ -219,7 +268,7 @@ def _threads(root: Path, owner: str, repo: str, number: int) -> list[dict[str, A
     result: list[dict[str, Any]] = []
     cursor: str | None = None
     for _ in range(MAX_THREADS_PAGES):
-        args = ["api", "graphql", "-f", f"query={query}", "-F", f"o={owner}",
+        args = ["api", "graphql", "--repo", f"{owner}/{repo}", "-f", f"query={query}", "-F", f"o={owner}",
                 "-F", f"r={repo}", "-F", f"n={number}"]
         if cursor is not None:
             args += ["-F", f"a={cursor}"]
@@ -234,17 +283,21 @@ def _threads(root: Path, owner: str, repo: str, number: int) -> list[dict[str, A
                 if set(node) != {"id", "isResolved", "comments"} or not isinstance(node["id"], str) \
                         or not isinstance(node["isResolved"], bool):
                     raise KeyError("thread")
-                comments = node["comments"].get("nodes") if isinstance(node["comments"], dict) else None
-                if not isinstance(comments, list):
+                comments_obj = node["comments"] if isinstance(node["comments"], dict) else None
+                comments = comments_obj.get("nodes") if comments_obj is not None else None
+                if comments_obj is None or set(comments_obj) != {"nodes"} or not isinstance(comments, list) \
+                        or len(comments) > MAX_THREAD_COMMENTS:
                     raise KeyError("comments")
                 for comment in comments:
-                    if not isinstance(comment, dict) or not isinstance(comment.get("id"), str) \
-                            or not isinstance(comment.get("body"), str):
+                    if not isinstance(comment, dict) or set(comment) != {"id", "body", "author", "updatedAt", "path"} \
+                            or not isinstance(comment.get("id"), str) or not isinstance(comment.get("body"), str):
                         raise KeyError("comment")
             result.extend(nodes)
             has_next = info.get("hasNextPage")
             next_cursor = info.get("endCursor")
-            if not isinstance(has_next, bool) or (has_next and not isinstance(next_cursor, str)):
+            if set(info) != {"hasNextPage", "endCursor"} or not isinstance(has_next, bool) \
+                    or (has_next and not isinstance(next_cursor, str)) \
+                    or (not has_next and next_cursor is not None):
                 raise KeyError("pageInfo")
             if not has_next:
                 return result
@@ -262,35 +315,42 @@ def read_pr(root: Path, url: str, *, expected_repository: str | None = None,
             expected_source_digest: str | None = None) -> dict[str, Any]:
     owner, repo, number = _pr_url(url)
     repository = f"{owner}/{repo}"
-    if expected_repository and repository.lower() != expected_repository.lower():
-        raise DeliveryError("PR repository does not match expectation")
+    actual_repository = remote_identity(root)
+    if repository.lower() != actual_repository.lower():
+        raise DeliveryError("PR repository differs from configured remote")
     fields = ("number,url,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,"
               "mergeStateStatus,mergeable,reviewDecision,reviewRequests,reviews,comments,"
               "statusCheckRollup,mergedAt,closedAt,updatedAt")
-    value = _validate_pr(_json("gh", ["pr", "view", url, "--json", fields], root), url, owner, repo, number)
+    value = _validate_pr(_json("gh", ["pr", "view", url, "--repo", actual_repository, "--json", fields], root), url, owner, repo, number)
+    actual_base_sha = pushed_head(root, value["baseRefName"])
+    actual_head_sha = pushed_head(root, value["headRefName"])
+    if value["baseRefOid"] != actual_base_sha or value["headRefOid"] != actual_head_sha:
+        raise DeliveryError("PR SHA differs from current remote branch")
+    if expected_repository and actual_repository.lower() != expected_repository.lower():
+        raise DeliveryError("PR repository expectation mismatch")
     if expected_base is not None and value["baseRefName"] != expected_base:
         raise DeliveryError("PR base branch mismatch")
-    if expected_base_sha is not None and value["baseRefOid"] != expected_base_sha:
+    if expected_base_sha is not None and actual_base_sha != expected_base_sha:
         raise DeliveryError("PR base commit mismatch")
     if expected_head is not None and value["headRefName"] != expected_head:
         raise DeliveryError("PR head branch mismatch")
-    if expected_head_sha is not None and value["headRefOid"] != expected_head_sha:
+    if expected_head_sha is not None and actual_head_sha != expected_head_sha:
         raise DeliveryError("PR head commit mismatch")
-    checks, status = _required_checks(root, url)
+    checks, status = _required_checks(root, url, actual_repository)
     value["requiredChecks"] = checks
     value["requiredChecksStatus"] = status
     value["reviewThreads"] = _threads(root, owner, repo, number)
-    if expected_source_digest is not None:
-        if not expected_head_sha or source_identity(root, expected_head_sha) != expected_source_digest:
-            raise DeliveryError("PR source identity mismatch")
-        value["sourceDigest"] = expected_source_digest
+    actual_source_digest = source_identity(root, actual_head_sha)
+    if expected_source_digest is not None and actual_source_digest != expected_source_digest:
+        raise DeliveryError("PR source identity mismatch")
+    value["sourceDigest"] = actual_source_digest
     return value
 
 
 def _existing_open(root: Path, repository: str, base: str, head: str, base_sha: str,
                    head_sha: str, source_digest: str) -> dict[str, Any] | None:
-    rows = _json("gh", ["pr", "list", "--state", "open", "--base", base, "--head", head,
-                         "--json", "url"], root)
+    rows = _json("gh", ["pr", "list", "--repo", repository, "--state", "open", "--base", base,
+                         "--head", head, "--json", "url"], root)
     if not isinstance(rows, list) or any(not isinstance(row, dict) or set(row) != {"url"} for row in rows):
         raise DeliveryError("existing PR query schema is invalid")
     if len(rows) > 1:
@@ -308,9 +368,15 @@ def create_pr(root: Path, *, base: str, head: str, title: str, body: str,
               expected_head_sha: str | None = None, expected_source_digest: str | None = None) -> dict[str, Any]:
     if not base or not head or not title or len(title) > 256 or len(body) > 100000:
         raise DeliveryError("invalid PR request")
-    repository = expected_repository or remote_identity(root)
-    base_sha = expected_base_sha or pushed_head(root, base)
-    head_sha = expected_head_sha or pushed_head(root, head)
+    repository = remote_identity(root)
+    if expected_repository and expected_repository.lower() != repository.lower():
+        raise DeliveryError("repository expectation mismatch")
+    base_sha = pushed_head(root, base)
+    head_sha = pushed_head(root, head)
+    if expected_base_sha and expected_base_sha != base_sha:
+        raise DeliveryError("base commit expectation mismatch")
+    if expected_head_sha and expected_head_sha != head_sha:
+        raise DeliveryError("head commit expectation mismatch")
     if not SHA_RE.fullmatch(base_sha) or not SHA_RE.fullmatch(head_sha):
         raise DeliveryError("PR commit expectation is not a full Git object id")
     digest = expected_source_digest or source_identity(root, head_sha)
@@ -319,8 +385,15 @@ def create_pr(root: Path, *, base: str, head: str, title: str, body: str,
     existing = _existing_open(root, repository, base, head, base_sha, head_sha, digest)
     if existing is not None:
         return existing
-    url = _run("gh", ["pr", "create", "--base", base, "--head", head, "--title", title,
-                       "--body", body], root)
+    try:
+        url = _run("gh", ["pr", "create", "--repo", repository, "--base", base, "--head", head,
+                           "--title", title, "--body", body], root)
+    except DeliveryError:
+        # A concurrent creator may have won. One read-only exact lookup is the only recovery.
+        recovered = _existing_open(root, repository, base, head, base_sha, head_sha, digest)
+        if recovered is not None:
+            return recovered
+        raise
     return read_pr(root, url, expected_repository=repository, expected_base=base,
                    expected_base_sha=base_sha, expected_head=head, expected_head_sha=head_sha,
                    expected_source_digest=digest)

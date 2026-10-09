@@ -34,6 +34,7 @@ packages/razr-pi/runtime/templates/spec.md
 packages/razr-pi/runtime/templates/state.yaml
 packages/razr-pi/scripts/adopt.py
 packages/razr-pi/scripts/contract-preflight.py
+packages/razr-pi/scripts/github-delivery.py
 packages/razr-pi/scripts/named-regressions.py
 packages/razr-pi/scripts/pi-surface.py
 packages/razr-pi/scripts/primary.py
