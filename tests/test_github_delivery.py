@@ -32,8 +32,10 @@ def pr_value(**changes):
 
 class GithubDeliveryTests(unittest.TestCase):
     def test_remote_and_head_are_strict(self):
-        with patch.object(delivery, "_run", side_effect=["git@github.com:Plazmodium/razr-pi.git", SHA + "  refs/heads/feature\n"]):
+        with patch.object(delivery, "_run", return_value="git@github.com:Plazmodium/razr-pi.git"):
             self.assertEqual(delivery.remote_identity(Path(".")), "Plazmodium/razr-pi")
+        with patch.object(delivery, "remote_identity", return_value="Plazmodium/razr-pi"), \
+             patch.object(delivery, "_run", return_value=SHA):
             self.assertEqual(delivery.pushed_head(Path("."), "feature"), SHA)
 
     def test_snapshot_has_source_identity_and_base_head(self):
@@ -184,6 +186,20 @@ class GithubDeliveryTests(unittest.TestCase):
                                    expected_head_sha=SHA, expected_source_digest=DIGEST)
             mutate.assert_not_called()
 
+    def test_new_candidate_identity_mismatch_is_compensated(self):
+        with patch.object(delivery, "remote_identity", return_value="o/r"), \
+             patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA, "b" * 40, SHA]), \
+             patch.object(delivery, "source_identity", side_effect=[DIGEST, DIGEST]), \
+             patch.object(delivery, "_json", return_value=[]), patch.object(delivery, "_run", return_value=URL), \
+             patch.object(delivery, "read_pr", side_effect=delivery.IdentityMismatch("PR head commit mismatch")), \
+             patch.object(delivery, "_close_created", side_effect=delivery.DeliveryError("close failed")) as close:
+            with self.assertRaises(delivery.CandidateChanged) as raised:
+                delivery.create_pr(Path("."), base="base", head="feature", title="t", body="b",
+                                   expected_repository="o/r", expected_base_sha="b" * 40,
+                                   expected_head_sha=SHA, expected_source_digest=DIGEST)
+            self.assertIn("uncertain", str(raised.exception))
+            close.assert_called_once()
+
     def test_new_mismatched_pr_is_closed_but_race_recovery_is_not(self):
         with patch.object(delivery, "remote_identity", return_value="o/r"), \
              patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA, "b" * 40, SHA]), \
@@ -214,7 +230,8 @@ class GithubDeliveryTests(unittest.TestCase):
                  ('[{"name":"ci","state":"QUEUED","bucket":"PENDING"}]', "pending"),
                  ('[{"name":"ci","state":"COMPLETED","bucket":"FAIL"}]', "failing"),
                  ('[{"name":"ci","state":"COMPLETED","bucket":"PASS"}]', "passing"),
-                 ('[{"name":"ci","state":"completed","bucket":"skipping"}]', "skipping")]
+                 ('[{"name":"ci","state":"completed","bucket":"skipping"}]', "skipping"),
+                 ('[{"name":"ci","state":"COMPLETED","bucket":"cancel"}]', "failing")]
         for raw, expected in cases:
             with self.subTest(expected=expected), patch.object(delivery, "_run_result", return_value=(raw, "", 0)):
                 self.assertEqual(delivery._required_checks(Path("."), URL, "o/r")[1], expected)
@@ -222,6 +239,9 @@ class GithubDeliveryTests(unittest.TestCase):
     def test_required_check_exit_one_requires_exact_no_checks_diagnostic(self):
         with patch.object(delivery, "_run_result", return_value=("", "no checks reported on the 'feature' branch\n", 1)):
             self.assertEqual(delivery._required_checks(Path("."), URL, "o/r")[1], "none")
+        failing = '[{"name":"ci","state":"FAILURE","bucket":"fail"}]'
+        with patch.object(delivery, "_run_result", return_value=(failing, "", 1)):
+            self.assertEqual(delivery._required_checks(Path("."), URL, "o/r")[1], "failing")
         with patch.object(delivery, "_run_result", return_value=("", "permission denied\n", 1)):
             with self.assertRaises(delivery.DeliveryError):
                 delivery._required_checks(Path("."), URL, "o/r")
@@ -251,6 +271,18 @@ class GithubDeliveryTests(unittest.TestCase):
             "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}}
         with patch.object(delivery, "_json", return_value=malformed), self.assertRaises(delivery.DeliveryError):
             delivery._threads(Path("."), "o", "r", 1)
+
+    def test_selector_setup_failures_cleanup_child(self):
+        script = "import time; time.sleep(10)"
+        with patch.object(delivery.selectors, "DefaultSelector", side_effect=RuntimeError("selector")):
+            with self.assertRaises(delivery.DeliveryError):
+                delivery._capture(sys.executable, ["-c", script], Path("."), timeout=.2)
+        class BrokenSelector:
+            def register(self, *_args):
+                raise RuntimeError("register")
+        with patch.object(delivery.selectors, "DefaultSelector", return_value=BrokenSelector()):
+            with self.assertRaises(delivery.DeliveryError):
+                delivery._capture(sys.executable, ["-c", script], Path("."), timeout=.2)
 
     def test_streaming_overflow_timeout_and_process_group_cleanup(self):
         script = "import sys; sys.stderr.write('credential-secret'); sys.stdout.write('x'*100); sys.stdout.flush()"

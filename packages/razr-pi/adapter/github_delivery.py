@@ -23,7 +23,7 @@ MAX_THREAD_COMMENTS = 100
 PR_STATES = {"OPEN", "CLOSED", "MERGED"}
 MERGEABLE = {"CONFLICTING", "MERGEABLE", "UNKNOWN"}
 MERGE_STATES = {"BEHIND", "BLOCKED", "CLEAN", "DIRTY", "DRAFT", "HAS_HOOK_ERRORS", "UNKNOWN", "UNSTABLE"}
-CHECK_BUCKETS = {"PASS", "FAIL", "PENDING", "SKIPPING"}
+CHECK_BUCKETS = {"PASS", "FAIL", "PENDING", "SKIPPING", "CANCEL"}
 CHECK_STATES = {"QUEUED", "IN_PROGRESS", "COMPLETED", "EXPECTED", "REQUESTED", "WAITING", "PENDING", "SUCCESS", "FAILURE", "ERROR"}
 
 
@@ -67,10 +67,21 @@ def _capture_detailed(program: str, args: list[str], cwd: Path, *, timeout: floa
                                    start_new_session=True)
     except OSError as exc:
         raise DeliveryError(f"{program} unavailable") from exc
-    assert process.stdout is not None and process.stderr is not None
-    selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ, "out")
-    selector.register(process.stderr, selectors.EVENT_READ, "err")
+    selector = None
+    try:
+        assert process.stdout is not None and process.stderr is not None
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ, "out")
+        selector.register(process.stderr, selectors.EVENT_READ, "err")
+    except BaseException as exc:
+        try:
+            _terminate_group(process)
+        except DeliveryError:
+            pass
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+        raise DeliveryError("subprocess capture setup failed") from exc
     buffers = {"out": bytearray(), "err": bytearray()}
     limits = {"out": MAX_STDOUT, "err": MAX_STDERR}
     deadline = time.monotonic() + timeout
@@ -105,14 +116,21 @@ def _capture_detailed(program: str, args: list[str], cwd: Path, *, timeout: floa
         if code not in (accepted_codes or {0}):
             raise DeliveryError(f"{program} request failed")
         return bytes(buffers["out"]), bytes(buffers["err"]), int(code)
-    except BaseException:
+    except DeliveryError:
         try:
             _terminate_group(process)
         except DeliveryError:
             pass
         raise
+    except BaseException as exc:
+        try:
+            _terminate_group(process)
+        except DeliveryError:
+            pass
+        raise DeliveryError("subprocess capture failed") from exc
     finally:
-        selector.close()
+        if selector is not None and hasattr(selector, "close"):
+            selector.close()
         for stream in (process.stdout, process.stderr):
             if stream is not None:
                 stream.close()
@@ -232,10 +250,15 @@ def remote_identity(root: Path, remote: str = "origin") -> str:
 def pushed_head(root: Path, branch: str, remote: str = "origin") -> str:
     if not re.fullmatch(r"[A-Za-z0-9._/-]{1,255}", branch) or ".." in branch:
         raise InvalidRequest("invalid branch")
-    rows = _run("git", ["ls-remote", remote, f"refs/heads/{branch}"], root).splitlines()
-    if len(rows) != 1 or len(rows[0].split()) != 2 or not SHA_RE.fullmatch(rows[0].split()[0]):
+    # Branch identity comes from the authenticated, host-pinned GitHub API;
+    # local core.sshCommand/url rewrites cannot spoof this ref observation.
+    repository = remote_identity(root, remote)
+    owner, name = repository.split("/", 1)
+    value = _run("gh", ["api", "--hostname", "github.com", f"repos/{owner}/{name}/git/ref/heads/{branch}",
+                         "--jq", ".object.sha"], root)
+    if not SHA_RE.fullmatch(value):
         raise DeliveryError("remote branch head is missing or ambiguous")
-    return rows[0].split()[0]
+    return value
 
 
 def source_identity(root: Path, commit: str, work_root: str = ".razr") -> str:
@@ -381,10 +404,15 @@ def _validate_pr(value: Any, url: str, owner: str, repo: str, number: int) -> di
                 if set(row) - allowed or not isinstance(row.get("__typename"), str):
                     raise DeliveryError("malformed status check")
                 if row["__typename"] == "CheckRun":
-                    if not isinstance(row.get("name"), str) or row.get("status") not in {"QUEUED", "IN_PROGRESS", "COMPLETED"}:
+                    if not isinstance(row.get("name"), str) or row.get("status") not in {"QUEUED", "IN_PROGRESS", "PENDING", "REQUESTED", "WAITING", "COMPLETED"}:
                         raise DeliveryError("malformed check run")
-                    if row.get("conclusion") not in {None, "SUCCESS", "SKIPPED", "FAILURE", "CANCELLED", "NEUTRAL", "TIMED_OUT", "ACTION_REQUIRED"}:
+                    conclusions = {"", "SUCCESS", "SKIPPED", "FAILURE", "CANCELLED", "NEUTRAL", "TIMED_OUT", "ACTION_REQUIRED", "STALE", "STARTUP_FAILURE"}
+                    if row.get("conclusion") not in conclusions:
                         raise DeliveryError("unknown check conclusion")
+                    if row["status"] == "COMPLETED" and row.get("conclusion") in {None, ""}:
+                        raise DeliveryError("completed check has no terminal conclusion")
+                    if row["status"] != "COMPLETED" and row.get("conclusion") not in {None, ""}:
+                        raise DeliveryError("pending check has terminal conclusion")
                 elif row["__typename"] == "StatusContext":
                     if not isinstance(row.get("context"), str) or row.get("state") not in {"EXPECTED", "ERROR", "FAILURE", "PENDING", "SUCCESS"}:
                         raise DeliveryError("malformed status context")
@@ -414,10 +442,8 @@ def _repo_arg(repository: str) -> str:
 def _required_checks(root: Path, url: str, repository: str) -> tuple[list[dict[str, str]], str]:
     raw, diagnostic, code = _run_result("gh", ["pr", "checks", url, "--repo", _repo_arg(repository), "--required", "--json", "name,state,bucket"], root,
                                          accepted_codes={0, 1, 8})
-    if code == 1:
-        # This is the only accepted empty-result failure: the bounded gh
-        # no-checks diagnostic observed from the supported CLI.
-        if raw or not re.fullmatch(r"no checks reported on the '[^'\n]{1,255}' branch\n?", diagnostic):
+    if code == 1 and not raw:
+        if not re.fullmatch(r"no checks reported on the '[^'\n]{1,255}' branch\n?", diagnostic):
             raise DeliveryError("required-check provider request failed")
         rows = []
     else:
@@ -443,12 +469,16 @@ def _required_checks(root: Path, url: str, repository: str) -> tuple[list[dict[s
         result.append({"name": row["name"], "state": state, "bucket": bucket})
     if not result:
         return result, "none"
-    if any(row["bucket"] == "FAIL" for row in result):
+    if any(row["bucket"] in {"FAIL", "CANCEL"} for row in result):
         return result, "failing"
     if any(row["bucket"] == "PENDING" for row in result):
         return result, "pending"
-    if code == 8 and not any(row["bucket"] == "PENDING" or row["state"] in {"QUEUED", "IN_PROGRESS", "PENDING"} for row in result):
+    if code == 1 and not any(row["bucket"] in {"FAIL", "CANCEL"} for row in result):
+        raise DeliveryError("exit 1 populated checks are not failing")
+    if code == 8 and not any(row["bucket"] == "PENDING" or row["state"] in {"QUEUED", "IN_PROGRESS", "PENDING", "REQUESTED", "WAITING"} for row in result):
         raise DeliveryError("exit 8 required-check result is not pending")
+    if any(row["bucket"] == "CANCEL" for row in result):
+        return result, "failing"
     if any(row["bucket"] == "SKIPPING" for row in result):
         return result, "skipping"
     return result, "passing"
@@ -471,7 +501,7 @@ def _thread_comments(root: Path, thread_id: str, initial: list[dict[str, Any]],
     result = list(initial)
     pages = 0
     while cursor is not None and pages < MAX_THREADS_PAGES:
-        value = _json("gh", ["api", "graphql", "-f", f"query={query}", "-F", f"id={thread_id}",
+        value = _json("gh", ["api", "--hostname", "github.com", "graphql", "-f", f"query={query}", "-F", f"id={thread_id}",
                               "-F", f"a={cursor}"], root)
         pages += 1
         try:
@@ -507,7 +537,7 @@ def _threads(root: Path, owner: str, repo: str, number: int) -> list[dict[str, A
     for _ in range(MAX_THREADS_PAGES):
         # gh api has no --repo flag; the explicit owner/name variables are the
         # API equivalent and are bound to the verified repository above.
-        args = ["api", "graphql", "-f", f"query={query}", "-F", f"o={owner}",
+        args = ["api", "--hostname", "github.com", "graphql", "-f", f"query={query}", "-F", f"o={owner}",
                 "-F", f"r={repo}", "-F", f"n={number}"]
         if cursor is not None:
             args += ["-F", f"a={cursor}"]
@@ -597,8 +627,13 @@ def read_pr(root: Path, url: str, *, expected_repository: str | None = None,
     final_digest = source_identity(root, final_head_sha)
     if (final_value["baseRefName"] != value["baseRefName"] or final_value["headRefName"] != value["headRefName"]
             or final_value["baseRefOid"] != value["baseRefOid"] or final_value["headRefOid"] != value["headRefOid"]
+            or final_value["url"] != value["url"] or final_value["number"] != value["number"]
+            or final_value["state"] != value["state"] or final_value["isDraft"] != value["isDraft"]
+            or final_value["updatedAt"] != value["updatedAt"] or final_value["mergedAt"] != value["mergedAt"]
+            or final_value["closedAt"] != value["closedAt"] or final_value["mergeStateStatus"] != value["mergeStateStatus"]
+            or final_value["mergeable"] != value["mergeable"] or final_value["reviewDecision"] != value["reviewDecision"]
             or final_base_sha != actual_base_sha or final_head_sha != actual_head_sha
-            or final_digest != actual_source_digest or final_value["url"] != value["url"]):
+            or final_digest != actual_source_digest):
         raise CandidateChanged("PR or remote branch identity changed during readback")
     if expected_base_sha is not None and final_base_sha != expected_base_sha:
         raise CandidateChanged("final base identity mismatch")
@@ -606,8 +641,11 @@ def read_pr(root: Path, url: str, *, expected_repository: str | None = None,
         raise CandidateChanged("final head identity mismatch")
     if expected_source_digest is not None and final_digest != expected_source_digest:
         raise CandidateChanged("final source identity mismatch")
-    value["sourceDigest"] = final_digest
-    return value
+    final_value["requiredChecks"] = value["requiredChecks"]
+    final_value["requiredChecksStatus"] = value["requiredChecksStatus"]
+    final_value["reviewThreads"] = value["reviewThreads"]
+    final_value["sourceDigest"] = final_digest
+    return final_value
 
 
 def _existing_open(root: Path, repository: str, base: str, head: str, base_sha: str,
@@ -626,10 +664,23 @@ def _existing_open(root: Path, repository: str, base: str, head: str, base_sha: 
                    expected_source_digest=source_digest)
 
 
-def _close_created(root: Path, repository: str, url: str) -> None:
+def _close_created(root: Path, repository: str, url: str) -> str:
     # GitHub's branch-name PR create has no atomic expected-head argument. This
-    # compensates only a URL returned by this invocation, never a race-recovered PR.
+    # compensates only a validated URL returned by this invocation.
+    owner, name, number = _pr_url(url)
+    if f"{owner}/{name}".lower() != repository.lower():
+        raise IdentityMismatch("created PR repository differs from verified repository")
     _run("gh", ["pr", "close", url, "--repo", _repo_arg(repository)], root)
+    fields = _json("gh", ["pr", "view", url, "--repo", _repo_arg(repository), "--json", "number,url,state"], root)
+    if not isinstance(fields, dict) or set(fields) != {"number", "url", "state"} \
+            or fields["number"] != number or fields["url"] != url or fields["state"] != "CLOSED":
+        raise DeliveryError("created PR compensation is unconfirmed")
+    return "confirmed"
+
+
+def _candidate_identity_mismatch(error: IdentityMismatch) -> bool:
+    text = str(error).lower()
+    return any(token in text for token in ("base branch", "base commit", "head branch", "head commit", "source identity", "final head", "final base"))
 
 
 def create_pr(root: Path, *, base: str, head: str, title: str, body: str,
@@ -679,12 +730,30 @@ def create_pr(root: Path, *, base: str, head: str, title: str, body: str,
             return recovered
         raise
     try:
+        # Validate the provider's returned text before it can reach close.
+        created_owner, created_name, _ = _pr_url(url)
+        if f"{created_owner}/{created_name}".lower() != repository.lower():
+            raise IdentityMismatch("created PR repository differs from verified repository")
+    except InvalidRequest as exc:
+        raise DeliveryError("gh create returned malformed PR URL") from exc
+    try:
         return read_pr(root, url, expected_repository=repository, expected_base=base,
                        expected_base_sha=base_sha, expected_head=head, expected_head_sha=head_sha,
                        expected_source_digest=digest)
-    except (CandidateChanged, InvalidRequest) as exc:
-        _close_created(root, repository, url)
-        raise CandidateChanged("new PR head/source did not match candidate; PR was closed") from exc
+    except CandidateChanged as exc:
+        try:
+            outcome = _close_created(root, repository, url)
+        except DeliveryError as close_error:
+            raise CandidateChanged(f"candidate mismatch; compensation uncertain: {close_error}") from exc
+        raise CandidateChanged(f"candidate mismatch; compensation {outcome}") from exc
+    except IdentityMismatch as exc:
+        if not _candidate_identity_mismatch(exc):
+            raise
+        try:
+            outcome = _close_created(root, repository, url)
+        except DeliveryError as close_error:
+            raise CandidateChanged(f"candidate identity mismatch; compensation uncertain: {close_error}") from exc
+        raise CandidateChanged(f"candidate identity mismatch; compensation {outcome}") from exc
 
 
 def snapshot(root: Path, *, branch: str, base: str = "campaign/razr-pi-next") -> dict[str, Any]:
