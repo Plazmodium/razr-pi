@@ -1,85 +1,55 @@
-# Razr-Pi Next campaign log
+# Release review checklist
 
-## M00 baseline — 2026-10-08
+This file is a release-review aid, not product guidance or Razr workflow state. The user-facing documentation begins at the repository [README](../../README.md).
 
-- Public development base: `dev` at `10acf5b5b1131a76b7659d2a429a9de1d3bef07e`.
-- Pre-reconciliation remote: `origin/dev` at `b030d675fc5ced54a3b16b3098ab356b3138039c`; it was an ancestor of local `dev` by eight commits (`0 8`).
-- Reconciliation: normal fast-forward push, no force, followed by Git and GitHub API read-back of `origin/dev` at `10acf5b5b1131a76b7659d2a429a9de1d3bef07e`.
-- GitHub auth: authenticated; no open PRs at baseline. Existing PR #1 was already merged.
-- Historical workshop/lab material in the unborn primary `main` worktree was preserved and not imported into this public campaign branch.
-- Campaign branch: `campaign/razr-pi-next`, created from the verified `dev` endpoint in Herdr workspace `wD`.
-- Herdr 0.9.3 initially refused creation from the linked `dev` checkout (`linked_worktree_source`); creation from the primary repository workspace succeeded. This changed no source.
+For any release candidate, record exact evidence outside the product source and verify all of the following against one immutable commit.
 
-### Clean-clone baseline
+## Source identity
 
-Fresh local clone: `/tmp/razr-pi-next-m00.6vs9Vw/repo` (ephemeral machine-local path, not product evidence).
+- Exact repository, branch, and full commit are known.
+- The candidate source digest is recomputed.
+- Tracked files match the public allowlist.
+- Excluded inputs are inspected explicitly.
+- The checkout is clean before and after verification.
 
-```text
+## Clean-room verification
+
+Run from a new remote clone of the exact pushed commit:
+
+```sh
 python3 -B tests/check_public_tree.py --root .
-PASS: 46 files; 6 core/templates matched
-manifest sha256:64c6ab642bec2453a8534c6377ee4ff8b6e21caefc441811317deb6ed5d91326
-
 python3 -B tests/run_public.py --phase tracer --require-pi
-PASS: 8 commands observed
-
 python3 -B tests/run_public.py --phase full --require-pi
-PASS: 41 tests / 81 subcases; 9 commands observed
+(cd tests && python3 -B -m unittest -v test_context test_memory)
+(cd tests && python3 -B -m unittest -v test_herdr_provider)
 ```
 
-The fresh clone remained clean. The installed model catalog resolves campaign workers to `openai-codex/gpt-5.6-luna` with medium thinking. Herdr process state remains telemetry only; Razr workflow evidence remains authoritative.
+Use the physical-path fixture procedure in [testing](../testing.md) for the abbreviated Pi/core/GitHub integration check.
 
-The first direct check in the linked campaign checkout refused the already-known stale/prunable shared-worktree registration with `ambiguous worktree registration`. The registration was not removed. The exact 47-file campaign source allowlist was then materialized without Git administration into an owned temporary source tree and passed the same static, tracer and full checks: 47 files and 41 tests / 81 subcases. The command output records the generated source manifest.
+Retain actual commands, results, source identities, and limitations. A public-source export is not a substitute for the remote clone.
 
-## M08 integrated dogfood — 2026-10-09
+## Independent review
 
-- Used the shipped local Pi package in an owned repository with no Project Brain, Obsidian, MCP vault or remote. Exact user campaign authorization was recorded as the specification/checkpoint decision source; no claim was made that the user personally observed the tracer.
-- The first dispatcher tracer passed before expansion. Two non-overlapping command slices then ran in separate Herdr worktrees with fresh named `openai-codex/gpt-5.6-luna:medium` workers. Their commits were integrated by normal cherry-picks and the final fixture suite passed 10 tests. Additive superseding evidence corrects the retained worker heads to normalize `7cefdcebd897dad15d5fb94435bf611f98d5bd57` and fingerprint `cf0c400e20d71c035768fdc1a588d88371027efe`; object, branch, worktree and candidate patch-equivalence checks passed, while the erroneous earlier IDs remain visible as chronology. The private correction record digest is `sha256:d19d3d7d3d61d22a183821293ab4cf075eb2adec8e0ff6504c0ed2d751ecf9d3`.
-- Product attempt `att-normalize-interrupted` was deliberately interrupted and settled `UNKNOWN` with uncertain cleanup. The Razr node remained incomplete, was explicitly classified through a core transition, and replacement `att-normalize-replacement` used a new allowance/session/worktree identity. Herdr status was not used as completion proof.
-- Memory `mem-6e0e96313b2d84f7649dd8fd3ba2768b` was recalled from a fresh Pi session, became stale after a material NFKC source change, and was superseded by evidence-bound `mem-d850e4bd20ffee2c0f0e71955af1f317`. Repository source remained authoritative.
-- Bound fixture candidate `94874b7a72a5d2107dcb8aa3540587a2b9001b8a` at source digest `sha256:66e14d2b41d487984c5d5cf19246ead3c66557e50475e8cf294b8d3e2eb1c41f`. Fresh review attempt `att-fresh-review-2` reproduced all 10 tests and accepted the bounded contract with one retained LOW finding: invalid CLI arguments expose tracebacks. Provider termination remained truthfully `UNKNOWN`; report content, source and reproduced checks supported the recommendation.
-- The fixture intentionally had no remote. Delivery links to same-campaign live PR [#11](https://github.com/Plazmodium/razr-pi/pull/11), read back as merged from head `c1ce50d42931c0a2f2bf8c28ca213650e01a53ca` to base `d68ce653fbfee7563fbdf637adf9b1f2a45892f6`, merge `e1d588bdd3d51a4ce36528a3f6aeae914f25188c`, with no reported checks or reviews. Empty collections are observations, not test or approval proof.
-- Dogfood exposed and fixed two package integration defects: orchestrators could not target a distinct verified worker pane, and `/razr-context` did not construct the typed core readback when workflow context was requested. The post-fix full public runner passed 137 tests / 139 subcases.
-- Corrective review found that the first Herdr request had overloaded caller/target identity and that the original combined `bind-review-delivery` node completed before its later mapped bounded review. Architecture-contract revision 4 now uses closed `host:{mode,caller,target}` identity, verifies caller environment, binds target worktree before launch, and persists both identities in handles, private records and new AttemptLedger events. Historical target-only events remain replayable evidence but cannot authorize new work. Focused tests execute target-binding success and mismatch paths.
-- A separate clean owned fixture loaded only the explicit local extension and `skills/razr/SKILL.md` with Pi RPC flags `--no-tools --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --no-mcp --offline --no-approve`. `get_commands` returned exactly five `razr-*` commands plus `skill:razr`; `/razr-status clean-tracer` was handled without a model, and `python3 -B -m unittest tests.test_tracer -v` passed. Campaign authorization was the decision source; this is not a claim of personal human observation.
-- The clean fixture's Memory proof retained private RPC/session records with source identity and raw-file digests. `mem-bf136f7c00e09db655562802efb6432a` was active in fresh session `m08-memory-recall-active-2` (artifact digest `sha256:6aa665305b9ae5ee09470d16a69b233896f6ffcd56a3c5ca055f155758942059`), then appeared historically stale after its source changed in fresh session `m08-memory-recall-stale-1` (`sha256:d97b7c1088a612f7cf4a046a20950b2570036c4ec25e011e78b09570ab3d625c`). Active `mem-8228df4897411f85caadd9da95021f1e` supersedes it at the new raw source digest; fresh session `m08-memory-recall-revalidated-1` retained artifact digest `sha256:d7749e9cb5134c9d43468de1ad65e7bdda409750180f8f4a11ec1109223a227f`.
-- Because reopening the combined node would rewrite history, corrective work item `m08-corrective-proof` used only core commands: preparation completed, candidate `963d292d95c8d52fa5ce36810cffd529259b173d` was bound at the unchanged implementation source digest, fresh Luna/medium reviewer `m08-corrective-review` reproduced 10 tests and scrutinized tracked/ignored configuration, and generation 5 recorded `candidate-review-accepted` before the M07 delivery-link evidence was appended. Supplied private artifact `corrective-reviewer-session.jsonl` is 94,857 bytes at `sha256:50282d1e398dd5faed9d320a80c0a97f74c477aeae20fb79e0b2db3b18827a09`. Supplied `coordinator-chronology-session.jsonl` is a 3,611,749-byte snapshot at `sha256:b5ea93833b8d25335423e4e47019419ceae987422e0b42e23b4ef107c66d18a4`; ordered JSONL entries 534, 539–540 and 543–544 retain reviewer ACCEPT read-back, the successful `candidate-review-accepted` transition, then the delivery-link append. These digest-bound snapshots are mechanically inspectable retained observations, not tamperproof logs or independent authentication of human approval. The original pre-binding “No candidate” evidence remains as truthful chronology and is explicitly superseded by later bound-candidate records rather than edited away.
+- Technical and Contract critics use fresh independent contexts.
+- Both review the same exact commit.
+- Reviewer evidence is candidate-bound and inspectable.
+- Findings are repaired additively and re-reviewed.
+- A model switch or a fork carrying builder history does not count as fresh independent review.
 
-M08 did not publish the fixture, transition it past Verify, record final Technical/Contract critic outcomes, claim final human review, merge, or deploy. Private sessions, raw output, AttemptLedger bytes and machine paths remain outside public source.
+## Pull-request read-back
 
-## M09 adversarial hardening — pending final review
+Verify and record:
 
-- Began at exact base `35787ae5c39e108d05a26318bd9cdaa9753de0c4` and triaged the three supplied fresh read-only reviews. No model or Herdr worker was invoked during implementation.
-- The provenance-pinned Python core remains sole lifecycle authority. Delivery now requires exact equality of live PR head, candidate commit, and both critic reviewed commits; an excluded-input two-commit regression proves equal source digests do not relax commit identity.
-- Herdr launch now uses core status/validate/raw-state readback for current generation, node ordinal and candidate before any worktree-open or dispatch mutation, then repeats it with read-only worktree/branch/commit/source verification immediately before `agent start`; the final fence cannot open a missing worktree. It rejects duplicate attempts before claims; stages evidence transactionally; makes STARTED the durable attempt, allowance, and root-ID claim; and materializes append-only private path claims only afterward with restart reconciliation. Descriptor-rooted/no-follow evidence operations reject linked parents before outside writes; injected pre-START failures clean exact staging and remain retryable, while post-START claim failures settle or remain explicitly recoverable without a second launch. STARTED consumes root IDs and canonical paths permanently across settlement, cleanup, and recreation; orphan prepared staging is not a claim. Every durable STARTED must retain two ledger-bound path claims, and an inode/count/chain-head state binds the append-only root journal: missing state or missing, truncated, or replaced history refuses before a new STARTED, while only canonical prepared bytes whose raw digest was committed in an unmatched STARTED may finish that attempt's incomplete claims; any path or byte tampering refuses before claim/marker mutation. Root storage is checked before reconciliation, so stale prepared state for an already SETTLED attempt cannot recreate missing authority history. Root marker absence/read/create is descriptor-rooted and no-follow; symlink, hard-link, replacement, mode, inode, or byte mismatch refuses before claim mutation. The attempt ledger has a separate atomic inode/count/head anchor and exact append intent; loss, identical-byte replacement, truncation, or valid-prefix reset refuses rather than becoming an empty authority history, while only the bound first-create or one-append crash window can reconcile. Digest-bound late session binding is additive, fsynced, serialized, and restart-validatable without rewriting the immutable pending handle. It passes a local immutable deadline explicitly through each launch helper, passes `--no-session`, streams output under separate bounds, owns process groups, and rejects linked executable paths. Concurrent launches cannot overwrite or clear each other's deadlines. Restart/disappearance and concurrent settlement retain one explicit `UNKNOWN` settlement; no host state becomes a Razr transition.
-- Memory now derives the live core repository-source identity for every direct operation; an explicit constructor digest is only an expectation. It also uses bounded total ledger processing, `.razr/memory.jsonl.lock`, restrictive modes and creation-directory fsync. A newly constructed current store omits foreign records and reports them stale. Its revision-6 closed error subset now names source/path/limit/capability failures and their retry semantics. The sibling lock coordinates cooperative processes and post-flock identity is checked, but same-UID hostile pathname replacement is not claimed race-proof and a completed append cannot be rolled back. Secret-like rejection was broadened, but remains a heuristic and is not a confidentiality claim.
-- Context now requires a clean candidate snapshot before and after assembly and reads tracked selected bytes, metadata and history from the exact immutable Git commit/tree/object snapshot. Explicit untracked/private source is unsupported and dirty source refuses; a concurrent mutate-and-restore writer cannot inject live worktree bytes into the packet.
-- The required static, tracer and fresh-export full commands must be rerun on the final integrated commit. Their results, exact final head, push/PR observation, and residual limitations belong in the closing report. Reviewer reports, context identifiers, and live PR read-backs are private digest-bound evidence supplied out-of-tree; private transcripts and machine paths are not copied into this public source. Fresh exact-head Technical/Contract disposition remains required after repairs. Final human PR review is the M10 gate and remains pending rather than being claimed or pulled forward into M09; this section does not claim acceptance, publication, merge, or deployment.
+- base and head branches;
+- exact base and head commits;
+- mergeability and merge state;
+- reported status checks;
+- review decision and visible reviews;
+- review requests, comments, and threads where available; and
+- provider completeness and non-atomic observation limits.
 
-## M10 finalization — exact-head proof in progress
+No-check or empty collection output is an observation, not proof of test execution, collection completeness, or approval. If repository-rule read-back is unavailable, disclose that limitation to the human reviewer.
 
-- M10 started from `campaign/razr-pi-next` and `origin/campaign/razr-pi-next` at `db46ea65d2fabc2a3b7db7aa637c65d1f80b9c18`. Mission branch `mission/m10-finalize` had the same base and remote head. The campaign integration history is normal, inspectable Git history; no force push or rewrite is permitted.
-- Integrated mission PR chronology is [#3](https://github.com/Plazmodium/razr-pi/pull/3), [#4](https://github.com/Plazmodium/razr-pi/pull/4), [#5](https://github.com/Plazmodium/razr-pi/pull/5), [#7](https://github.com/Plazmodium/razr-pi/pull/7), [#8](https://github.com/Plazmodium/razr-pi/pull/8), [#9](https://github.com/Plazmodium/razr-pi/pull/9), [#10](https://github.com/Plazmodium/razr-pi/pull/10), [#11](https://github.com/Plazmodium/razr-pi/pull/11), [#12](https://github.com/Plazmodium/razr-pi/pull/12), and [#13](https://github.com/Plazmodium/razr-pi/pull/13). PR #6 was closed and replaced by the clean-history M04 PR #7; that history is not rewritten.
-- Delivered architecture is repository-as-brain context, bounded evidence-linked Memory, one Pi skill plus one command extension, the unchanged lifecycle authority with exact delivery commit identity, an optional direct Herdr provider with durable bounded attempt mechanics, and a separately invoked source-bound GitHub helper. General critics, factory operation, merge, deployment, installation, and publication remain outside this surface.
-- Final documentation now describes local Pi package declaration, standalone behavior, Herdr and Memory boundaries, clean-room verification, and remaining human gates. The private package remains version `0.1.0`: there is no tag or prior version-bump convention, so M10 does not invent one. Its description is updated to match implemented scope.
-- The orchestrator was read back inside Herdr 0.9.3 with complete current workspace/tab/pane identity. M10 does not spend a model allowance or claim a new live multi-worker acceptance from that observation; the exact-head run uses the focused provider suite and records that mechanical boundary separately from M08's historical live dogfood.
-- A pre-commit abbreviated-dogfood invocation from the repository root addressed `tests.test_pi_surface` and `tests.test_primary_execution`; both modules correctly refused to import their top-level shared fixture under that invocation shape, while 41 GitHub helper tests in the same command passed. A second invocation from `tests/` loaded those modules but correctly refused nine cases because their required owned `PUBLIC_TEST_ROOT` was absent; the same 41 GitHub tests again passed. No product assertion failed. The documented command was corrected to create and pass an owned private fixture root after the full runner; both failed outputs remain private diagnostics and are not relabelled passes.
-- First documentation head `2ca0cd713c3788f7a23bbe8208222cc129203680` was pushed normally and read back at the same remote SHA. A fresh single-branch clone of that exact head was clean before and after verification. Static public-tree validation passed 63 files and six core/templates at source manifest `sha256:3b5b2584d2e040a9e96919301efbc97d2f7c8d79741e40c17c80598d0eeb5b3b`; the no-model Pi package/adoption/discovery tracer passed eight commands; the full runner passed 163 tests / 174 subcases across nine commands. Standalone context/Memory passed 27 tests; focused provider mechanics passed 39; corrected abbreviated command-surface/primary/delivery dogfood passed 51. These are actual command results, not claims that a human observed them or that final critics ran.
-- The first exact-head abbreviated-dogfood invocation used the clone's lexical temporary path while Python resolved its physical path, so nine fixture-owning cases refused the root identity and 41 delivery tests passed. Changing only the invocation to derive `pwd -P` yielded all 51 passing on the same commit. The documented command now preserves physical-path identity. The refusal remains chronology, not a product PASS or an erased attempt.
-- The shipped GitHub snapshot read `Plazmodium/razr-pi`, base `campaign/razr-pi-next` at `db46ea65d2fabc2a3b7db7aa637c65d1f80b9c18`, head `mission/m10-finalize` at `2ca0cd713c3788f7a23bbe8208222cc129203680`, and core source digest `sha256:3d8e8c14cbaa469b7ac410cb3b16453c9c25db9e372186748bf70c7ee7005eec`.
-- The helper's first create produced PR [#14](https://github.com/Plazmodium/razr-pi/pull/14), then observed PR/ref movement during its bounded read and performed confirmed compensation; #14 is closed and remains history. The policy-authorized direct `gh pr create` then opened M10 PR [#15](https://github.com/Plazmodium/razr-pi/pull/15) to `campaign/razr-pi-next`. Initial read-back: OPEN, exact base/head SHAs above, `MERGEABLE` / `CLEAN`, no reported checks, reviews, requests, or comments, and empty review decision. Empty collections and no checks are observations only.
-- This evidence record is committed as a second head and pushed; all clean-room commands are then repeated from a new clone of that exact pushed head. The repeated results are reported without changing the tested head again. Fresh exact-head Technical and Contract critics, integration of PR #15, the final campaign PR to `dev`, repository checks on that final PR, and final human review remain future gates. No merge, deploy, publish, installation, auth mutation, model invocation, or global configuration change is part of M10.
+## Final authority
 
-### Historical exact-head candidate matrix — `d9411e2e9f62b5cc09be63d805bf158f61303b6c`
-
-This subsection records the complete verified matrix for the then-current pushed candidate `d9411e2e9f62b5cc09be63d805bf158f61303b6c`. Committing this subsection necessarily creates a later docs-only head, so these observations remain historical evidence for `d9411e2e...`; they are not represented as current evidence for the commit containing this text.
-
-- Identity and source boundary: a new remote single-branch clone resolved both local and remote `mission/m10-finalize` to `d9411e2e9f62b5cc09be63d805bf158f61303b6c`. Initial/final status was clean, `git diff --check` passed, and all 63 tracked files were present in the public allowlist with no tracked escape. Static source manifest was `sha256:15d747613551a0e3867c42b46c8891a392d5ebbcae2cfa0af9f39b4f77615908`; all six pinned core/templates matched.
-- `python3 -B tests/check_public_tree.py --root .`: PASS, 63 files, six core/templates.
-- `python3 -B tests/run_public.py --phase tracer --require-pi`: PASS, eight commands, no model/client construction.
-- `python3 -B tests/run_public.py --phase full --require-pi`: PASS, 163 tests / 174 subcases across nine commands, no accepted top-level skips or expected failures.
-- `(cd tests && python3 -B -m unittest -v test_context test_memory)`: PASS, 27 tests in 79.514 seconds.
-- `(cd tests && python3 -B -m unittest -v test_herdr_provider)`: PASS, 39 tests in 2.818 seconds. This is provider mechanics with real subprocess/Git fixtures and simulated Herdr responses, not a live model claim.
-- The documented physical-root abbreviated dogfood over `test_pi_surface`, `test_primary_execution`, and `test_github_delivery`: PASS, 51 tests in 19.974 seconds.
-- The shipped snapshot read repository `Plazmodium/razr-pi`, base `campaign/razr-pi-next` at `db46ea65d2fabc2a3b7db7aa637c65d1f80b9c18`, head `mission/m10-finalize` at `d9411e2e9f62b5cc09be63d805bf158f61303b6c`, and source digest `sha256:bacc71ee1c320b34a7c4132cef5afb159fa2996e763b453d8d43f2085e4fe597`.
-- The first bounded PR read during GitHub head settling refused `CANDIDATE_CHANGED`; after a separately observed stable-ref interval, a new read passed two provider passes and a trailing fence at the exact identities above. PR #15 was `OPEN`, `MERGEABLE` / `CLEAN`, non-draft, with `requiredChecksStatus: none`, empty reported checks/reviews/requests/comments/threads and empty review decision. Dynamic collections were explicitly incomplete and the observation non-atomic. Empty/no-check output is not execution, completeness, approval, or merge evidence.
-- These commands did not invoke a critic, mutate lifecycle state, authenticate human approval, merge, deploy, publish, install, or alter global/auth configuration. The independent critics subsequently blocked because this matrix had not yet been present in the campaign log and no digest-bound private exact-head bundle had been supplied. Their BLOCKED decisions remain history; this subsection does not rewrite them or claim a later disposition.
+The final human reviewer decides whether to merge. Critic recommendations, hashes, local tests, package loading, Herdr telemetry, and GitHub metadata do not authorize merge, publication, or deployment.

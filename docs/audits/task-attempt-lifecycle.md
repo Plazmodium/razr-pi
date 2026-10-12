@@ -1,11 +1,13 @@
 # Task and worker-attempt lifecycle audit
 
+> Internal historical evidence. This audit is not current product documentation; see [architecture](../architecture.md) and the [execution provider](../design/execution-provider.md) for the implemented product.
+
 ## Scope and conclusion
 
 This audit distinguishes three authorities:
 
 1. **Public Razr behavior** — the tracked core snapshot and public adapter/tests in this repository.
-2. **Local historical evidence** — external workshop records for the Markdown-link checker. These records are observations, not part of the public package or portable proof.
+2. **Local historical evidence** — retained external records for the Markdown-link checker. These records are observations, not part of the public package or portable proof.
 3. **Herdr operational state** — live pane/agent telemetry from an external process host. It is neither Razr state nor acceptance evidence.
 
 **Conclusion:** Razr's node state is a logical workflow record, not a process monitor. The core has an `attempt` counter, but no attempt entity, worker/session binding, allowance identity, or per-attempt outcome. The Markdown-link incident was therefore representable only as “node still `running`” in Razr plus a separate historical record that one bounded worker had stopped and its allowance was consumed. That separation was operationally correct, but it is not self-explanatory from public status output and is vulnerable to misinterpretation.
@@ -153,7 +155,7 @@ Whether this ledger eventually becomes core state is an architecture decision re
 
 ## Verification and limits
 
-Inspection was read-only for tracked core/adapter/tests, external workshop records, the installed Herdr wrapper, and live Herdr status. No model, worker, lifecycle mutation, product/regression suite, remote operation, or external-file edit was performed.
+Inspection was read-only for tracked core/adapter/tests, retained external records, the installed Herdr wrapper, and live Herdr status. No model, worker, lifecycle mutation, product/regression suite, remote operation, or external-file edit was performed.
 
 Verified against start SHA `b030d675fc5ced54a3b16b3098ab356b3138039c`:
 

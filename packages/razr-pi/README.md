@@ -1,66 +1,135 @@
-# Razr for Pi: local package
+# Razr-Pi local package
 
-Pi concept: a skill supplies instructions, while an extension registers executable commands. Loading either resource does not adopt a project, execute work, or authorize writes. The extension is a thin dispatcher to the existing core, context engine, and Memory adapter; it does not reimplement lifecycle authority, workers, authentication, or automatic adoption.
+Razr-Pi integrates the Razr workflow with Pi. The package contains one instruction skill, one command extension, a provenance-pinned Python core, bounded context and Memory adapters, an optional Herdr execution provider, and a separate GitHub delivery helper.
 
-Razr-Pi is designed for an ordinary repository: the checkout is the project brain. Project Brain, Obsidian, MCP vaults, and separate architecture/component/session documentation trees are not dependencies. The supported guidance is idea or conversation → spec convergence → executable → build → verify → delivery. Source, tests, configuration, and Git remain durable project truth; Memory stores bounded experience and workflow artifacts retain intent/provenance as needed.
+A Pi skill supplies instructions. A Pi extension registers executable commands. Loading either makes resources available but does not adopt a repository, execute work, approve a specification, or authorize writes.
 
-## Review, declare, and load locally
+## Repository model
 
-Review this directory before granting Pi project trust. With human-provided Pi, declare the package in a project using normal local-package behavior:
+The checked-out repository is authoritative. Relevant project truth includes source, tests, types and schemas, configuration, build and deployment definitions, Git history and current changes, intentional documentation, and active Razr workflow artifacts.
+
+Razr Memory stores bounded experiential context—rationale, recurring failures, debugging discoveries, environmental quirks, workarounds, navigation hints, and preferences. Repository evidence is authoritative; Memory helps interpret and navigate it.
+
+## Install and load
+
+Prerequisites are human-provided Python 3.11+, Git, Node, and Pi. Review this directory before granting Pi project trust.
 
 ```sh
 pi install --local /reviewed/path/to/razr-pi/packages/razr-pi
 pi list
 ```
 
-A local package is loaded from its resolved path and is not copied. Razr-Pi never runs this command, installs dependencies, or changes global configuration. Loading registers exactly one `razr` skill and one extension; it must not create `razr.yaml`, `.razr`, or `AGENTS.md`. Explicit adoption remains separate:
+Pi references the resolved local package path; it does not copy the package. Razr-Pi never runs this command automatically, installs dependencies, or changes global configuration.
+
+Loading registers one `razr` skill and one extension. It must not create `razr.yaml`, `.razr`, or `AGENTS.md`.
+
+## Adopt a repository
+
+Adoption is explicit and separate from package loading:
 
 ```sh
-python3 -B /reviewed/path/to/razr-pi/packages/razr-pi/scripts/adopt.py --target "$PWD" --work-root .razr/work
+python3 -B /reviewed/path/to/razr-pi/packages/razr-pi/scripts/adopt.py \
+  --target "$PWD" \
+  --work-root .razr/work
 ```
 
-Inspect the command and target before running it. Adoption checks the exact root and control paths, preserves unrelated instructions, and delegates initialization to the pinned core.
+Inspect the command and target before running it. Adoption validates the repository root and control paths, preserves unrelated instructions, and delegates initialization to the pinned Razr core.
 
-## Commands
+## Pi commands
 
-The package registers `/razr-status`, `/razr-context`, `/razr-remember`, `/razr-recall`, and `/razr-memory-inspect`. `/razr-status <work_id>` requires an adopted, materialized work item and returns the frozen core status/validate/raw-state projection; it also reports M04 fanout capability availability without launching workers. Status/context are read-only; context delegates bounded selection to the M03 `ContextEngine`, while remember is the one explicit append operation and requires the M02 Memory adapter's closed JSON request. Recall is bounded and labels stale or foreign evidence rather than allowing it to override repository truth. There is deliberately no worker command: authorized callers use the bounded Herdr provider directly, while dispatch authority remains outside the Pi command surface.
+The extension registers:
 
-Review [the skill](skills/razr/SKILL.md) and [managed routing](runtime/AGENTS.project-razr.md) before loading. This local package provides the primary skill plus a thin command extension for explicit inspection/adoption workflows. Loading does not authorize writes or adopt a project. Do not install automatically. Existing legacy Project Brain/Obsidian/MCP-vault or workshop hooks may be migrated or ignored explicitly; they are never silently required or treated as workflow authority.
+| Command | Purpose |
+|---|---|
+| `/razr-status <work_id>` | Read core-backed workflow status and validation state. |
+| `/razr-context ...` | Build a bounded context packet for an objective. |
+| `/razr-remember ...` | Append an evidence-linked Memory record. |
+| `/razr-recall ...` | Retrieve bounded active Memory and identify stale records. |
+| `/razr-memory-inspect` | Inspect the append-only Memory ledger. |
 
-The package resolves helpers and runtime internally. Status constructs the frozen `CoreRequest` using the package-internal identity primitives already shared with M03 (`_git_head` and `_source_digest`); it does not duplicate digest logic or broaden the frozen protocol. The Python core and five canonical templates are pinned by [provenance](runtime/provenance.json); M09 narrowly hardens the core's exact PR/candidate/critic commit gate while preserving it as sole lifecycle authority. Provenance is not execution proof or licensing clearance.
+Status and context are read-only. Remember is an explicit append operation. There is no Pi worker command: authorized orchestration uses the Herdr provider directly, outside the command surface.
 
-Stable adapter surfaces:
+## Context engine
 
-- `adapter/memory.py`: deterministic repository-local append-only Memory for M03/M05; it stores experience only and never owns workflow state. Every operation derives live core source identity; a supplied repository digest is an expectation, never authority. Recall is scoped to that identity, total processing is capped, storage/lock modes are private, and secret-like rejection is explicitly heuristic rather than a confidentiality guarantee. The sibling lock serializes cooperative processes; post-flock identity checks detect feasible replacements but do not make same-UID hostile writers race-proof or retroactively undo a completed append.
-- `adapter/context.py`: read-only M03 context selector. `ContextEngine.context(request)` returns the closed bounded packet response; tracked file bytes and metadata come from one content-addressed Git commit tree rather than mutable worktree paths, while clean-checkout fences reject dirty/untracked input and foreign/stale Memory is omitted or labelled lower-priority experience.
+`adapter/context.py` selects relevant context from one clean candidate:
 
-Context packets contain bounded UTF-8 excerpts or metadata-only references, repository-relative provenance, deterministic ordering and a canonical packet digest. The selector never writes workflow state or Memory and refuses unsafe paths, invalid limits and unavailable explicitly requested Memory/workflow boundaries.
+- tracked source, tests, and configuration from an immutable Git commit tree;
+- bounded Git history;
+- core-backed active workflow state; and
+- repository-scoped Razr Memory at lower authority.
 
-The closed Memory surface is `MemoryStore(root, repository=<expected current source digest>).remember(kind, summary, repository, paths=[], confidence="medium", evidence=[], tags=[], related_ids=[], record_id=None)`; the store independently derives and rechecks live core source identity for inspect, recall, remember, retire and supersede, returning one closed record with `schema_version`, stable `id`, `kind`, `summary`, `scope`, `confidence`, `status`, UTC `created_at`/`updated_at`, `evidence`, `prev_digest`, `record_digest`, and optional `tags`/`related_ids`. Reads are `recall(query="", paths=[], limit=20)` → `{records, omitted_count, stale_ids, query_digest}` and `inspect()` → records. `retire(id)` and `supersede(id, summary, evidence=None, tags=None, confidence=None)` append immutable transitions; no transition can change schema, kind, scope, or relation authority. Inputs and stored bytes use strict canonical JSON, bounded values, and repository-relative POSIX evidence refs.
+The result is deterministic, bounded, provenance-labelled, and digest-bound. Dirty, untracked, linked, private, or mutable source inputs are refused rather than silently included.
 
-Supported helper surfaces:
+## Razr Memory
 
-- `scripts/adopt.py`: explicit exact-root preflight, then unchanged core initialization.
-- `scripts/primary.py`: read-only inspection of already materialized work; refuses discovery-only items. No execution or approval authority.
-- `scripts/contract-preflight.py`: read-only pair identities and a narrow evidence-authority conflict diagnostic. Not semantic completeness or human approval.
-- `scripts/named-regressions.py`: actual unittest observation collection. Its raw output is private, not public source or independent critique.
+`adapter/memory.py` stores Memory in `.razr/memory.jsonl` as canonical append-only JSON records. Every operation derives and rechecks the live repository source identity. A supplied repository digest is only an expected identity.
 
-## Herdr and standalone behavior
+Memory supports `remember`, `recall`, `inspect`, `retire`, and `supersede`. Records are bounded and evidence-linked. Foreign or changed evidence is omitted or labelled stale and cannot outrank repository evidence.
 
-Outside `HERDR_ENV=1`, all ordinary package commands continue to work and fanout reports `FANOUT_UNAVAILABLE`. Inside Herdr, complete caller identity is mandatory; the provider never guesses workspace, tab, or pane IDs. Herdr `working`, `blocked`, `idle`, `done`, pane loss, or process exit is telemetry only and never completes or reviews a Razr node.
+The ledger and sibling lock use restrictive local modes. The lock coordinates cooperative processes; it is not a hostile same-UID sandbox. Secret-like input filtering is heuristic and is not a confidentiality guarantee. Do not store credentials or sensitive secrets in Memory.
 
-Do not infer general task, candidate, critique, recovery or delivery automation from commands present in the provenance-pinned core. No general reviewer dispatcher or PR factory ships here. The Herdr provider is a bounded, capability-probed host adapter: outside `HERDR_ENV=1` it is cleanly unavailable, and inside Herdr it preserves separate closed `caller` and `target` identities, verifies the caller against its environment, re-reads current generation/node ordinal/candidate through the core before opening/binding the target worktree or making any dispatch mutation, then applies a read-only final candidate fence immediately before launch. Pre-START evidence staging is transactional; STARTED is the durable attempt/resource-ID claim, and append-only private path claims materialize only afterward with crash reconciliation and no chronology deletion. Durable starts require complete integrity-bound root-claim coverage: missing state or missing, truncated, or replaced claim history refuses before a new STARTED, except that an exact surviving prepared record whose complete canonical-byte digest was committed in STARTED may finish its own unmatched-STARTED crash window. Root storage is checked before reconciliation; stale prepared state for a SETTLED attempt cannot recreate missing history. Ownership marker absence/read/create uses pinned root descriptors and `O_NOFOLLOW`; linked/replaced/non-private/non-single-link markers refuse before claim mutation. The attempt ledger is independently bound to an atomic inode/count/chain-head state; an exact fsynced append intent is the only authority to recover first creation or one state-lagging append, so missing/replaced/truncated/reset history never becomes an empty ledger. Its subprocess boundary streams bounded output, owns process groups, uses one end-to-end deadline, rejects linked executables, and passes explicit fresh-context flags. Herdr state and attempt evidence never authorize or mutate Razr workflow state. Comments explain non-obvious local intent or invariants only; tests carry behavioral memory, and Git plus Razr Memory carry historical context. The narrower project contract/routing always applies. Exact approval, first-task human inspection, source identity, fresh independent dual critique and final human PR review remain required for later work.
+## Workflow authority
 
-## Shipped M07 GitHub delivery helper
+The package invokes `runtime/scripts/razr.py` through a bounded subprocess boundary rather than reimplementing lifecycle rules. The core alone owns:
 
-`scripts/github-delivery.py` is a separately invoked closed-JSON helper, not a Pi command and not a PR factory. It exposes `snapshot` and read-only `read`, plus one explicitly authorized `create` operation. Create/read requests require exact repository identity, base/head branch names, full base/head SHAs, and the candidate source digest; the helper performs an authentication preflight without returning credentials or auth stderr. It is intended for authenticated GitHub/private-repository observations through host-pinned `gh` operations.
+- specifications and executable graphs;
+- legal generation-fenced transitions;
+- node progress and first-task verification;
+- candidate identity;
+- critic records; and
+- delivery state.
 
-The read result is a bounded, non-atomic observation. `requiredChecksStatus: "none"` means no required checks were reported; it does not prove tests ran or passed. Review/comment/request/status-rollup collections from the bounded provider response are explicitly marked incomplete because `gh pr view` does not provide collection page information; review threads are bounded and paginated. Candidate movement, collection changes, malformed provider data, and unsupported enums refuse.
+Adapter output, hashes, model reports, process exit, and CLI messages are observations—not approval or lifecycle authority.
 
-Create has explicit authority requirements and may report `created-but-unverified`, compensation unavailable, or compensation uncertain after a transport/output/recovery failure. Compensation closes only a candidate independently bound to the verified repository, PR URL/number, attempted base/head branch names, and base/head OIDs, then confirms `CLOSED`. No helper operation merges, deploys, force-pushes, deletes branches, mutates Razr lifecycle state, launches critics, authenticates approval, or claims final human PR review. The final human PR review gate remains mandatory.
+## Standalone Pi and Herdr
+
+Ordinary status, context, and Memory operations work outside Herdr. Fanout reports `FANOUT_UNAVAILABLE` when `HERDR_ENV=1` and complete Herdr identity are unavailable.
+
+Inside Herdr, the provider preserves separate caller and target workspace/tab/pane identities, verifies current workflow generation and candidate through the core, binds the requested worktree, and repeats a read-only fence immediately before launch.
+
+The provider owns bounded transport and attempt evidence. Herdr owns workspaces, terminals, worktrees, and worker processes. Herdr observations such as `working`, `blocked`, `idle`, `done`, process exit, or pane disappearance never become Razr transitions or review verdicts.
+
+Provider attempts use append-only STARTED/SETTLED evidence, permanent resource identities, bounded output, end-to-end deadlines, process-group cleanup, explicit interruption, and truthful `UNKNOWN` outcomes. Recovery is explicit; there is no automatic retry.
+
+## GitHub delivery helper
+
+`scripts/github-delivery.py` is a separately invoked closed-JSON helper, not a Pi command. It provides:
+
+- `snapshot` for exact local repository/source identity;
+- `read` for bounded PR observations; and
+- separately authorized `create` for one exact candidate.
+
+Requests bind repository, base/head branches, full base/head commits, and source digest. Reads are bounded and non-atomic. `requiredChecksStatus: "none"` means no required checks were reported; it does not prove tests ran. Provider collections may be explicitly incomplete.
+
+The helper does not merge, deploy, force-push, delete branches, launch critics, mutate Razr workflow state, or infer approval. Creation can produce an uncertain remote side effect; recovery and compensation report uncertainty rather than claiming success.
+
+## Helper surfaces
+
+- `scripts/adopt.py` — explicit repository adoption.
+- `scripts/primary.py` — read-only inspection of materialized work.
+- `scripts/contract-preflight.py` — structural pair and evidence-authority checks; not semantic approval.
+- `scripts/named-regressions.py` — bounded unittest observation collection.
+- `scripts/pi-surface.py` — command-facing adapter boundary.
+- `scripts/github-delivery.py` — source-bound GitHub operations.
+
+## Verification
+
+From the repository root:
+
+```sh
+python3 -B tests/check_public_tree.py --root .
+python3 -B tests/run_public.py --phase tracer --require-pi
+python3 -B tests/run_public.py --phase full --require-pi
+```
+
+See [testing](../../docs/testing.md) for focused commands, isolation rules, and proof limits.
 
 ## Limits
 
-Memory files and attempt ledgers are private local evidence, not source truth or a confidentiality sandbox. Secret-like filtering is heuristic. Context requires a clean candidate and rejects dirty, untracked, linked, or mutable source inputs. Provider recovery is narrow and explicit; no implicit retry is available. GitHub reads are bounded and non-atomic, and a `none` check status does not prove execution. Exact approval, first-task checkpoint, candidate/excluded-input scrutiny, fresh independent Technical and Contract critique, and final human PR review remain outside package loading.
-
-[Public testing](../../docs/testing.md) describes no-model loader/adoption proof, focused context/Memory and Herdr mechanics, the `test_github_delivery` scope, prerequisites, and limits. No model, auth client, or credential access is required to inspect package resources.
+- Loading is not adoption, execution, approval, or sandboxing.
+- Context requires a clean Git candidate.
+- Memory is local evidence, not source truth or secret storage.
+- The provider does not choose work, approve results, or control Razr lifecycle state.
+- The GitHub helper is not a general PR factory.
+- Fresh independent Technical and Contract review must target the exact candidate.
+- Final human PR review remains mandatory before merge.
