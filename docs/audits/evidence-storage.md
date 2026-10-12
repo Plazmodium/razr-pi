@@ -1,10 +1,12 @@
 # Evidence storage and retention audit
 
+> Internal historical evidence. This audit is not current product documentation; see [architecture](../architecture.md) and [capabilities](../capabilities.md) for the implemented product.
+
 Status: policy recommendation based on a read-only inventory; no evidence was moved, deleted, or imported.
 
 ## Scope and method
 
-Measured 2026-10-05 UTC. The measurement source was the local workshop wrapper, inspected read-only and reported here only in aggregate. It is not part of this public candidate. The candidate itself was pinned at start commit `b030d675fc5ced54a3b16b3098ab356b3138039c` and occupied about 364 KiB before this document.
+Measured 2026-10-05 UTC. The measurement source was a retained local evidence wrapper, inspected read-only and reported here only in aggregate. It is not part of the public product source. The candidate itself was pinned at start commit `b030d675fc5ced54a3b16b3098ab356b3138039c` and occupied about 364 KiB before this document.
 
 Sizes below are allocated sizes from `du -sk`, so totals include filesystem block overhead and nested Git administration. File-type and duplicate figures are logical-byte measurements and therefore are not directly additive. The duplicate scan used SHA-256 only for same-size regular files and excluded nested `.git` directories. No raw evidence, session identifiers, personal absolute paths, credentials, or evidence payloads were copied into this audit.
 

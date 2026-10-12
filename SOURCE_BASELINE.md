@@ -1,13 +1,38 @@
-# Clean Razr-Pi source baseline
+# Razr-Pi source baseline
 
-This source baseline is intended for explicit adoption/discovery, no-model package loading, read-only inspection and contract preflight, and selected synthetic regression tests. Acceptance is pending until the commands in docs/testing.md pass on the exact reviewed tree and a fresh post-import clone.
+The public source consists of the exact files listed in `tests/public-tree.txt`. The package is private and intended for reviewed local loading.
 
-The deterministic core and five templates are byte-identical snapshots identified by packages/razr-pi/runtime/provenance.json. Routing, skills and helpers are adapter-owned. Provenance hashes establish byte identity, not execution, human approval or independent review.
+## Identity
 
-Historical workshop artifacts, lab-bound critique/recovery/local-history helpers, private sessions and factory drafts are not distributed. Their omission does not establish equivalent portable capabilities. Automated PR factory work, live critique, recovery and delivery remain deferred. No past approval or model allowance transfers to this baseline.
+The deterministic Python core and five workflow templates are pinned by `packages/razr-pi/runtime/provenance.json`. Provenance hashes establish byte identity; they do not prove execution, review, or human approval.
 
-Exact human specification approval, generation-fenced transitions, the first verified-task human checkpoint, source-digest identity and excluded-input scrutiny, fresh independent Technical and Contract critics, and final human PR review remain mandatory. No automatic merge or deployment.
+Candidate identity has two separate domains:
 
-Tests use declared public synthetic fixtures and owned temporary output. They must not require historical labs, sibling distributions, personal paths, credentials or external services. Installed Pi is a manually supplied prerequisite for actual no-model resource-loader proof; missing prerequisites are not passing tests.
+- the full Git commit identifies the exact candidate object; and
+- the core source digest identifies the covered tree content.
 
-The existing remote LICENSE is retained unchanged. Do not publish raw test output, local paths, session records or historical evidence as part of this tree.
+Delivery requires exact equality between PR head, candidate commit, and both critic-reviewed commits. Source-digest equality cannot substitute for commit equality.
+
+## Included product surface
+
+- Razr core and templates
+- one Pi skill and one extension
+- adoption and read-only workflow helpers
+- context and Memory adapters
+- optional Herdr execution provider
+- GitHub delivery helper
+- public documentation and selected synthetic test fixtures
+
+Runtime and adapters do not depend on sibling distributions, personal paths, credentials, private sessions, or external knowledge stores.
+
+## Verification boundary
+
+Tests use declared synthetic fixtures and owned temporary output. Installed Pi is a human-provided prerequisite for the real no-model package-loader probe. Missing prerequisites are failures, not passing skips.
+
+The public runner exports the allowlisted tree into an isolated source directory and runs selected regressions. This is source isolation, not a substitute for exact-head Git clone verification when delivery policy requires one.
+
+## Publication boundary
+
+Do not publish raw test output, machine paths, private Memory, attempt ledgers, session records, credentials, or private review evidence. Review all source and licensing before distribution.
+
+Exact specification approval, generation fencing, first-task verification, excluded-input scrutiny, independent exact-candidate review, applicable repository checks, and final human PR review remain separate delivery gates.

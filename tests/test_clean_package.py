@@ -24,7 +24,7 @@ class CleanPackageTests(FixtureTest):
         pi_root = self.loader_fixture()
         before = {name: surface(self.lab / name) for name in ('home', 'agent', 'xdg', 'clean project', 'relocated package')}
         result = json.loads(self.load(pi_root).stdout)
-        self.assertEqual(result['loaded'], dict(skills=1, extensions=0, prompts=0, themes=0, contextFiles=0))
+        self.assertEqual(result['loaded'], dict(skills=1, extensions=1, prompts=0, themes=0, contextFiles=0))
         self.assertEqual(result['networkAttempts'], 0)
         self.assertEqual(result['modelInvocations'], 0)
         self.assertFalse(result['adopted'])

@@ -92,8 +92,8 @@ def isolate(run, tools):
     }
 
 
-TEST_MODULES = ('test_adoption', 'test_clean_package', 'test_contract_preflight',
-                'test_primary_execution', 'test_provenance', 'test_public_boundary', 'test_named_regressions')
+TEST_MODULES = ('test_adapter_foundation', 'test_memory', 'test_context', 'test_herdr_provider', 'test_adoption', 'test_clean_package', 'test_pi_surface', 'test_contract_preflight',
+                'test_primary_execution', 'test_provenance', 'test_public_boundary', 'test_named_regressions', 'test_github_delivery')
 
 
 def regression_worker(source_before):
@@ -203,7 +203,7 @@ def main():
                                                         pi_root, run], project, env))
         require(loader['status'] == 'PASS' and loader['adopted'] is False and loader['unchanged'] is True,
                 'loader did not prove read-only package resolution')
-        require(loader['loaded'] == {'skills': 1, 'extensions': 0, 'prompts': 0, 'themes': 0, 'contextFiles': 0},
+        require(loader['loaded'] == {'skills': 1, 'extensions': 1, 'prompts': 0, 'themes': 0, 'contextFiles': 0},
                 'unexpected loaded resources')
         require(loader['networkAttempts'] == loader['modelInvocations'] == 0, 'unexpected external/model activity')
         require(snapshot(project) == initial_project, 'package loading adopted or changed project')
@@ -240,7 +240,7 @@ def main():
         require(source_after == source_before, 'public source drift during tracer')
         suite_summary = None
         if args.phase == 'full':
-            # Export only the 46 declared files, never .git, private output or workshop data.
+            # Export only the 48 declared files, never .git, private output or workshop data.
             # This is a stripped materialized tree, not a commit or actual clone.
             stripped = run / 'public source tree'
             stripped.mkdir()

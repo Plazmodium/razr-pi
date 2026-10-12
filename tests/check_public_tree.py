@@ -19,11 +19,11 @@ import stat
 import subprocess
 import sys
 
-ALLOWLIST_SHA256 = '0d823ca7b5ba05a9597bb8a6bbe0bcfec3c59e32b679882a83c6077ac4670ff6'
+ALLOWLIST_SHA256 = '9cc6fd48169089963a1470adb59e5ca251ff2afdd632c4524f41522c751ab6f2'
 LICENSE_SHA256 = '9d2fdecab2aa2dca006dbd67b07d3cc63a9d9f64a4f954aff2fe782251f9f8f4'
 OUTPUT_MARKER = 'clean-source-v1 owned private test output\n'
 PROVENANCE = {
-    'scripts/razr.py': '4a366402b130b946d6609ddee392167b80c8f69723e292202b23aeb0a507bd9a',
+    'scripts/razr.py': 'a463afd5078d3fbaa54bc425a681b0cb2cf71562c1db85bd4018716a3846b020',
     'templates/evidence.md': '7a4a2eee74df44e152f079f31f032c34c2de1a0dba04530d97df3f15ac8c7447',
     'templates/executable.yaml': '662461e91527d3ed810edd6a04f7fd223f3097f9066e1e9fa158f8adc196a0f2',
     'templates/razr.yaml': 'a68278cdf4588c8debad214f22dedbc6ef31011287160bdafd981b57a2ac335a',
@@ -36,7 +36,7 @@ SOURCE_PINS = {
     'scripts/primary.py': '4ea38b5ef08dfb4944f50376d2475653d81671fb51239cac61549c49dfe895ed',
     'scripts/contract-preflight.py': '54d237feabd02cb250c51d677cc8df08de9fe9feaecc557583ef76579899a850',
     'scripts/named-regressions.py': '8885fa72a2ae3446e69577f26347c3ffacd8f499a322725d807bb8e947d01392',
-    'runtime/provenance.json': 'd4a712e663ac75ff0f447a0a2a62e917f43222aa652cb1ba8cb7735b6e4bf1ee',
+    'runtime/provenance.json': '071d73081db98d2f397a58925ffade5844d4b873a82074acb7c8661583f3fc89',
 }
 
 
@@ -169,7 +169,7 @@ def check(root):
     raw = regular(root / 'tests/public-tree.txt')
     require(sha(raw) == ALLOWLIST_SHA256, 'public allowlist drift')
     names = raw.decode('utf-8').splitlines()
-    require(len(names) == len(set(names)) == 46, 'invalid allowlist cardinality')
+    require(len(names) == len(set(names)) == 63, 'invalid allowlist cardinality')
     for name in names:
         p = PurePosixPath(name)
         require(not p.is_absolute() and '..' not in p.parts and str(p) == name, 'unsafe allowlist entry')
@@ -230,7 +230,7 @@ def check(root):
                 for node in ast.walk(tree):
                     imports = ([alias.name for alias in node.names] if isinstance(node, ast.Import)
                                else [node.module or ''] if isinstance(node, ast.ImportFrom) else [])
-                    require(all(module.split('.')[0] in sys.stdlib_module_names for module in imports),
+                    require(all(module.startswith('.') or module in {'protocol', 'core_subprocess', 'memory', 'adapter'} or module.split('.')[0] in sys.stdlib_module_names or module.split('.')[0] == 'adapter' for module in imports),
                             'non-standard static package import: ' + name)
         elif name.endswith('.json'):
             json.loads(text)
@@ -247,11 +247,12 @@ def check(root):
     for name, expected in SOURCE_PINS.items():
         require(sha(regular(package / name)) == expected, 'retained helper/provenance drift: ' + name)
     manifest = json.loads(regular(package / 'package.json'))
-    require(set(manifest) == {'name', 'version', 'private', 'description', 'keywords', 'pi', 'files'},
+    require(set(manifest) == {'name', 'version', 'private', 'description', 'keywords', 'pi', 'peerDependencies', 'files'},
             'unexpected package manifest fields')
     require(manifest['name'] == 'razr-pi' and manifest['private'] is True, 'unsafe package identity/publication policy')
-    require(manifest['pi'] == {'skills': ['./skills']}, 'broadened package resource loading')
-    require(manifest['files'] == ['skills', 'runtime', 'scripts', 'README.md'], 'package file declaration drift')
+    require(manifest['pi'] == {'extensions': ['./extensions/razr.ts'], 'skills': ['./skills']}, 'broadened package resource loading')
+    require(manifest['peerDependencies'] == {'@earendil-works/pi-coding-agent': '*', '@earendil-works/pi-ai': '*', 'typebox': '*'}, 'unexpected host dependency declaration')
+    require(manifest['files'] == ['extensions', 'skills', 'runtime', 'scripts', 'adapter', 'README.md'], 'package file declaration drift')
     require(sorted(p.relative_to(package).as_posix() for p in (package / 'skills').rglob('SKILL.md'))
             == ['skills/razr/SKILL.md'], 'unexpected package skill inventory')
     provenance = json.loads(regular(package / 'runtime/provenance.json'))

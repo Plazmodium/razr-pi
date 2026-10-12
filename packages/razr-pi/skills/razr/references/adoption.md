@@ -8,4 +8,4 @@ After explicit human authority for this target, invoke `scripts/adopt.py` using 
 
 Run bundled core `status --json` and `validate --all` from the adopted root. Separately authorized discovery uses `idea` with the intended identifier, title and depth. Inspect configuration, routing and the newly created spec.md, then rerun status and validation. A subprocess error is a stop, not success. Validation is not product-test evidence.
 
-No state belongs in this reusable package. Stop before approval or live task/candidate/review actions. No automatic routing migration, repair, installation, model invocation or publication is supported.
+No target-project state belongs in this reusable package. Stop before approval or live task/candidate/review actions. No automatic routing repair, installation, model invocation or publication is supported. Preserve retained evidence and unrelated repository content.

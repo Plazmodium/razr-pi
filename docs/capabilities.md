@@ -1,11 +1,79 @@
-# Capability boundaries
+# Capabilities and limitations
 
-This public source candidate implements safe adoption/discovery and selected no-model regression mechanics. Acceptance of a reviewed source identity, independent critique and actual post-import clone verification are separate gates; no historic acceptance is inherited.
+## Supported capabilities
 
-The integration tracer checks source/provenance, an actual installed Pi local-package resolver with no model/client construction, explicit safe adoption, discovery, core status/validation and unchanged relocated package bytes. Exactly one package skill and no other resource types are permitted. Loading does not adopt or authorize writes.
+### Repository adoption and workflow inspection
 
-The selected public suite covers adoption refusal/idempotence/separation/relocation, loader refusal/no-adoption, synthetic contract preflight, core-materialized synthetic work inspected read-only, stale-generation refusal, source/provenance and privacy boundary refusals, and collector test/subcase behavior. Core approval in a fixture uses explicitly synthetic metadata and never represents a real human decision. No lifecycle state is hand-written.
+Razr-Pi safely adopts an explicitly selected repository, creates managed routing, and delegates workflow initialization and validation to the Python core. Status reads are core-backed and do not mutate lifecycle state.
 
-Lab-bound review, retained-run recovery, local-history admission and automatic PR/factory capabilities are deliberately absent. Excluding their dependencies does not prove portable replacements. No historical test aggregate, review outcome or model allowance transfers here. Runtime core commands beyond the public adapter's scope remain present only to preserve the unchanged snapshot, not to grant execution authority.
+### Pi package surface
 
-Missing prerequisites and declared fixtures are failures, not passing skips. Pattern scanning and hashes are not confidentiality certification, approval authentication or a sandbox. Review all source before publication. Tests run from an allowlist-only materialized tree without historical data; that is not a freshly cloned published repository. Actual post-import clean-clone execution, exact-source review, fresh independent Technical/Contract critique and human final review remain required. No publication or factory work is authorized by passing tests.
+The package supplies one instruction skill and one command extension. It registers:
+
+- `/razr-status`
+- `/razr-context`
+- `/razr-remember`
+- `/razr-recall`
+- `/razr-memory-inspect`
+
+Loading is read-only and does not adopt a project or authorize writes.
+
+### Context selection
+
+The context engine creates deterministic bounded packets from:
+
+- tracked source, tests, and configuration;
+- bounded Git history;
+- active core-backed workflow state; and
+- repository-scoped Razr Memory.
+
+Candidate-bound content comes from one immutable Git commit tree. Dirty, untracked, linked, private, or mutable input is refused.
+
+### Razr Memory
+
+Memory is local, append-only, bounded, evidence-linked, and scoped to the live repository source identity. It supports remember, recall, inspect, retire, and supersede operations. Changed or foreign evidence is labelled stale or omitted and cannot override repository evidence.
+
+Memory is intended for rationale, failure patterns, debugging discoveries, environmental quirks, workarounds, navigation hints, and preferences—not a prose mirror of the codebase.
+
+### Herdr-hosted execution
+
+The optional Herdr provider supports capability probing, launch, inspect, collect, interrupt, and explicit unmatched-attempt recovery. It verifies workflow generation and candidate identity before dispatch and again immediately before launch.
+
+Attempts use fresh context, separate caller/target identity, permanent resource identities, append-only STARTED/SETTLED evidence, bounded time/output, process-group cleanup, and truthful `UNKNOWN` outcomes. Herdr telemetry is never Razr state.
+
+### GitHub delivery
+
+The separate GitHub helper supports:
+
+- exact local `snapshot`;
+- bounded PR `read`; and
+- separately authorized PR `create`.
+
+Operations bind repository, base/head branches, full commits, and source digest. Read results disclose bounded/non-atomic and collection-completeness limits. Candidate movement or malformed provider data is refused.
+
+## Deliberately unsupported
+
+Razr-Pi does not provide:
+
+- automatic project adoption;
+- a Pi worker command;
+- automatic critic selection or dispatch;
+- implicit retry after uncertain execution;
+- a general PR factory;
+- automatic merge, deployment, or publication;
+- credential installation or global configuration; or
+- inference of approval from a hash, model report, process state, or CLI message.
+
+## Security and consistency limits
+
+- Memory secret filtering is heuristic and is not a confidentiality boundary.
+- Memory locking coordinates cooperative processes and is not a hostile same-UID sandbox.
+- Context requires a clean exact Git candidate.
+- Descriptor and identity checks are cooperative filesystem hardening, not hostile-OS authentication.
+- Herdr cleanup cannot control deliberately detached processes outside the owned process group; uncertainty is reported.
+- GitHub reads are bounded and non-atomic. No-check and empty-review results do not prove execution or approval.
+- Test coverage establishes only the selected source, fixtures, commands, and environments.
+
+## Mandatory human and review gates
+
+For delivery, Razr-Pi requires exact candidate identity, excluded-input scrutiny, fresh independent Technical and Contract review of that exact commit, and final human PR review. These gates remain outside package loading and automated test results.
