@@ -1,0 +1,30 @@
+{
+  "source": "razr sibling distribution baseline plus reviewed M09 lifecycle hardening; source paths relative to this runtime root",
+  "policy": "Pinned runtime identity; Python core remains sole lifecycle authority. Pi routing and transport adapters do not reimplement lifecycle state.",
+  "files": [
+    {
+      "path": "scripts/razr.py",
+      "sha256": "a463afd5078d3fbaa54bc425a681b0cb2cf71562c1db85bd4018716a3846b020"
+    },
+    {
+      "path": "templates/evidence.md",
+      "sha256": "7a4a2eee74df44e152f079f31f032c34c2de1a0dba04530d97df3f15ac8c7447"
+    },
+    {
+      "path": "templates/executable.yaml",
+      "sha256": "662461e91527d3ed810edd6a04f7fd223f3097f9066e1e9fa158f8adc196a0f2"
+    },
+    {
+      "path": "templates/razr.yaml",
+      "sha256": "a68278cdf4588c8debad214f22dedbc6ef31011287160bdafd981b57a2ac335a"
+    },
+    {
+      "path": "templates/spec.md",
+      "sha256": "908f799cada27c14ebf8e121c8150dbbd2a6dbf4115f0f6033a032f060e334bb"
+    },
+    {
+      "path": "templates/state.yaml",
+      "sha256": "e1f908381f38097798320e2ebc1e12663d93a6aa90e66c89f6bc5873758a11af"
+    }
+  ]
+}
