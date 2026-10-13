@@ -1,6 +1,8 @@
-# Razr-Pi
+<img width="2172" height="724" alt="Razr-Pi Cozy Coding Workshop" src="https://github.com/user-attachments/assets/72fc4eaa-8c65-4598-aa89-4fe334feb187" />
 
 Razr-Pi is a local [Pi](https://github.com/badlogic/pi-mono) package for repository-centered engineering work. It combines a Razr workflow core, selective context assembly, durable Razr Memory, Pi commands, optional Herdr-hosted execution, and bounded GitHub delivery operations.
+
+Already using Pi? Point your agent to [For Pi agents](#for-pi-agents) for guided setup.
 
 ## Why Razr-Pi?
 
@@ -94,14 +96,16 @@ Herdr states such as `working`, `idle`, `blocked`, or `done` are operational tel
 
 Prerequisites are Python 3.11+, Git, Node, and an installed Pi. Razr-Pi does not install or configure them.
 
-Review the local package, then declare it through Pi:
+Clone Razr-Pi into a reviewed tools directory, then install the local package from the repository you want to use it with:
 
 ```sh
-pi install --local /reviewed/path/to/razr-pi/packages/razr-pi
+git clone https://github.com/Plazmodium/razr-pi.git /path/to/razr-pi
+cd /path/to/your-project
+pi install --local /path/to/razr-pi/packages/razr-pi
 pi list
 ```
 
-The package is referenced from its resolved local path. Loading it registers:
+The package stays in the cloned directory; Pi records a local reference to it. Loading is read-only and registers:
 
 - `/razr-status`
 - `/razr-context`
@@ -109,15 +113,29 @@ The package is referenced from its resolved local path. Loading it registers:
 - `/razr-recall`
 - `/razr-memory-inspect`
 
-Loading is read-only. To adopt the current repository explicitly:
+Reload Pi, invoke `/skill:razr`, and begin with read-only orientation. When you are ready, adopt the current repository as a separate action:
 
 ```sh
-python3 -B /reviewed/path/to/razr-pi/packages/razr-pi/scripts/adopt.py \
+python3 -B /path/to/razr-pi/packages/razr-pi/scripts/adopt.py \
   --target "$PWD" \
   --work-root .razr/work
 ```
 
 Inspect the target and command before running it. Adoption creates managed routing and delegates initialization to the Razr core.
+
+## For Pi agents
+
+If a developer points you here, guide the setup instead of silently changing their environment:
+
+1. Read this README, [`AGENTS.md`](AGENTS.md), and the [package guide](packages/razr-pi/README.md).
+2. Check `python3`, `git`, `node`, and `pi`. Report missing prerequisites; ask before any global installation, authentication, or credential work.
+3. Confirm the intended project with `git rev-parse --show-toplevel`. Do not initialize or adopt a different repository implicitly.
+4. If Razr-Pi is not present, propose the exact clone location and command. Wait for approval before network or filesystem changes.
+5. Show the exact `pi install --local` command and package path before running it. Verify the result with `pi list`.
+6. Start with read-only orientation. Explain that package loading is not repository adoption or permission to write.
+7. Ask separately before running `scripts/adopt.py`. Reconfirm the target Git root and work root, then read back the created routing and Razr state.
+
+Stop on failed prerequisites, unexpected existing Razr files, symlinks in control paths, or ambiguous repository identity. Never infer approval, alter credentials, or merge, deploy, or publish automatically.
 
 ## Typical workflow
 
