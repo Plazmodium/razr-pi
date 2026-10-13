@@ -1,4 +1,4 @@
-# Razr-Pi
+<img width="2172" height="724" alt="Razr-Pi Cozy Coding Workshop" src="https://github.com/user-attachments/assets/72fc4eaa-8c65-4598-aa89-4fe334feb187" />
 
 Razr-Pi is a local [Pi](https://github.com/badlogic/pi-mono) package for repository-centered engineering work. It combines a Razr workflow core, selective context assembly, durable Razr Memory, Pi commands, optional Herdr-hosted execution, and bounded GitHub delivery operations.
 
