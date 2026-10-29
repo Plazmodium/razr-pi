@@ -82,7 +82,7 @@ def _adapter_status(root: Path, stage: str, status: str) -> dict[str, object]:
         "supported_through": "candidate_binding",
         "experimental_through": "open_pr_handoff",
         "delivery_status": "acceptance_pending",
-        "review_and_delivery": "fresh dual review, human-gated Review entry and exact PR handoff are supported; merge/deploy remain unavailable",
+        "review_and_delivery": "fresh dual review, human-gated Review entry and exact PR handoff are experimental and acceptance-pending; merge/deploy remain unavailable",
         **routing,
     }
     if stage == "spec" and status == "exploring" and routing["routing"] == "incompatible_previous_release":

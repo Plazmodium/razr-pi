@@ -68,7 +68,7 @@ python3 -B "$REVIEW" audit \
 
 The audit binds the consumed role claim, original event stream, exact fresh saved session, original report bytes, provider/model, isolated candidate clone and exact observed validation tool calls. It returns `structurally_valid`, never `recordable`.
 
-The primary must additionally inspect actual tool arguments/results, findings, limitations, candidate identity and protected before/after state, then reproduce every declared check independently in a fresh shallow candidate clone. Retain bounded actual stdout/stderr and execution results with:
+The primary must additionally inspect actual tool arguments/results, findings, limitations, candidate identity and protected before/after state, then reproduce every declared check independently in a fresh detached candidate clone with committed history but no configured remote URL. Retain bounded actual stdout/stderr and execution results with:
 
 ```sh
 python3 -B "$REVIEW" reproduce \

@@ -68,6 +68,11 @@ class ReviewFlowTests(FixtureTest):
         checkpoint_state = json.loads((item / "state.yaml").read_text())
         self.assertEqual(checkpoint_state["nodes"][node]["status"], "complete")
         self.assertIn(command + " => PASS", (item / "evidence.md").read_text())
+        checkpoint_decision = self.commands / f"{name}-{work_id}-first-task-acceptance.json"
+        review.save_new(checkpoint_decision, {"schema_version": 1, "work_id": work_id,
+                                              "decision": "SYNTHETIC-accepted-for-no-model-test",
+                                              "candidate_preparation_authorized": True})
+        self.assertTrue(json.loads(checkpoint_decision.read_text())["candidate_preparation_authorized"])
         (root / "product.txt").write_text("portable review fixture\n")
         self.invoke([self.tools["git"], "-C", root, "add", "AGENTS.md", "razr.yaml", "product.txt",
                      str(Path(work_root) / work_id / "spec.md"),
@@ -309,6 +314,47 @@ sys.exit(2)
         delivered = json.loads((item / "state.yaml").read_text())["delivery"]
         self.assertEqual((delivered["pull_request"], delivered["head_commit"], delivered["outcome"]),
                          (url, commit, "pending"))
+
+    def test_duplicate_commands_bind_by_validation_id_and_fail_can_be_supported(self):
+        context = str(uuid.uuid4()); common_digest = "sha256:" + "c" * 64
+        common = {"work_id": "duplicate-probe",
+                  "candidate": {"repository": "fixture/duplicate", "branch": "main", "commit": "a" * 40,
+                                "source_digest": "sha256:" + "b" * 64},
+                  "contract": {"spec": {"sha256": "sha256:" + "d" * 64}},
+                  "canonical": {"state": {"executable": {"digest": "sha256:" + "e" * 64}}},
+                  "declared_validations": [{"id": "one:1", "command": "true"},
+                                           {"id": "two:1", "command": "true"}]}
+        report = self.report(common, common_digest, "technical", context)
+        shells = ["cd candidate && RAZR_REVIEW_CHECK_ID=one:1 /bin/sh -c true",
+                  "cd candidate && RAZR_REVIEW_CHECK_ID=two:1 /bin/sh -c true"]
+        rows = [{"type": "session", "id": context}]
+        for index, command in enumerate(shells):
+            rows += [{"type": "tool_execution_start", "toolCallId": str(index), "toolName": "bash",
+                      "args": {"command": command}},
+                     {"type": "tool_execution_end", "toolCallId": str(index), "isError": False,
+                      "result": {"content": []}}]
+        rows += [{"type": "message_end", "message": {"role": "assistant",
+                  "content": [{"type": "text", "text": json.dumps(report)}]}},
+                 {"type": "agent_settled", "aborted": False}]
+        raw = ("\n".join(json.dumps(row) for row in rows) + "\n").encode()
+        review.audit_events(raw, common, common_digest, "technical", context, shells)
+        one_only = ("\n".join(json.dumps(row) for row in rows if row.get("toolCallId") != "1") + "\n").encode()
+        with self.assertRaisesRegex(review.Refusal, "each observed exactly once"):
+            review.audit_events(one_only, common, common_digest, "technical", context, shells)
+
+        stdout = self.lab / "fail-stdout"; stderr = self.lab / "fail-stderr"
+        stdout.write_bytes(b""); stderr.write_bytes(b"expected failure\n")
+        common["declared_validations"] = [{"id": "one:1", "command": "false"}]
+        fail_report = self.report(common, common_digest, "technical", context, verdict="FAIL")
+        fail_report["reproduced_checks"][0]["exit_code"] = 1
+        reproduction = {"checks": [{"id": "one:1", "command": "false", "exit_code": 1,
+                                      "stdout": str(stdout), "stdout_digest": review.digest(b""),
+                                      "stderr": str(stderr), "stderr_digest": review.digest(stderr.read_bytes()),
+                                      "execution": {"reason": None, "exit_code": 1}}]}
+        review.validate_primary_reproduction(reproduction, common, fail_report)
+        fail_report["verdict"] = "PASS"
+        with self.assertRaisesRegex(review.Refusal, "contradicts PASS"):
+            review.validate_primary_reproduction(reproduction, common, fail_report)
 
     def test_reports_refuse_incomplete_reuse_drift_and_peer_context(self):
         root, _ = self.candidate("refusals", ".workflow/items", shell_validation=True)

@@ -208,7 +208,7 @@ def freeze_data(target: str | Path, work_id: str) -> dict[str, object]:
         "limitations": [
             "Hashes establish identity, not execution, independence, semantic support or human approval.",
             "Reviewer tools execute with the current operating-system identity and are not a sandbox.",
-            "Reviewers receive a detached shallow candidate clone and no live-target path, but same-UID indirect discovery is not prevented.",
+            "Reviewers receive a detached candidate clone with committed Git history and no live-target path, but same-UID indirect discovery is not prevented.",
             "GitHub observations and model/provider transport are external and non-atomic.",
         ],
     }
@@ -458,19 +458,24 @@ def launch(common_path: str, common_digest: str, role: str, run_path: str, provi
                      "status": "consumed-before-launch"})
     run.mkdir(parents=True, exist_ok=False)
     candidate_view = run / "candidate"
-    clone = subprocess.run(["git", "clone", "--quiet", "--no-local", "--no-hardlinks", "--depth", "1",
-                            "--single-branch", "--branch", common["candidate"]["branch"], "--no-checkout",
+    clone = subprocess.run(["git", "clone", "--quiet", "--no-local", "--no-hardlinks", "--no-checkout",
                             str(root), str(candidate_view)], capture_output=True, text=True, timeout=120)
     require(clone.returncode == 0, "cannot create isolated candidate clone: " + clone.stderr.strip())
     checkout = subprocess.run(["git", "-C", str(candidate_view), "checkout", "--quiet", "--detach",
                                common["candidate"]["commit"]], capture_output=True, text=True, timeout=60)
     require(checkout.returncode == 0, "cannot checkout isolated candidate: " + checkout.stderr.strip())
+    source_refs = subprocess.run(["git", "for-each-ref", "--format=%(refname:strip=2) %(objectname)", "refs/heads"],
+                                 cwd=root, capture_output=True, text=True, timeout=30, check=True).stdout.splitlines()
     subprocess.run(["git", "-C", str(candidate_view), "remote", "remove", "origin"], capture_output=True, timeout=30)
+    for source_ref in source_refs:
+        branch_name, object_id = source_ref.split(" ", 1)
+        git(candidate_view, "update-ref", f"refs/remotes/origin/{branch_name}", object_id)
     require(git_text(candidate_view, "rev-parse", "HEAD") == common["candidate"]["commit"]
-            and git_text(candidate_view, "rev-list", "--count", "--all") == "1"
             and not git(candidate_view, "status", "--porcelain", "-z"), "isolated candidate mismatch")
     check_invocations = [{"id": row["id"], "command": row["command"],
-                          "bash": "cd -- " + shlex.quote(str(candidate_view)) + " && " + row["command"]}
+                          "bash": ("cd -- " + shlex.quote(str(candidate_view)) + " && "
+                                   + "RAZR_REVIEW_CHECK_ID=" + shlex.quote(row["id"]) + " /bin/sh -c "
+                                   + shlex.quote(row["command"]))}
                          for row in common["declared_validations"]]
     driver = run / "driver"
     (driver / ".pi").mkdir(parents=True)
@@ -597,7 +602,6 @@ def audit_run(common_path: str, common_digest: str, run_path: str, role: str) ->
             "retained review evidence drift")
     candidate_view = Path(launch_data["candidate_view"])
     require(git_text(candidate_view, "rev-parse", "HEAD") == common["candidate"]["commit"]
-            and git_text(candidate_view, "rev-list", "--count", "--all") == "1"
             and not git(candidate_view, "remote")
             and not git(candidate_view, "status", "--porcelain", "-z"), "isolated candidate changed")
     return report, {"role": role, "context": context, "review_status": report["review_status"],
@@ -620,14 +624,18 @@ def reproduce(common_path: str, common_digest: str, output_path: str, primary_co
     output.mkdir(parents=True)
     candidate = output / "candidate"
     root = Path(common["target"])
-    clone = subprocess.run(["git", "clone", "--quiet", "--no-local", "--no-hardlinks", "--depth", "1",
-                            "--single-branch", "--branch", common["candidate"]["branch"], "--no-checkout",
+    clone = subprocess.run(["git", "clone", "--quiet", "--no-local", "--no-hardlinks", "--no-checkout",
                             str(root), str(candidate)], capture_output=True, text=True, timeout=120)
     require(clone.returncode == 0, "cannot create primary candidate clone: " + clone.stderr.strip())
     checkout = subprocess.run(["git", "checkout", "--quiet", "--detach", common["candidate"]["commit"]],
                               cwd=candidate, capture_output=True, text=True, timeout=120)
     require(checkout.returncode == 0, "cannot checkout primary candidate: " + checkout.stderr.strip())
+    source_refs = subprocess.run(["git", "for-each-ref", "--format=%(refname:strip=2) %(objectname)", "refs/heads"],
+                                 cwd=root, capture_output=True, text=True, timeout=30, check=True).stdout.splitlines()
     git(candidate, "remote", "remove", "origin")
+    for source_ref in source_refs:
+        branch_name, object_id = source_ref.split(" ", 1)
+        git(candidate, "update-ref", f"refs/remotes/origin/{branch_name}", object_id)
     home = output / "home"; temporary = output / "tmp"; home.mkdir(); temporary.mkdir()
     environment = {"PATH": os.defpath, "HOME": str(home), "TMPDIR": str(temporary), "LANG": "C.UTF-8",
                    "LC_ALL": "C.UTF-8", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
@@ -649,6 +657,30 @@ def reproduce(common_path: str, common_digest: str, output_path: str, primary_co
     return value
 
 
+def validate_primary_reproduction(reproduction: dict[str, object], common: dict[str, object],
+                                  report: dict[str, object]) -> None:
+    expected = {(row["id"], row["command"]) for row in common["declared_validations"]}
+    observed = {}
+    for row in reproduction["checks"]:
+        require(isinstance(row, dict) and set(row) == {"id", "command", "exit_code", "stdout", "stdout_digest",
+                                                       "stderr", "stderr_digest", "execution"},
+                "invalid primary reproduction check")
+        require(digest(regular(row["stdout"])) == row["stdout_digest"]
+                and digest(regular(row["stderr"])) == row["stderr_digest"], "primary reproduction output drift")
+        require(row["execution"].get("reason") is None
+                and row["execution"].get("exit_code") == row["exit_code"],
+                "primary reproduction result mismatch")
+        key = (row["id"], row["command"])
+        require(key not in observed, "duplicate primary reproduction check")
+        observed[key] = row["exit_code"]
+    require(set(observed) == expected, "primary reproduction does not prove every declared validation")
+    reported = {(row["id"], row["command"]): row["exit_code"] for row in report["reproduced_checks"]}
+    if report["verdict"] == "PASS":
+        require(all(exit_code == 0 for exit_code in observed.values()), "primary reproduction contradicts PASS")
+    else:
+        require(observed == reported, "primary reproduction does not reproduce critic FAIL checks")
+
+
 def support_run(common_path: str, common_digest: str, run_path: str, role: str,
                 primary_context: str, decision_ref: str, reproduction_path: str) -> dict[str, object]:
     report, audit = audit_run(common_path, common_digest, run_path, role)
@@ -666,20 +698,7 @@ def support_run(common_path: str, common_digest: str, run_path: str, role: str,
     common = validate_common(common_path, common_digest)
     require(reproduction.get("common_digest") == common_digest and reproduction.get("candidate") == common["candidate"],
             "primary reproduction identity mismatch")
-    expected = {(row["id"], row["command"]) for row in common["declared_validations"]}
-    observed = set()
-    for row in reproduction["checks"]:
-        require(isinstance(row, dict) and set(row) == {"id", "command", "exit_code", "stdout", "stdout_digest",
-                                                       "stderr", "stderr_digest", "execution"},
-                "invalid primary reproduction check")
-        require(digest(regular(row["stdout"])) == row["stdout_digest"]
-                and digest(regular(row["stderr"])) == row["stderr_digest"], "primary reproduction output drift")
-        require(row["execution"].get("reason") is None
-                and row["execution"].get("exit_code") == row["exit_code"],
-                "primary reproduction result mismatch")
-        if row["exit_code"] == 0:
-            observed.add((row["id"], row["command"]))
-    require(observed == expected, "primary reproduction does not prove every declared validation")
+    validate_primary_reproduction(reproduction, common, report)
     support_path = Path(run_path) / "outcome-support.json"
     value = {"schema_version": 1, "role": role, "context": report["context"],
              "primary_context": primary_context, "decision_ref": decision_ref,
