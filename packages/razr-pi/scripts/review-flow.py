@@ -51,6 +51,18 @@ def require(condition: bool, message: str) -> None:
         raise Refusal(message)
 
 
+def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value = {}
+    for key, item in pairs:
+        require(key not in value, "duplicate JSON object field: " + key)
+        value[key] = item
+    return value
+
+
+def strict_json(raw: str) -> object:
+    return json.loads(raw, object_pairs_hook=unique_object)
+
+
 def digest(raw: bytes) -> str:
     return "sha256:" + hashlib.sha256(raw).hexdigest()
 
@@ -104,27 +116,64 @@ def safe_git_environment() -> None:
 
 
 def history_identity(root: Path) -> dict[str, object]:
-    raw_refs = git_text(root, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads")
-    refs = []
+    raw_refs = git_text(root, "for-each-ref", "--format=%(refname) %(objectname)",
+                        "refs/heads", "refs/tags", "refs/remotes")
+    by_name = {}
     for line in raw_refs.splitlines():
         name, object_id = line.split(" ", 1)
-        require(name.startswith("refs/heads/") and re.fullmatch(r"[0-9a-f]{40}", object_id),
-                "invalid committed-history reference")
-        refs.append({"name": name, "object": object_id})
+        if name.endswith("/HEAD"):
+            continue
+        require(name.startswith(("refs/heads/", "refs/tags/", "refs/remotes/"))
+                and re.fullmatch(r"[0-9a-f]{40}", object_id), "invalid committed-history reference")
+        by_name[name] = object_id
+    for name, object_id in list(by_name.items()):
+        if name.startswith("refs/heads/"):
+            by_name.setdefault("refs/remotes/origin/" + name.removeprefix("refs/heads/"), object_id)
+    refs = [{"name": name, "object": by_name[name]} for name in sorted(by_name)]
     require(refs, "candidate committed history has no refs")
-    graph = git(root, "rev-list", "--parents", "--topo-order", *[row["object"] for row in refs])
+    commits = []
+    for row in refs:
+        peeled = subprocess.run(["git", "rev-parse", row["object"] + "^{commit}"], cwd=root,
+                                capture_output=True, text=True, timeout=30)
+        if peeled.returncode == 0:
+            commits.append(peeled.stdout.strip())
+    require(commits, "candidate committed history has no commits")
+    graph = git(root, "rev-list", "--parents", "--topo-order", *sorted(set(commits)))
     return {"refs": refs, "graph_digest": digest(b"\n".join(sorted(graph.splitlines())) + b"\n")}
+
+
+def materialize_history_refs(root: Path, expected: dict[str, object]) -> None:
+    existing = git_text(root, "for-each-ref", "--format=%(refname)", "refs/heads", "refs/tags", "refs/remotes")
+    for name in existing.splitlines():
+        git(root, "update-ref", "-d", name)
+    for row in expected["refs"]:
+        git(root, "update-ref", row["name"], row["object"])
 
 
 def verify_history(root: Path, expected: dict[str, object]) -> None:
     require(git_text(root, "rev-parse", "--is-shallow-repository") == "false",
             "shallow candidate history refused")
+    actual = []
+    raw_actual = git_text(root, "for-each-ref", "--format=%(refname) %(objectname)",
+                          "refs/heads", "refs/tags", "refs/remotes")
+    for line in raw_actual.splitlines():
+        name, object_id = line.split(" ", 1)
+        if not name.endswith("/HEAD"):
+            actual.append({"name": name, "object": object_id})
+    require(actual == expected["refs"], "candidate committed-history refs mismatch")
+    commits = []
     for row in expected["refs"]:
-        require(core.git_commit_exists(root, row["object"]), "candidate history object missing")
-    graph = git(root, "rev-list", "--parents", "--topo-order", *[row["object"] for row in expected["refs"]])
+        present = subprocess.run(["git", "cat-file", "-e", row["object"]], cwd=root,
+                                 capture_output=True, timeout=30)
+        require(present.returncode == 0, "candidate history object missing")
+        peeled = subprocess.run(["git", "rev-parse", row["object"] + "^{commit}"], cwd=root,
+                                capture_output=True, text=True, timeout=30)
+        if peeled.returncode == 0:
+            commits.append(peeled.stdout.strip())
+    graph = git(root, "rev-list", "--parents", "--topo-order", *sorted(set(commits)))
     require(digest(b"\n".join(sorted(graph.splitlines())) + b"\n") == expected["graph_digest"],
             "candidate committed history mismatch")
-    fsck = subprocess.run(["git", "fsck", "--connectivity-only", "--no-dangling"], cwd=root,
+    fsck = subprocess.run(["git", "fsck", "--full", "--no-dangling"], cwd=root,
                           capture_output=True, text=True, timeout=120)
     require(fsck.returncode == 0, "candidate committed history integrity failure")
 
@@ -364,7 +413,7 @@ def audit_events(events_raw: bytes, common: dict[str, object], common_digest: st
     if model is not None:
         require(final.get("model") == model, "review model mismatch")
     original_report = assistant_text(final)
-    report = validate_report(json.loads(original_report), common, common_digest, role, context)
+    report = validate_report(strict_json(original_report), common, common_digest, role, context)
     starts = {row.get("toolCallId"): row for row in rows if row.get("type") == "tool_execution_start"}
     ends = {row.get("toolCallId"): row for row in rows if row.get("type") == "tool_execution_end"}
     require(starts.keys() == ends.keys(), "unpaired tool execution records")
@@ -495,12 +544,12 @@ def launch(common_path: str, common_digest: str, role: str, run_path: str, provi
     checkout = subprocess.run(["git", "-C", str(candidate_view), "checkout", "--quiet", "--detach",
                                common["candidate"]["commit"]], capture_output=True, text=True, timeout=60)
     require(checkout.returncode == 0, "cannot checkout isolated candidate: " + checkout.stderr.strip())
-    source_refs = subprocess.run(["git", "for-each-ref", "--format=%(refname:strip=2) %(objectname)", "refs/heads"],
-                                 cwd=root, capture_output=True, text=True, timeout=30, check=True).stdout.splitlines()
+    fetch = subprocess.run(["git", "-C", str(candidate_view), "fetch", "--quiet", "--force", "--no-tags", str(root),
+                            "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*",
+                            "+refs/remotes/*:refs/remotes/*"], capture_output=True, text=True, timeout=120)
+    require(fetch.returncode == 0, "cannot fetch complete committed history: " + fetch.stderr.strip())
     subprocess.run(["git", "-C", str(candidate_view), "remote", "remove", "origin"], capture_output=True, timeout=30)
-    for source_ref in source_refs:
-        branch_name, object_id = source_ref.split(" ", 1)
-        git(candidate_view, "update-ref", f"refs/remotes/origin/{branch_name}", object_id)
+    materialize_history_refs(candidate_view, common["committed_history"])
     require(git_text(candidate_view, "rev-parse", "HEAD") == common["candidate"]["commit"]
             and not git(candidate_view, "status", "--porcelain", "-z"), "isolated candidate mismatch")
     verify_history(candidate_view, common["committed_history"])
@@ -663,12 +712,13 @@ def reproduce(common_path: str, common_digest: str, output_path: str, primary_co
     checkout = subprocess.run(["git", "checkout", "--quiet", "--detach", common["candidate"]["commit"]],
                               cwd=candidate, capture_output=True, text=True, timeout=120)
     require(checkout.returncode == 0, "cannot checkout primary candidate: " + checkout.stderr.strip())
-    source_refs = subprocess.run(["git", "for-each-ref", "--format=%(refname:strip=2) %(objectname)", "refs/heads"],
-                                 cwd=root, capture_output=True, text=True, timeout=30, check=True).stdout.splitlines()
+    fetch = subprocess.run(["git", "fetch", "--quiet", "--force", "--no-tags", str(root),
+                            "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*",
+                            "+refs/remotes/*:refs/remotes/*"], cwd=candidate,
+                           capture_output=True, text=True, timeout=120)
+    require(fetch.returncode == 0, "cannot fetch complete primary history: " + fetch.stderr.strip())
     git(candidate, "remote", "remove", "origin")
-    for source_ref in source_refs:
-        branch_name, object_id = source_ref.split(" ", 1)
-        git(candidate, "update-ref", f"refs/remotes/origin/{branch_name}", object_id)
+    materialize_history_refs(candidate, common["committed_history"])
     verify_history(candidate, common["committed_history"])
     home = output / "home"; temporary = output / "tmp"; home.mkdir(); temporary.mkdir()
     environment = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(home), "TMPDIR": str(temporary), "LANG": "C.UTF-8",

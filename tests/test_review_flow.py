@@ -84,6 +84,9 @@ class ReviewFlowTests(FixtureTest):
                      str(Path(work_root) / work_id / "evidence.md")], root)
         self.invoke([self.tools["git"], "-C", root, "commit", "-qm", "review candidate"], root)
         commit = self.invoke([self.tools["git"], "-C", root, "rev-parse", "HEAD"], root).stdout.strip()
+        base_commit = self.invoke([self.tools["git"], "-C", root, "rev-parse", "HEAD^"], root).stdout.strip()
+        self.invoke([self.tools["git"], "-C", root, "tag", "fixture-history-base", base_commit], root)
+        self.invoke([self.tools["git"], "-C", root, "update-ref", "refs/remotes/upstream/base", base_commit], root)
         state = json.loads((item / "state.yaml").read_text())
         self.core(root, "candidate", work_id, "--repository", repository,
                   "--branch", branch, "--commit", commit, "--expect-generation", str(state["generation"]))
@@ -335,6 +338,10 @@ sys.exit(2)
                                                      "summary": "contradictory duplicate"})
         with self.assertRaisesRegex(review.Refusal, "duplicate reproduced check"):
             review.validate_report(contradictory, common, common_digest, "technical", context)
+        duplicate_field = json.dumps(report).replace('"verdict": "PASS"',
+                                                       '"verdict": "FAIL", "verdict": "PASS"')
+        with self.assertRaisesRegex(review.Refusal, "duplicate JSON object field"):
+            review.strict_json(duplicate_field)
         shells = ["cd candidate && RAZR_REVIEW_CHECK_ID=one:1 /bin/sh -c true",
                   "cd candidate && RAZR_REVIEW_CHECK_ID=two:1 /bin/sh -c true"]
         rows = [{"type": "session", "id": context}]
@@ -391,6 +398,9 @@ sys.exit(2)
         root, _ = self.candidate("launcher")
         output = self.lab / "launcher-review"
         common_path, common_digest = review.freeze(str(root), "public-probe", str(output))
+        history_names = {row["name"] for row in review.validate_common(common_path, common_digest)["committed_history"]["refs"]}
+        self.assertTrue({"refs/tags/fixture-history-base", "refs/remotes/upstream/base",
+                         "refs/remotes/origin/main"} <= history_names)
         fake = self.fake_pi()
         run = self.lab / "technical-live-shape"
         result = review.launch(str(common_path), common_digest, "technical", str(run), "fixture", "fixture",
