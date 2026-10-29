@@ -116,7 +116,7 @@ Do not require a preexisting HEAD merely to execute the first task. Conversely, 
 
 After the authorized commit read its full SHA and branch, inspect explicit excluded paths (`AGENTS.md`, `razr.yaml`, configured work root) and re-run affected checks on the committed candidate as required. Stop if checks change tracked source or required canonical bytes. Source digest excludes these metadata paths; digest equality alone does not prove their review.
 
-## 4. Bind only the inspected candidate, then stop in Verify
+## 4. Bind only the inspected candidate, then enter Verify
 
 Use the approved repository identity, full 40-character implementation commit and inspected branch pointing to it. Immediately reinspect before **each** command, supply the generation actually returned, and inspect each result before proceeding:
 
@@ -133,4 +133,4 @@ python3 "$PACKAGE/scripts/primary.py" --target "$TARGET" --work-id "$WORK_ID"
 
 Compare stored repository/branch/commit/source digest with the inspected commit and actual core output; retain actual status/validation and expected state/evidence deltas. Canonical state now postdates the implementation commit; that is expected. Do not automatically recommit metadata to make times appear identical. Never require locks to be unchanged. A synthetic identity is local metadata, not a remote: no push/PR/network action follows.
 
-**STOP.** This procedure neither launches critics nor grants review allowances. Fresh Technical and Contract sessions, same-source identity, independent inputs, actual checkpoint decisions and supported original outcomes remain mandatory for later review. Prior claims stay consumed. Review/PR/final human review are not bypassed. Interruption recovery and different-product review portability remain separate slices; this inspector is not an automatic resume engine or an authenticated decision ledger.
+**STOP this procedure.** It neither launches critics nor grants model or remote allowances. If the human requests formal review, continue only with [independent review through human PR handoff](review-delivery.md). Fresh Technical and Contract sessions, same-source identity, primary semantic audit, explicit Review approval, exact PR read-back and final human PR review remain mandatory. Prior claims stay consumed; this inspector is not an automatic resume engine or an authenticated decision ledger.

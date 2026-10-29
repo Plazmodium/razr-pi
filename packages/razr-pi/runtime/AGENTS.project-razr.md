@@ -1,17 +1,27 @@
 <!-- RAZR:START -->
 ## Razr in Pi
 
-This project explicitly adopts Razr. Load the reviewed `razr` Pi skill before workflow actions. If unavailable, stop and ask the human to load the reviewed local package; do not install anything automatically or guess a CLI from PATH.
+This project explicitly adopts Razr. Load the reviewed `razr` Pi skill before workflow actions. If unavailable, stop and ask the human to load the reviewed local package; do not install automatically or guess a CLI from PATH.
 
-The primary Pi agent owns conversation and workflow mutations. The existing bundled Razr Python CLI remains the validator; never hand-edit lifecycle state. Before acting, read project rules and run actual `status --json` and `validate --all` through the bundled core.
+One primary Pi session owns the conversation and supported workflow mutations. The provenance-pinned Razr Python core is the sole lifecycle authority; never hand-edit canonical state. Read project rules and actual human decisions, then inspect core status and validation before acting.
 
-Authority: `spec.md` owns approved intent; `executable.yaml` owns the immutable approved DAG; `state.yaml` owns generation-fenced progress; `evidence.md` records actual proof. Git owns source history; a live PR is the human review surface. Before approval, discovery contains only `spec.md`.
+Authority: `spec.md` owns exact approved intent; `executable.yaml` owns the immutable approved DAG; `state.yaml` owns generation-fenced progress; `evidence.md` records observed proof. Git owns candidate history. The live PR is the final human review surface.
 
-For an exact human-approved canonical spec and digest-matched executable, the primary may use the supported CLI to approve, run the declared first task, record actual validation evidence, and complete that task with current generation fencing. Then pause for a human checkpoint. This is not permission to infer approval, fabricate PASS evidence, or continue beyond the checkpoint.
+Follow the shipped skill procedures in order:
 
-Candidate recording is permitted only when that work item's exact human-approved canonical spec explicitly requires it, every declared node and first-task checkpoint is complete, required artifacts are committed, and the core's source-identity gates pass. Entering Verify stops unless that exact approved canonical contract explicitly permits bounded Technical review or fresh dual Technical/Contract review. Only after the human first-task checkpoint, verified helper/resource-loading prerequisites, and explicit live-run limits may the primary launch the canonically authorized fresh saved sessions. Dual review uses frozen neutral inputs against one exact candidate; neither critic receives builder history, prior critic reports, or peer findings. Pause after Technical for human inspection before Contract. Critics return evidence only; the primary inspects actual candidate-bound session/tool results and reproduces relevant claims. Record supported original PASS/FAIL outcomes only when the exact canonical contract explicitly permits recording, using distinct substantive evidence sections/reviewers/actual contexts and current-generation core commands. Incomplete, unsupported, contaminated, or drifted reviews are not recorded. Genuine FAIL stops for the human without automatic repair/retry. Pause after recorded-result read-back while still in Verify. No Verify-to-Review transition, PR action, merge, or deployment is permitted in this increment. Future gates remain mandatory: fresh independent Technical and Contract critics against one candidate, live PR read-back, and final human review. A model switch or fork with builder history is not independent critique.
+1. discovery and exact spec/executable approval;
+2. declared task execution with actual evidence and fresh generations;
+3. mandatory human inspection after the first verified task;
+4. explicit candidate staging/commit, source identity and digest-excluded input scrutiny;
+5. fresh independent Technical and Contract Pi sessions against the same frozen candidate inputs;
+6. primary audit and supported original-outcome recording through the core;
+7. explicit human approval before Verify-to-Review transition;
+8. separately authorized non-force push and exact GitHub PR create/read-back;
+9. core PR recording and final human PR handoff.
 
-When the exact contract requires reviewable neutral evidence, freeze named executed regression/subcase proof and assertion/source mappings, not just aggregate counts. New reports explicitly declare complete or incomplete; only complete reports include an eligible original Verdict. After a supported complete Technical PASS and actual human report checkpoint, Contract alone may receive the contract's separate immutable strict-allowlist sequencing receipt, never peer findings/verdicts/reports/transcripts or private history paths. Keep common inputs unchanged. Primary revalidates that receipt against actual private records before launch and recording; it is primary-observed provenance, not independently authenticated approval. Contract assesses already-due permitted evidence; its own completion and primary audit/recording/read-back remain explicitly post-report. Missing due-now proof is not a pending exemption. Preserve all prior reports and consumed allowances; no evidence retrofit or automatic retry.
+Package loading, hashes, flags, CLI attestations, model identity and Herdr telemetry do not prove execution, independence or human approval. A model switch, resumed/forked builder session or context carrying builder history is not fresh critique. Incomplete, unsupported, contaminated, drifted or failed review stops; there is no automatic retry, repair or fallback. A repair requires legal return to Build, a new candidate and two new reviews.
 
-CLI attestations do not authenticate approval, execute tests, or prove critic independence. The source digest excludes root `AGENTS.md`, `razr.yaml`, and the configured work root; these paths still require explicit scrutiny. Stop on partial/inconsistent state and preserve artifacts. No automatic install, global configuration, merge, deployment, or cleanup.
+The source digest excludes root `AGENTS.md`, `razr.yaml` and the configured work root; inspect them explicitly. Use freshly read generations for every core mutation. Preserve failures and consumed review claims. Stop for credentials, spending, destructive operations, production actions and material scope decisions.
+
+No automatic install, global configuration, force-push, compensation, merge, deployment, release or publication is permitted. Review entry, remote mutation and final PR acceptance remain distinct human-owned decisions.
 <!-- RAZR:END -->

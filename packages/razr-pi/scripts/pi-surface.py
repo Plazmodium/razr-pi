@@ -79,8 +79,10 @@ def _routing_status(root: Path) -> dict[str, str]:
 def _adapter_status(root: Path, stage: str, status: str) -> dict[str, object]:
     routing = _routing_status(root)
     boundary = {
-        "supported_through": "verify",
-        "review_and_delivery": "not generally supported; only exact separately approved bounded procedures apply",
+        "supported_through": "candidate_binding",
+        "experimental_through": "open_pr_handoff",
+        "delivery_status": "acceptance_pending",
+        "review_and_delivery": "fresh dual review, human-gated Review entry and exact PR handoff are supported; merge/deploy remain unavailable",
         **routing,
     }
     if stage == "spec" and status == "exploring" and routing["routing"] == "incompatible_previous_release":

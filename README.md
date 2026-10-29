@@ -4,7 +4,7 @@ Already using Pi? Point your agent to [For Pi agents](#for-pi-agents) for guided
 
 > **Breaking release:** Razr-Pi does not support in-place migration from previously generated project routing or workflow state. Existing users must start again from the beginning in a clean repository. The helper prepares original/proposed `AGENTS.md` files for human-applied de-adoption without deleting project data; archival or deletion of retained `razr.yaml` and `.razr/` data is a separate explicit decision.
 >
-> Razr-Pi still does not provide a general end-to-end delivery workflow for arbitrary projects. The supported package path reaches discovery and exact-approved execution through the first checkpoint; candidate/review support is conditional and bounded, and general Review/PR delivery remains unavailable.
+> Razr-Pi includes an experimental primary-led end-to-end path for bounded GitHub-backed projects: exact approval, execution, first-task checkpoint, candidate binding, fresh independent Technical and Contract review, human-gated Review entry, exact PR creation/read-back, and final human PR handoff. Release acceptance is still pending; it never merges or deploys automatically.
 
 ## Why Razr-Pi?
 
@@ -141,20 +141,17 @@ Stop on failed prerequisites, unexpected existing Razr files, symlinks in contro
 
 ## Workflow model and current support
 
-The Razr model runs from exploration through human-reviewed delivery, but this package does not yet support every step generally.
+The experimental delivery workflow is intended to run from exploration through an open PR presented for final human review; treat it as acceptance-pending until the release evidence is complete:
 
-Available now:
+1. Explicitly adopt a repository and create/refine an exact specification and executable.
+2. Execute declared work with core-backed state, validation read-back and the first-task human checkpoint.
+3. Bind one clean committed candidate and freeze neutral candidate-bound review inputs.
+4. Launch fresh independent Technical and Contract Pi sessions with explicit model/budget authorization.
+5. Primary-audit and record supported outcomes, then obtain explicit human approval before entering Review.
+6. After separate remote authorization, push the exact reviewed head, create/read back the PR and record it through the core.
+7. Stop at final human PR review. Merge and deployment remain human-owned.
 
-1. Explicitly adopt a repository and create/refine a specification.
-2. Inspect core state and the separate adapter boundary with `/razr-status <work_id>`.
-3. For an exact approved contract, follow the supported first-task and human-checkpoint procedure.
-4. Safely prepare a human-reviewed de-adoption proposal while retaining project data.
-
-Conditional or unavailable:
-
-- Candidate and critic procedures apply only when the exact contract and supported bounded procedure permit them.
-- General Review transition, PR delivery, merge and deployment are not provided by this release.
-- Core commands existing in the bundled runtime are not permission to bypass the adapter boundary.
+The path is project/language/test-runner/model/branch independent within its explicit repository and safety constraints. Core commands, helper flags and hashes never bypass actual human gates.
 
 Use `/razr-context` for bounded context and the Memory commands for experiential context. Updating the package does not rewrite project routing, and this breaking release provides no in-place upgrade. Previous users should use `scripts/de-adopt.py`, manually review and apply its proposal, retain or separately archive the old data, and begin again in a clean repository.
 
@@ -178,8 +175,9 @@ Razr-Pi currently provides:
 - bounded immutable-Git context selection;
 - repository-scoped append-only Memory;
 - five Pi command surfaces;
-- an optional bounded Herdr execution provider with durable attempt evidence; and
-- a separate source-bound GitHub snapshot/read/create helper.
+- an optional bounded Herdr execution provider with durable attempt evidence;
+- candidate-bound fresh Technical/Contract Pi review preparation, launch, audit and core recording; and
+- source-bound GitHub snapshot/read/create plus core PR handoff.
 
 ## Current limitations
 
@@ -189,7 +187,7 @@ Razr-Pi currently provides:
 - Context requires a clean exact candidate and rejects dirty, untracked, linked, or mutable source inputs.
 - Herdr telemetry never proves workflow completion or review acceptance.
 - GitHub reads are bounded and non-atomic; empty check or review collections do not prove execution or approval.
-- No automatic merge, deployment, package publication, credential management, general critic dispatcher, or PR factory is provided.
+- Review launch and PR creation are explicit bounded operations, not autonomous factories; there are no automatic retries, repairs, compensation, merge, deployment, package publication or credential changes.
 - Exact source scrutiny, independent review, and final human PR review remain mandatory delivery gates.
 
 ## Verification

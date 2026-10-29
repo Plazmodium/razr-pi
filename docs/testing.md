@@ -59,6 +59,7 @@ When `.git` is present, read-only Git checks require a valid exact repository ro
 | `test_clean_package` / `clean_package_preflight.mjs` | Clean-copy package loading and no implicit adoption |
 | `public_package_preflight.mjs` | Public-export no-model Pi loading, resource closure and no implicit adoption in the tracer |
 | `test_recovery_release` | Breaking-release disclosure, incompatible-routing status, safe de-adoption and clean-restart refusal |
+| `test_review_flow` | Generic candidate freeze, bounded fresh-session transport, dual report recording, Review gate and drift/refusal behavior |
 | `test_provenance` | Core/template/helper pins, relocation, missing or changed files |
 | `test_public_boundary` | Exact tree, links, paths, output ownership, fixtures, repository identity |
 | `test_context` | Immutable-candidate context selection, bounds, dirty-source refusal, stale Memory |

@@ -38,7 +38,9 @@ class PiSurfaceTests(FixtureTest):
                                        "candidate", "status_row", "raw_state", "adapter", "fanout"})
         self.assertEqual(result["schema_version"], 2)
         self.assertEqual(result["adapter"]["routing"], "current")
-        self.assertEqual(result["adapter"]["supported_through"], "verify")
+        self.assertEqual(result["adapter"]["supported_through"], "candidate_binding")
+        self.assertEqual(result["adapter"]["experimental_through"], "open_pr_handoff")
+        self.assertEqual(result["adapter"]["delivery_status"], "acceptance_pending")
         self.assertEqual((result["work_id"], result["stage"], result["status"], result["generation"]),
                          ("public-probe", "build", "active", 1))
         self.assertEqual(result["node_id"], "assert-arithmetic")

@@ -94,7 +94,7 @@ def isolate(run, tools):
 
 TEST_MODULES = ('test_adapter_foundation', 'test_memory', 'test_context', 'test_herdr_provider', 'test_adoption', 'test_pi_surface',
                 'test_contract_preflight', 'test_primary_execution', 'test_clean_package',
-                'test_provenance', 'test_public_boundary', 'test_recovery_release',
+                'test_provenance', 'test_public_boundary', 'test_recovery_release', 'test_review_flow',
                 'test_named_regressions', 'test_github_delivery')
 
 

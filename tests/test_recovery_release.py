@@ -151,5 +151,6 @@ class RecoveryReleaseTests(FixtureTest):
             self.assertIn("scripts/de-adopt.py", text)
             self.assertIn("clean repository", text)
         self.assertIn("Breaking release", root_readme)
-        self.assertIn("does not provide a general end-to-end delivery workflow", root_readme)
+        self.assertIn("experimental primary-led end-to-end path", root_readme)
+        self.assertIn("final human PR handoff", root_readme)
         self.assertIn("retain", package_readme.lower())

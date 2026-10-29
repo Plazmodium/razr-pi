@@ -16,10 +16,10 @@ sys.path.insert(0, str(PACKAGE))
 from adapter import github_delivery as delivery  # noqa: E402
 
 
-def fail(code: str, message: str) -> int:
+def fail(code: str, message: str, details: dict | None = None) -> int:
     print(json.dumps({"schema_version": 1, "ok": False,
                       "error": {"code": code, "message": message, "retryable": False,
-                                "details": {}}}, sort_keys=True))
+                                "details": details or {}}}, sort_keys=True))
     return 1
 
 
@@ -37,17 +37,19 @@ def _validate_request(request: object) -> dict:
             or isinstance(request.get("schema_version"), bool) or request["schema_version"] != 1:
         raise ValueError("invalid schema")
     operation = request.get("operation")
-    if operation not in {"snapshot", "read", "create"} or not isinstance(operation, str):
+    if operation not in {"snapshot", "read", "create", "close"} or not isinstance(operation, str):
         raise ValueError("invalid operation")
     common = {"schema_version", "operation", "root"}
     if "root" in request:
         _string(request, "root")
     if operation == "snapshot":
-        allowed, required = common | {"branch", "base"}, ("branch",)
+        allowed, required = common | {"branch", "base"}, ("branch", "base")
     elif operation == "read":
         allowed, required = common | {"url", "repository", "base", "branch", "base_sha", "head_sha", "source_digest"}, ("url", "repository", "base", "branch", "base_sha", "head_sha", "source_digest")
-    else:
+    elif operation == "create":
         allowed, required = common | {"base", "branch", "title", "body", "repository", "base_sha", "head_sha", "source_digest"}, ("base", "branch", "title", "body", "repository", "base_sha", "head_sha", "source_digest")
+    else:
+        allowed, required = common | {"url", "repository", "base", "branch", "base_sha", "head_sha", "source_digest"}, ("url", "repository", "base", "branch", "base_sha", "head_sha", "source_digest")
     if set(request) - allowed:
         raise ValueError("unknown operation field")
     for key in required:
@@ -57,7 +59,7 @@ def _validate_request(request: object) -> dict:
     for key in ("branch", "base"):
         if key in request and (not re.fullmatch(r"[A-Za-z0-9._/-]{1,255}", request[key]) or ".." in request[key]):
             raise ValueError(f"invalid {key}")
-    if operation == "read":
+    if operation in {"read", "close"}:
         owner, repo, _ = delivery._pr_url(request["url"])
         if f"{owner}/{repo}".lower() != request["repository"].lower():
             raise ValueError("read URL repository contradicts repository expectation")
@@ -78,21 +80,28 @@ def main() -> int:
         delivery.auth_preflight(root)
         operation = request["operation"]
         if operation == "snapshot":
-            result = delivery.snapshot(root, branch=request["branch"], base=request.get("base", "campaign/razr-pi-next"))
+            result = delivery.snapshot(root, branch=request["branch"], base=request["base"])
         elif operation == "read":
             result = delivery.read_pr(root, request["url"], expected_repository=request["repository"],
                                       expected_base=request["base"], expected_base_sha=request["base_sha"],
                                       expected_head=request["branch"], expected_head_sha=request["head_sha"],
                                       expected_source_digest=request["source_digest"])
-        else:
+        elif operation == "create":
             result = delivery.create_pr(root, base=request["base"], head=request["branch"],
                                         title=request["title"], body=request["body"],
                                         expected_repository=request.get("repository"),
                                         expected_base_sha=request.get("base_sha"),
                                         expected_head_sha=request.get("head_sha"),
                                         expected_source_digest=request.get("source_digest"))
+        else:
+            result = delivery.close_pr(root, url=request["url"], repository=request["repository"],
+                                       base=request["base"], head=request["branch"],
+                                       base_sha=request["base_sha"], head_sha=request["head_sha"],
+                                       source_digest=request["source_digest"])
         print(json.dumps({"schema_version": 1, "ok": True, "result": result}, sort_keys=True))
         return 0
+    except delivery.CreatedButUnverified as exc:
+        return fail("CREATED_BUT_UNVERIFIED", str(exc), exc.details)
     except delivery.CandidateChanged as exc:
         return fail("CANDIDATE_CHANGED", str(exc))
     except delivery.IdentityMismatch as exc:

@@ -1,8 +1,8 @@
-# Razr for one Pi agent — local workshop prototype
+# Razr for one Pi primary
 
-Provides explicit safe adoption, validated discovery and instructions for exact-approved task execution and human checkpoints. Candidate binding and genuine fresh dual critique/result recording have also been accepted in bounded labs; those results do not create general delivery support.
+Provides explicit safe adoption and an experimental, acceptance-pending primary-led workflow from discovery through an open PR presented for final human review. The provenance-pinned core owns lifecycle state; package helpers prepare candidate-bound review inputs, launch fresh bounded Pi critics, audit/record supported outcomes, and perform exact GitHub create/read operations without merging.
 
-**Current skill boundary: stop in Verify.** The critic helper is lab-specific, not a general reviewer for arbitrary work items. Separate offline tests exercise Review/PR gates with simulated inputs; they do not add delivery authority to this package. The command extension is read-oriented and does not grant lifecycle authority. There is no install script, global setup or general worker system.
+The command extension remains read-oriented and grants no lifecycle authority. Human approval is required at exact contract approval, the first verified task, Review entry, remote mutation and final PR review. There is no install script, global setup, autonomous worker fleet, automatic retry, merge or deployment.
 
 **Breaking change:** projects adopted by an earlier release are not upgraded in place. `/razr-status <work_id>` reports incompatible previous routing. Use `scripts/de-adopt.py` to prepare exact original/proposed `AGENTS.md` files, manually review and apply the proposal, retain or separately archive the old `razr.yaml` and `.razr/` data, then start again from the beginning in a clean repository.
 
@@ -22,7 +22,7 @@ Explicit skill loading and isolated installed-Pi critic-resource loading have re
 
 For an empty project, start with [greenfield preparation](skills/razr/references/greenfield.md), not direct implementation. `scripts/contract-preflight.py --pair <absolute-directory>` reports labelled raw/core identities and catches the known evidence-ownership contradiction before approval; it never approves or applies a contract.
 
-From a fresh primary, read [the primary runbook](skills/razr/references/primary-execution.md). It covers approved task → actual first-task human pause → separately permitted candidate preparation/binding → Verify stop. No one-off execution wrapper is required:
+From a fresh primary, read [the primary runbook](skills/razr/references/primary-execution.md). It covers approved task → actual first-task human pause → candidate preparation/binding → Verify. Then follow [independent review through human PR handoff](skills/razr/references/review-delivery.md). No one-off task execution wrapper is required:
 
 ```sh
 python3 /absolute/path/to/razr-pi/scripts/primary.py \
@@ -40,8 +40,10 @@ Inspection is read-only. The primary runs reviewed declared validations directly
 | `scripts/primary.py` | Read-only core-backed approved-item inspection, absolute paths, empty-candidate handling and fresh generation read-back | No command execution, checkpoint authentication, automatic resume or workflow mutations |
 | `scripts/de-adopt.py` | Creates exact original/proposed files for recognized managed routing and reports retained project data | Never changes `AGENTS.md`, uninstalls Pi or deletes/migrates Razr artifacts |
 | `scripts/pi-surface.py` | Read-only core status plus a separately labelled adapter boundary and next action | Status never authenticates approval or grants permission |
-| `skills/razr/` | Discovery, exact approval, first-task checkpoint and conditional candidate guidance | No general critic dispatch, Review transition or PR delivery procedure |
+| `scripts/review-flow.py` | Generic candidate freeze, bounded fresh Technical/Contract Pi launch, structural audit and supported core recording | Human model authorization and primary semantic audit remain mandatory; not a sandbox |
+| `scripts/github-delivery.py` | Explicit-base snapshot, exact read/create and optional separately authorized compensation | Push and core lifecycle mutations remain primary-owned; observations are non-atomic |
+| `skills/razr/` | Discovery through candidate, fresh dual review, human Review gate and PR handoff | No automatic approval, retry, merge, deploy or publication |
 | `scripts/named-regressions.py` | Source-bound named test/subcase proof collection | Test observations are not independent review or authenticated approval |
 | `runtime/` | Unchanged deterministic core plus adapter-owned routing | CLI attestations do not prove checks ran or humans approved |
 
-Pi release versions are diagnostic metadata, not runtime gates. Missing required behavior—not an unfamiliar version—is a refusal. This package does not claim general independent-review, live GitHub or full delivery readiness.
+Pi release versions are diagnostic metadata, not runtime gates. Missing required behavior—not an unfamiliar version—is a refusal. The experimental delivery path requires actual fresh independent reviews and exact live PR read-back for each delivered candidate; tests and simulated transports do not substitute for those per-candidate gates or release acceptance.

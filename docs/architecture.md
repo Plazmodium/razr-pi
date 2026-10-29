@@ -84,13 +84,15 @@ The provider transports an already authorized request, records attempt evidence,
 
 The provider applies generation/candidate fences before dispatch, a final read-only fence before launch, fresh-context requirements, bounded output/time, durable resource identities, append-only attempt events, process-group cleanup, and explicit recovery. Uncertain outcomes remain `UNKNOWN`.
 
-## Delivery boundary
+## Review and delivery boundary
 
-Git owns candidate commit identity. The GitHub helper observes or creates one explicitly authorized PR bound to exact repository, base/head branches, full commits, and source digest.
+The review helper freezes neutral candidate-bound inputs and may launch separately authorized fresh Technical and Contract Pi processes. It retains structured evidence but does not decide semantic support or authenticate independence/approval. The primary audits original results and invokes the core; only the core records outcomes and permits Review.
+
+Git owns candidate commit identity. After explicit human Review approval and separate remote authorization, the GitHub helper observes or creates one PR bound to exact repository, base/head branches, full commits, and source digest.
 
 Delivery readiness requires exact equality between the PR head, candidate commit, and both independently reviewed commits. Source-digest equality alone is insufficient. GitHub observations are bounded and non-atomic; absent checks or reviews are observations, not evidence of success or approval.
 
-The helper never merges, deploys, force-pushes, launches critics, or authenticates human approval.
+The GitHub helper never merges, deploys, force-pushes, launches critics, or authenticates human approval. Compensation is disabled unless separately authorized for the exact rebound PR.
 
 ## Trust and review gates
 
@@ -100,8 +102,10 @@ The architecture keeps these gates separate:
 2. generation-fenced execution;
 3. first-task verification before expansion;
 4. exact candidate and excluded-input scrutiny;
-5. fresh independent Technical and Contract review; and
-6. final human PR review.
+5. fresh independent Technical and Contract review;
+6. explicit human approval to enter Review;
+7. separately authorized remote mutation; and
+8. final human PR review.
 
 Hashes establish identity, not execution or approval. A model switch or a context carrying builder history is not independent review.
 
