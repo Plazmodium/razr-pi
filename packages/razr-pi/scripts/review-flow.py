@@ -103,6 +103,32 @@ def safe_git_environment() -> None:
         require(name not in os.environ, "Git environment override refused: " + name)
 
 
+def history_identity(root: Path) -> dict[str, object]:
+    raw_refs = git_text(root, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads")
+    refs = []
+    for line in raw_refs.splitlines():
+        name, object_id = line.split(" ", 1)
+        require(name.startswith("refs/heads/") and re.fullmatch(r"[0-9a-f]{40}", object_id),
+                "invalid committed-history reference")
+        refs.append({"name": name, "object": object_id})
+    require(refs, "candidate committed history has no refs")
+    graph = git(root, "rev-list", "--parents", "--topo-order", *[row["object"] for row in refs])
+    return {"refs": refs, "graph_digest": digest(b"\n".join(sorted(graph.splitlines())) + b"\n")}
+
+
+def verify_history(root: Path, expected: dict[str, object]) -> None:
+    require(git_text(root, "rev-parse", "--is-shallow-repository") == "false",
+            "shallow candidate history refused")
+    for row in expected["refs"]:
+        require(core.git_commit_exists(root, row["object"]), "candidate history object missing")
+    graph = git(root, "rev-list", "--parents", "--topo-order", *[row["object"] for row in expected["refs"]])
+    require(digest(b"\n".join(sorted(graph.splitlines())) + b"\n") == expected["graph_digest"],
+            "candidate committed history mismatch")
+    fsck = subprocess.run(["git", "fsck", "--connectivity-only", "--no-dangling"], cwd=root,
+                          capture_output=True, text=True, timeout=120)
+    require(fsck.returncode == 0, "candidate committed history integrity failure")
+
+
 def source_inventory(root: Path, commit: str, work_relative: str) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for record in git(root, "ls-tree", "-r", "-z", "--full-tree", commit).split(b"\0"):
@@ -174,6 +200,7 @@ def freeze_data(target: str | Path, work_id: str) -> dict[str, object]:
             validations.append({"id": f"{node['id']}:{index + 1}", "node": node["id"], "command": command})
     require(validations, "declared validations required")
     inventory = source_inventory(root, commit, work_relative)
+    history = history_identity(root)
     remotes = sorted(git_text(root, "remote").splitlines()) if git_text(root, "remote") else []
     data: dict[str, object] = {
         "schema_version": 1,
@@ -195,6 +222,7 @@ def freeze_data(target: str | Path, work_id: str) -> dict[str, object]:
         "canonical": {"state": state, "evidence_sha256": digest(evidence_raw)},
         "declared_validations": validations,
         "source_inventory": inventory,
+        "committed_history": history,
         "remotes": remotes,
         "package_resources": {name: digest(regular(PACKAGE / name)) for name in RESOURCE_PATHS},
         "review_requirements": {
@@ -214,6 +242,7 @@ def freeze_data(target: str | Path, work_id: str) -> dict[str, object]:
     }
     require(primary.inspect(root, work_id) == observation, "canonical state changed during freeze")
     require(source_inventory(root, commit, work_relative) == inventory, "candidate source changed during freeze")
+    require(history_identity(root) == history, "candidate committed history changed during freeze")
     return data
 
 
@@ -282,7 +311,9 @@ def validate_report(value: object, common: dict[str, object], common_digest: str
     for row in checks:
         require(isinstance(row, dict) and set(row) == {"id", "command", "exit_code", "summary"}, "invalid reproduced check")
         require(isinstance(row["exit_code"], int) and isinstance(row["summary"], str) and row["summary"].strip(), "invalid check result")
-        observed.add((row["id"], row["command"]))
+        key = (row["id"], row["command"])
+        require(key not in observed, "duplicate reproduced check")
+        observed.add(key)
     if value["review_status"] == "complete":
         require(observed == expected, "complete report must reproduce every declared validation")
         if value["verdict"] == "PASS":
@@ -472,6 +503,7 @@ def launch(common_path: str, common_digest: str, role: str, run_path: str, provi
         git(candidate_view, "update-ref", f"refs/remotes/origin/{branch_name}", object_id)
     require(git_text(candidate_view, "rev-parse", "HEAD") == common["candidate"]["commit"]
             and not git(candidate_view, "status", "--porcelain", "-z"), "isolated candidate mismatch")
+    verify_history(candidate_view, common["committed_history"])
     check_invocations = [{"id": row["id"], "command": row["command"],
                           "bash": ("cd -- " + shlex.quote(str(candidate_view)) + " && "
                                    + "RAZR_REVIEW_CHECK_ID=" + shlex.quote(row["id"]) + " /bin/sh -c "
@@ -604,6 +636,7 @@ def audit_run(common_path: str, common_digest: str, run_path: str, role: str) ->
     require(git_text(candidate_view, "rev-parse", "HEAD") == common["candidate"]["commit"]
             and not git(candidate_view, "remote")
             and not git(candidate_view, "status", "--porcelain", "-z"), "isolated candidate changed")
+    verify_history(candidate_view, common["committed_history"])
     return report, {"role": role, "context": context, "review_status": report["review_status"],
                     "verdict": report["verdict"], "structurally_valid": True,
                     "events_digest": structural["events_digest"], "session_digest": structural["session_digest"],
@@ -636,8 +669,9 @@ def reproduce(common_path: str, common_digest: str, output_path: str, primary_co
     for source_ref in source_refs:
         branch_name, object_id = source_ref.split(" ", 1)
         git(candidate, "update-ref", f"refs/remotes/origin/{branch_name}", object_id)
+    verify_history(candidate, common["committed_history"])
     home = output / "home"; temporary = output / "tmp"; home.mkdir(); temporary.mkdir()
-    environment = {"PATH": os.defpath, "HOME": str(home), "TMPDIR": str(temporary), "LANG": "C.UTF-8",
+    environment = {"PATH": os.environ.get("PATH", os.defpath), "HOME": str(home), "TMPDIR": str(temporary), "LANG": "C.UTF-8",
                    "LC_ALL": "C.UTF-8", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
                    "GIT_OPTIONAL_LOCKS": "0", "GIT_TERMINAL_PROMPT": "0"}
     checks = []
@@ -651,7 +685,8 @@ def reproduce(common_path: str, common_digest: str, output_path: str, primary_co
                        "stdout_digest": digest(stdout), "stderr": str(stderr_path),
                        "stderr_digest": digest(stderr), "execution": execution})
     value = {"schema_version": 1, "primary_context": primary_context, "common_digest": common_digest,
-             "candidate": common["candidate"], "checks": checks,
+             "candidate": common["candidate"], "environment": {"path_digest": digest(environment["PATH"].encode())},
+             "checks": checks,
              "limitations": ["Primary reproduction executes declared repository commands; it is not a sandbox."]}
     save_new(output / "reproduction.json", value)
     return value
@@ -692,11 +727,13 @@ def support_run(common_path: str, common_digest: str, run_path: str, role: str,
         raise Refusal("primary context must be canonical UUID") from exc
     require(isinstance(decision_ref, str) and decision_ref.strip(), "primary decision reference required")
     reproduction = load(reproduction_path)
-    require(isinstance(reproduction, dict) and set(reproduction) == {"schema_version", "primary_context", "common_digest", "candidate", "checks", "limitations"}
+    require(isinstance(reproduction, dict) and set(reproduction) == {"schema_version", "primary_context", "common_digest", "candidate", "environment", "checks", "limitations"}
             and reproduction["schema_version"] == 1 and reproduction["primary_context"] == primary_context,
             "invalid primary reproduction record")
     common = validate_common(common_path, common_digest)
-    require(reproduction.get("common_digest") == common_digest and reproduction.get("candidate") == common["candidate"],
+    require(reproduction.get("common_digest") == common_digest and reproduction.get("candidate") == common["candidate"]
+            and isinstance(reproduction.get("environment"), dict)
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", reproduction["environment"].get("path_digest", "")),
             "primary reproduction identity mismatch")
     validate_primary_reproduction(reproduction, common, report)
     support_path = Path(run_path) / "outcome-support.json"

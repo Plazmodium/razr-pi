@@ -80,7 +80,7 @@ python3 -B "$REVIEW" reproduce \
   --max-output-bytes <explicit-positive-bound>
 ```
 
-This executes repository-declared commands and is not a sandbox. Structural PASS is not semantic support.
+This executes repository-declared commands with an allowlisted environment and the primary's current `PATH`; the retained reproduction records a digest of that path. It is not a sandbox. Stop if the approved runner is unavailable rather than substituting another command. Structural PASS is not semantic support.
 
 Incomplete, timed-out, malformed, drifted or unsupported work is not recordable PASS or FAIL. A substantive FAIL stops delivery. Repair requires legal return to Build, a new candidate and two new fresh reviews; never rebind old reports.
 

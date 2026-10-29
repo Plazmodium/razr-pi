@@ -28,6 +28,9 @@ class ReviewFlowTests(FixtureTest):
         root = self.repo(name)
         if branch != "main":
             self.invoke([self.tools["git"], "-C", root, "branch", "-m", branch], root)
+        (root / "history-base.txt").write_text("committed history base\n")
+        self.invoke([self.tools["git"], "-C", root, "add", "history-base.txt"], root)
+        self.invoke([self.tools["git"], "-C", root, "commit", "-qm", "history base"], root)
         self.adopt(root, work_root)
         self.core(root, "idea", work_id, "--title", "Synthetic review probe", "--depth", "tiny")
         item = root / work_root / work_id
@@ -188,6 +191,8 @@ saved.append({'type': 'message', 'message': message})
         reproduction_dir = self.lab / "primary-reproduction"
         review.reproduce(str(common_path), common_digest, str(reproduction_dir), primary_context, 120, 1048576)
         reproduction = reproduction_dir / "reproduction.json"
+        self.assertEqual(json.loads(reproduction.read_text())["environment"]["path_digest"],
+                         review.digest(os.environ["PATH"].encode()))
         for role in review.ROLES:
             run = self.lab / f"{role}-tracer-run"
             review.launch(str(common_path), common_digest, role, str(run), "fixture", "fixture",
@@ -325,6 +330,11 @@ sys.exit(2)
                   "declared_validations": [{"id": "one:1", "command": "true"},
                                            {"id": "two:1", "command": "true"}]}
         report = self.report(common, common_digest, "technical", context)
+        contradictory = json.loads(json.dumps(report))
+        contradictory["reproduced_checks"].append({"id": "one:1", "command": "true", "exit_code": 1,
+                                                     "summary": "contradictory duplicate"})
+        with self.assertRaisesRegex(review.Refusal, "duplicate reproduced check"):
+            review.validate_report(contradictory, common, common_digest, "technical", context)
         shells = ["cd candidate && RAZR_REVIEW_CHECK_ID=one:1 /bin/sh -c true",
                   "cd candidate && RAZR_REVIEW_CHECK_ID=two:1 /bin/sh -c true"]
         rows = [{"type": "session", "id": context}]
@@ -388,6 +398,13 @@ sys.exit(2)
         self.assertEqual((result["review_status"], result["verdict"]), ("complete", "PASS"))
         self.assertTrue((run / "events.jsonl").is_file())
         self.assertTrue((run / "report.json").is_file())
+        candidate_view = run / "candidate"
+        self.assertGreaterEqual(int(review.git_text(candidate_view, "rev-list", "--count", "HEAD")), 2)
+        shallow = candidate_view / ".git/shallow"
+        shallow.write_text(review.git_text(candidate_view, "rev-parse", "HEAD") + "\n")
+        with self.assertRaisesRegex(review.Refusal, "shallow candidate history"):
+            review.audit_run(str(common_path), common_digest, str(run), "technical")
+        shallow.unlink()
         events = run / "events.jsonl"; original_events = events.read_bytes()
         rows = [json.loads(line) for line in original_events.splitlines()]
         next(row for row in rows if row.get("type") == "tool_execution_end")["isError"] = True
