@@ -1,8 +1,10 @@
-<img width="2172" height="724" alt="Razr-Pi Cozy Coding Workshop" src="https://github.com/user-attachments/assets/72fc4eaa-8c65-4598-aa89-4fe334feb187" />
-
 Razr-Pi is a local [Pi](https://github.com/badlogic/pi-mono) package for repository-centered engineering work. It combines a Razr workflow core, selective context assembly, durable Razr Memory, Pi commands, optional Herdr-hosted execution, and bounded GitHub delivery operations.
 
 Already using Pi? Point your agent to [For Pi agents](#for-pi-agents) for guided setup.
+
+> **Breaking release:** Razr-Pi does not support in-place migration from previously generated project routing or workflow state. Existing users must start again from the beginning in a clean repository. The helper prepares original/proposed `AGENTS.md` files for human-applied de-adoption without deleting project data; archival or deletion of retained `razr.yaml` and `.razr/` data is a separate explicit decision.
+>
+> Razr-Pi still does not provide a general end-to-end delivery workflow for arbitrary projects. The supported package path reaches discovery and exact-approved execution through the first checkpoint; candidate/review support is conditional and bounded, and general Review/PR delivery remains unavailable.
 
 ## Why Razr-Pi?
 
@@ -137,18 +139,24 @@ If a developer points you here, guide the setup instead of silently changing the
 
 Stop on failed prerequisites, unexpected existing Razr files, symlinks in control paths, or ambiguous repository identity. Never infer approval, alter credentials, or merge, deploy, or publish automatically.
 
-## Typical workflow
+## Workflow model and current support
 
-1. Explore an idea and converge on a specification.
-2. Approve the exact specification.
-3. Materialize executable work with explicit dependencies and checks.
-4. Verify the first task before expanding execution.
-5. Build and validate the remaining work.
-6. Bind a candidate to an exact repository, branch, commit, and source digest.
-7. Obtain fresh independent Technical and Contract reviews of that candidate.
-8. Read back delivery state and stop for final human review.
+The Razr model runs from exploration through human-reviewed delivery, but this package does not yet support every step generally.
 
-Use `/razr-status <work_id>` to inspect workflow state, `/razr-context` to assemble bounded context, and the Memory commands to retain or retrieve experiential context. Authorized orchestrators may use the Herdr provider directly for workers and the GitHub helper for bounded delivery operations.
+Available now:
+
+1. Explicitly adopt a repository and create/refine a specification.
+2. Inspect core state and the separate adapter boundary with `/razr-status <work_id>`.
+3. For an exact approved contract, follow the supported first-task and human-checkpoint procedure.
+4. Safely prepare a human-reviewed de-adoption proposal while retaining project data.
+
+Conditional or unavailable:
+
+- Candidate and critic procedures apply only when the exact contract and supported bounded procedure permit them.
+- General Review transition, PR delivery, merge and deployment are not provided by this release.
+- Core commands existing in the bundled runtime are not permission to bypass the adapter boundary.
+
+Use `/razr-context` for bounded context and the Memory commands for experiential context. Updating the package does not rewrite project routing, and this breaking release provides no in-place upgrade. Previous users should use `scripts/de-adopt.py`, manually review and apply its proposal, retain or separately archive the old data, and begin again in a clean repository.
 
 ## Architecture and reference
 

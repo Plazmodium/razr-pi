@@ -1,18 +1,44 @@
 ---
 name: razr
-description: Explicit safe Razr adoption and discovery using the bundled core. Does not authorize live execution, critique, recovery or delivery.
+description: Guide explicitly adopted Razr projects through exact approval, task execution, human checkpoints and separately authorized review. Loading never authorizes actions. Stops before Review or PR work.
 ---
 
-# Razr public bootstrap
+# Razr — start here
 
-Resolve the package root two parents above this skill directory. Helpers are under `scripts/` and the unchanged core is `runtime/scripts/razr.py` relative to that root. Do not resolve a CLI from PATH or a sibling source distribution.
+One primary Pi session handles the conversation and workflow. Pi supplies tools; the bundled Razr core validates contracts and owns workflow state. A skill is instructions, not approval, proof that checks ran, or a sandbox.
 
-Read the target's rules and exact contract before acting; narrower instructions win. Loading this skill does not adopt the target or authorize writes. Start with read-only orientation and [safe adoption](references/adoption.md). Ask for explicit adoption authority naming the exact Git root and work root before calling the wrapper.
+## Choose the next step
 
-After adoption, run bundled core status and validation from the target. Discovery creates only spec.md. Keep project state separate from this package. Guide work through idea or exploration → specification → executable work → build → validation → candidate → independent review → delivery. The checked-out repository is authoritative. Razr Memory records bounded experience that helps interpret repository evidence; it is not a source or documentation mirror. Stop before any capability this package does not actually provide: approval, compilation/build execution, live task execution, candidate binding, review dispatch, or delivery automation.
+Read the project's instructions and actual decisions first. Follow only the row that applies; do not load every procedure or infer permission from a file's existence.
 
-Preserve the eventual gates: exact human specification approval; deterministic generation-fenced transitions; the first verified-task human checkpoint; source-digest identity and explicit scrutiny of excluded instructions/configuration; fresh independent Technical and Contract critics; final human PR review. A model switch or builder-history fork is not fresh critique. CLI attestations do not authenticate decisions or prove checks ran.
+| Situation | Read next |
+| --- | --- |
+| New idea or project; no exact approved pair | [Greenfield preparation](references/greenfield.md). Keep discovery separate from implementation. |
+| Existing project needs explicit adoption | [Safe adoption](references/adoption.md). Never adopt or initialize automatically. |
+| Project was adopted by an earlier incompatible release | [Safe de-adoption](references/de-adoption.md), then restart from the beginning in a clean repository. No in-place upgrade. |
+| Human wants to stop using Razr routing in this project | [Safe de-adoption](references/de-adoption.md). Retain workflow data by default. |
+| Exact pair approved; task execution or candidate work authorized | [Primary execution](references/primary-execution.md). This is the single runbook from approval through the first human checkpoint and separately permitted candidate work. |
+| Formal review requested | Stop. This release has no general review procedure for arbitrary projects. |
 
-Comments should explain only non-obvious local intent or invariants; regression tests carry behavioral memory, while Git and Razr Memory carry history and rationale. Preserve unrelated repository material and do not destructively delete retained evidence.
+If the current state is incomplete, conflicting, failed, already running or completed, inspect it and establish the authorized next action. Do not reset, retry or treat it as a new pending task.
 
-Do not edit state manually, reuse historical approvals, install packages, access credentials, change global configuration, publish, merge or deploy. Stop on partial state or failed checks and retain private diagnostics rather than inventing recovery evidence.
+## Rules that always apply
+
+- Preserve the exact human-approved spec and executable. Scope agreement or prepared approval metadata is not an observed human decision.
+- Only the unchanged core materializes lifecycle artifacts and changes `state.yaml`. The primary appends inspected actual proof to core-created `evidence.md`, preserving earlier evidence. Never invent PASS results.
+- Read the generation immediately before each mutation that supports `--expect-generation`. Do not calculate the next value or retry after a refusal.
+- Stop after the first verified task for actual human inspection. Candidate work also needs permission in the exact contract and completion of all declared tasks.
+- Keep source identity and inspect digest-excluded instructions/configuration too. Later formal review requires separate fresh Technical and Contract sessions on the same source; a model switch or builder-history fork is not independent.
+- Stop immediately on any unexpected read or command error: preserve the result, report it and wait for human direction. Do not continue other task work, guess another path, repair or retry. Expected negative test cases are not unexpected errors. If a check shows that preparation cannot succeed, stop immediately. Don’t attempt the command just to confirm the failure.
+- Save command logs only in a new directory inside the approved target, never `/tmp`; directory checks and creation must succeed before log redirection or task commands run. Use explicit fail-fast chaining or checked exits; `set -u` alone and unchecked semicolons are insufficient. Do not overwrite or delete logs. Read saved output before relying on it. Preserve failures and consumed allowances; no automatic cleanup, merge or deployment. Stop for credentials, spending, destructive operations, production and material scope decisions.
+- Installation, global configuration and credentials remain human-owned. This package stops before Review/PR work; final human PR review remains required for later delivery.
+
+## Review boundary
+
+This breaking release does not provide general Technical/Contract critic dispatch or Review/PR delivery for arbitrary projects. Do not reuse retained lab procedures as product capability. Stop and establish a separately specified, approved and verified review procedure before any formal critique or later lifecycle transition.
+
+## Resource paths
+
+Resolve paths from this skill's directory, not the project cwd: package `../..`, core `../../runtime/scripts/razr.py`, read-only inspector `../../scripts/primary.py`, adoption helper `../../scripts/adopt.py`, de-adoption helper `../../scripts/de-adopt.py`, provenance `../../runtime/provenance.json`. Use resolved absolute paths; never guess a `razr` executable from PATH or use the sibling distribution.
+
+No launcher or extra worker is required for the ordinary task procedure. File checks, process output and model reports are observations, not dispatch authority or workflow approval.

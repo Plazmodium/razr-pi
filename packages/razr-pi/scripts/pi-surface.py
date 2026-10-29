@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import re
 import sys
 import uuid
 
@@ -48,13 +49,76 @@ def _fanout_status() -> dict[str, object]:
         return {"availability": "unavailable", "code": exc.code}
 
 
+def _routing_status(root: Path) -> dict[str, str]:
+    start, end = b"<!-- RAZR:START -->", b"<!-- RAZR:END -->"
+    path = root / "AGENTS.md"
+    if not path.is_file() or path.is_symlink():
+        return {"routing": "missing", "blocked_by": "project_routing",
+                "next_action": "Inspect or explicitly adopt this exact Git repository."}
+    raw = path.read_bytes()
+    if raw.count(start) != 1 or raw.count(end) != 1 or raw.find(end) < raw.find(start):
+        return {"routing": "ambiguous", "blocked_by": "project_routing",
+                "next_action": "Stop and inspect the project instructions; no in-place migration is supported."}
+    block = raw[raw.find(start):raw.find(end) + len(end)]
+    current = (PACKAGE / "runtime/AGENTS.project-razr.md").read_bytes().strip()
+    if block == current:
+        return {"routing": "current", "blocked_by": "none",
+                "next_action": "Follow the loaded skill and exact project contract; human approval is never inferred."}
+    routing_dir = PACKAGE / "runtime/routing"
+    known = {} if not routing_dir.is_dir() else {
+        p.read_bytes().strip(): p.stem for p in routing_dir.glob("*.md")
+    }
+    if block in known:
+        return {"routing": "incompatible_previous_release", "routing_profile": known[block],
+                "blocked_by": "breaking_release",
+                "next_action": "Use scripts/de-adopt.py to prepare exact files, manually review and apply the proposal, then restart in a clean repository. Retained razr.yaml and .razr data require a separate explicit archive or removal decision."}
+    return {"routing": "modified_or_unknown", "blocked_by": "project_routing",
+            "next_action": "Review the local routing; the adapter will not replace an unknown block."}
+
+
+def _adapter_status(root: Path, stage: str, status: str) -> dict[str, object]:
+    routing = _routing_status(root)
+    boundary = {
+        "supported_through": "verify",
+        "review_and_delivery": "not generally supported; only exact separately approved bounded procedures apply",
+        **routing,
+    }
+    if stage == "spec" and status == "exploring" and routing["routing"] == "incompatible_previous_release":
+        boundary["reason"] = "This project was adopted by an incompatible previous release. In-place upgrade is not supported; start again from the beginning."
+    elif stage == "spec" and status == "exploring":
+        boundary["reason"] = "This item is still exploring. Progress requires an exact approved spec/executable pair and the current project routing."
+    else:
+        boundary["reason"] = "Core workflow state and adapter authorization are separate; a valid state does not authorize the next action."
+    return boundary
+
+
 def core_status(root: Path, work_id: str | None = None) -> object:
     if not work_id:
-        raise ValueError("status requires an adopted, materialized work_id")
+        raise ValueError("status requires a work_id")
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", work_id):
+        raise ValueError("invalid core work ID")
     sys.path.insert(0, str(PACKAGE))
-    from adapter.core_subprocess import read_workflow_context
+    from adapter.core_subprocess import invoke_core, read_workflow_context
+    response = invoke_core(_request(root, ("status", work_id, "--json")))
+    try:
+        rows = json.loads(response.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("core status response is malformed") from exc
+    if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+        raise ValueError("status row count differs")
+    row = rows[0]
+    stage, status = row.get("stage"), row.get("status")
+    if not isinstance(stage, str) or not isinstance(status, str):
+        raise ValueError("core status row is malformed")
+    adapter = _adapter_status(root, stage, status)
+    if stage == "spec" and status == "exploring":
+        return {"schema_version": 2, "work_id": work_id, "stage": stage, "status": status,
+                "generation": None, "node_id": None, "node_status": None, "node_attempt": None,
+                "node_result_ref": None, "candidate": {"repository": None, "branch": None,
+                "commit": None, "source_digest": None}, "status_row": row, "raw_state": None,
+                "adapter": adapter, "fanout": _fanout_status()}
     read = read_workflow_context(_request(root, ("status", work_id, "--json")), work_id)
-    return {"schema_version": 1, "work_id": read.work_id, "stage": read.stage, "status": read.status,
+    return {"schema_version": 2, "work_id": read.work_id, "stage": read.stage, "status": read.status,
             "generation": read.generation, "node_id": read.node_id, "node_status": read.node_status,
             "node_attempt": read.node_attempt, "node_result_ref": read.node_result_ref,
             "candidate": {"repository": read.candidate_repository, "branch": read.candidate_branch,
@@ -63,7 +127,7 @@ def core_status(root: Path, work_id: str | None = None) -> object:
             "raw_state": {"path": read.raw_state_path, "digest": read.raw_state_digest,
                           "bytes": read.raw_state_bytes, "core_identity": read.raw_state_core_identity,
                           "source_digest": read.raw_state_source_digest},
-            "fanout": _fanout_status()}
+            "adapter": adapter, "fanout": _fanout_status()}
 
 
 def _object(raw: str, label: str) -> dict[str, object]:

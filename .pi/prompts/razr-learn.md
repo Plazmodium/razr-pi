@@ -1,5 +1,4 @@
 ---
-description: Explore the public Razr-Pi bootstrap without authorizing workflow writes
+description: Learn one Pi concept through a bounded Razr workshop exercise
 ---
-
-Read README.md, SOURCE_BASELINE.md and .pi/skills/razr-pi-learning/SKILL.md. Explain one relevant Pi concept for $ARGUMENTS, propose one bounded observable check, and distinguish instructions from actual results. Do not infer adoption, implementation, model use or publication authority from this prompt.
+Read .pi/skills/razr-pi-learning/SKILL.md and follow it. Topic: ${ARGUMENTS:-Orient me to this workspace without editing files}. Explain the relevant Pi concept briefly, inspect facts with tools, and use one small exercise with an observable result. Do not install or change configuration implicitly. Separate proposed steps from actions actually executed.

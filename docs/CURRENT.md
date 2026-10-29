@@ -1,37 +1,38 @@
-# Current product state
+# Current Razr-Pi release
 
-Razr-Pi is a private local Pi package for repository-centered workflow, context, Memory, optional Herdr-hosted execution, and bounded GitHub delivery operations.
+Razr-Pi `0.2.0` is a breaking local Pi package release. It does not migrate routing or workflow state created by previous releases.
 
 ## Start here
 
 1. [Repository overview](../README.md)
 2. [Package installation and commands](../packages/razr-pi/README.md)
-3. [Architecture and authority](architecture.md)
-4. [Capabilities and limitations](capabilities.md)
+3. [Capabilities and limitations](capabilities.md)
+4. [Architecture and authority](architecture.md)
 5. [Testing](testing.md)
 6. [Source identity policy](../SOURCE_BASELINE.md)
 
-## Implemented
+## Supported now
 
-- Explicit repository adoption and discovery.
-- One Pi skill and one extension with five commands.
-- Core-backed status and validation read-back.
-- Deterministic bounded context from immutable Git objects.
-- Repository-scoped append-only Razr Memory.
-- Optional Herdr execution with candidate fences, durable attempts, bounded subprocess supervision, interruption, and explicit recovery.
-- Source-bound GitHub snapshot/read/create operations.
-- No-model package loading checks and selected public regression coverage.
+- Explicit repository adoption and validated discovery.
+- Core-backed status that reports workflow state separately from adapter authority.
+- Clear detection of incompatible previous-release routing.
+- Safe de-adoption preparation that creates exact original/proposed files and retains project data.
+- Exact-approved first-task execution and the required human checkpoint.
+- Conditional candidate and critique procedures only where an exact supported contract permits them.
+- Deterministic bounded context, repository-scoped Memory, and the documented read-oriented Pi commands.
 
-## Product boundaries
+## Breaking restart policy
 
-- The Razr core is the sole workflow authority.
-- Repository evidence outranks Memory.
-- Pi loading does not adopt or execute a project.
-- Herdr telemetry does not become Razr workflow state.
-- The Pi command surface has no worker command.
-- GitHub observations are bounded and non-atomic.
-- No automatic merge, deployment, publication, credential management, general critic dispatcher, or PR factory is provided.
+Projects adopted by previous releases must start again from the beginning in a clean repository. There is no in-place routing or workflow-state upgrade.
 
-## Delivery requirements
+Use `scripts/de-adopt.py` to create exact original/proposed `AGENTS.md` files, then compare the current file and apply the proposal manually. The helper never changes `AGENTS.md`; it retains `razr.yaml`, `.razr/`, specifications, state, evidence and Memory. Applying the proposal, or archiving/deleting retained data, is a separate explicit decision.
 
-A deliverable candidate still requires exact source and excluded-input scrutiny, fresh independent Technical and Contract review of the same commit, applicable repository checks, and final human PR review. Package loading, hashes, process status, CLI output, and empty remote check collections do not satisfy those gates.
+## Not generally supported
+
+- General candidate or critic dispatch for arbitrary projects.
+- Verify-to-Review transition or complete PR delivery.
+- Automatic merge, deployment or publication.
+- Credential installation or global configuration.
+- Treating Pi, Herdr, process output or CLI validation as proof of human approval or completed checks.
+
+Final human review and the original Razr gates remain mandatory wherever later delivery support is explicitly provided.

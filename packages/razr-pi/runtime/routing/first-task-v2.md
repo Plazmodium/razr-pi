@@ -1,0 +1,15 @@
+<!-- RAZR:START -->
+## Razr in Pi
+
+This project explicitly adopts Razr. Load the reviewed `razr` Pi skill before workflow actions. If unavailable, stop and ask the human to load the reviewed local package; do not install anything automatically or guess a CLI from PATH.
+
+The primary Pi agent owns conversation and workflow mutations. The existing bundled Razr Python CLI remains the validator; never hand-edit lifecycle state. Before acting, read project rules and run actual `status --json` and `validate --all` through the bundled core.
+
+Authority: `spec.md` owns approved intent; `executable.yaml` owns the immutable approved DAG; `state.yaml` owns generation-fenced progress; `evidence.md` records actual proof. Git owns source history; a live PR is the human review surface. Before approval, discovery contains only `spec.md`.
+
+For an exact human-approved canonical spec and digest-matched executable, the primary may use the supported CLI to approve, run the declared first task, record actual validation evidence, and complete that task with current generation fencing. Then pause for a human checkpoint. This is not permission to infer approval, fabricate PASS evidence, or continue beyond the checkpoint.
+
+This adapter currently stops before candidate recording, Technical/Contract Critics, PR actions, merge, or deployment. Those future gates remain mandatory: source-digest identity, fresh independent critics against one candidate, live PR read-back, and final human review. A model switch or fork with builder history is not independent critique.
+
+CLI attestations do not authenticate approval, execute tests, or prove critic independence. The source digest excludes root `AGENTS.md`, `razr.yaml`, and the configured work root; these paths still require explicit scrutiny. Stop on partial/inconsistent state and preserve artifacts. No automatic install, global configuration, merge, deployment, or cleanup.
+<!-- RAZR:END -->
