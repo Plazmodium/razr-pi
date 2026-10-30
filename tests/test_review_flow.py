@@ -86,7 +86,10 @@ class ReviewFlowTests(FixtureTest):
         commit = self.invoke([self.tools["git"], "-C", root, "rev-parse", "HEAD"], root).stdout.strip()
         base_commit = self.invoke([self.tools["git"], "-C", root, "rev-parse", "HEAD^"], root).stdout.strip()
         self.invoke([self.tools["git"], "-C", root, "tag", "fixture-history-base", base_commit], root)
+        self.invoke([self.tools["git"], "-C", root, "tag", "release/HEAD", base_commit], root)
         self.invoke([self.tools["git"], "-C", root, "update-ref", "refs/remotes/upstream/base", base_commit], root)
+        self.invoke([self.tools["git"], "-C", root, "symbolic-ref", "refs/remotes/upstream/HEAD",
+                     "refs/remotes/upstream/base"], root)
         state = json.loads((item / "state.yaml").read_text())
         self.core(root, "candidate", work_id, "--repository", repository,
                   "--branch", branch, "--commit", commit, "--expect-generation", str(state["generation"]))
@@ -342,14 +345,20 @@ sys.exit(2)
                                                        '"verdict": "FAIL", "verdict": "PASS"')
         with self.assertRaisesRegex(review.Refusal, "duplicate JSON object field"):
             review.strict_json(duplicate_field)
-        shells = ["cd candidate && RAZR_REVIEW_CHECK_ID=one:1 /bin/sh -c true",
-                  "cd candidate && RAZR_REVIEW_CHECK_ID=two:1 /bin/sh -c true"]
+        duplicate_event = b'{"type":"session","type":"message_end"}\n'
+        with self.assertRaisesRegex(review.Refusal, "duplicate JSON object field"):
+            review.parse_jsonl(duplicate_event)
+        bool_exit = json.loads(json.dumps(report)); bool_exit["reproduced_checks"][0]["exit_code"] = False
+        with self.assertRaisesRegex(review.Refusal, "invalid check result"):
+            review.validate_report(bool_exit, common, common_digest, "technical", context)
+        markers = [review.check_exit_marker(context, "one:1"), review.check_exit_marker(context, "two:1")]
+        shells = ["wrapped-one", "wrapped-two"]
         rows = [{"type": "session", "id": context}]
         for index, command in enumerate(shells):
             rows += [{"type": "tool_execution_start", "toolCallId": str(index), "toolName": "bash",
                       "args": {"command": command}},
                      {"type": "tool_execution_end", "toolCallId": str(index), "isError": False,
-                      "result": {"content": []}}]
+                      "result": {"content": [{"type": "text", "text": markers[index] + "=0\n"}]}}]
         rows += [{"type": "message_end", "message": {"role": "assistant",
                   "content": [{"type": "text", "text": json.dumps(report)}]}},
                  {"type": "agent_settled", "aborted": False}]
@@ -399,8 +408,9 @@ sys.exit(2)
         output = self.lab / "launcher-review"
         common_path, common_digest = review.freeze(str(root), "public-probe", str(output))
         history_names = {row["name"] for row in review.validate_common(common_path, common_digest)["committed_history"]["refs"]}
-        self.assertTrue({"refs/tags/fixture-history-base", "refs/remotes/upstream/base",
-                         "refs/remotes/origin/main"} <= history_names)
+        self.assertTrue({"refs/tags/fixture-history-base", "refs/tags/release/HEAD",
+                         "refs/remotes/upstream/base", "refs/remotes/origin/main"} <= history_names)
+        self.assertNotIn("refs/remotes/upstream/HEAD", history_names)
         fake = self.fake_pi()
         run = self.lab / "technical-live-shape"
         result = review.launch(str(common_path), common_digest, "technical", str(run), "fixture", "fixture",
@@ -420,6 +430,13 @@ sys.exit(2)
         next(row for row in rows if row.get("type") == "tool_execution_end")["isError"] = True
         events.write_text("".join(json.dumps(row) + "\n" for row in rows))
         with self.assertRaisesRegex(review.Refusal, "exit contradicts"):
+            review.audit_run(str(common_path), common_digest, str(run), "technical")
+        events.write_bytes(original_events)
+        rows = [json.loads(line) for line in original_events.splitlines()]
+        ended = next(row for row in rows if row.get("type") == "tool_execution_end")
+        ended["result"]["content"][0]["text"] = ended["result"]["content"][0]["text"].replace("=0\n", "=1\n")
+        events.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        with self.assertRaisesRegex(review.Refusal, "exact tool result"):
             review.audit_run(str(common_path), common_digest, str(run), "technical")
         events.write_bytes(original_events)
         session = next((run / "sessions").rglob("*.jsonl")); original_session = session.read_bytes()

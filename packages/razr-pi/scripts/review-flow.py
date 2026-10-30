@@ -116,12 +116,13 @@ def safe_git_environment() -> None:
 
 
 def history_identity(root: Path) -> dict[str, object]:
-    raw_refs = git_text(root, "for-each-ref", "--format=%(refname) %(objectname)",
+    raw_refs = git_text(root, "for-each-ref", "--format=%(refname)%09%(objectname)%09%(symref)",
                         "refs/heads", "refs/tags", "refs/remotes")
     by_name = {}
     for line in raw_refs.splitlines():
-        name, object_id = line.split(" ", 1)
-        if name.endswith("/HEAD"):
+        parts = line.split("\t", 2); name, object_id = parts[:2]
+        symbolic_target = parts[2] if len(parts) == 3 else ""
+        if name.startswith("refs/remotes/") and symbolic_target:
             continue
         require(name.startswith(("refs/heads/", "refs/tags/", "refs/remotes/"))
                 and re.fullmatch(r"[0-9a-f]{40}", object_id), "invalid committed-history reference")
@@ -154,11 +155,12 @@ def verify_history(root: Path, expected: dict[str, object]) -> None:
     require(git_text(root, "rev-parse", "--is-shallow-repository") == "false",
             "shallow candidate history refused")
     actual = []
-    raw_actual = git_text(root, "for-each-ref", "--format=%(refname) %(objectname)",
+    raw_actual = git_text(root, "for-each-ref", "--format=%(refname)%09%(objectname)%09%(symref)",
                           "refs/heads", "refs/tags", "refs/remotes")
     for line in raw_actual.splitlines():
-        name, object_id = line.split(" ", 1)
-        if not name.endswith("/HEAD"):
+        parts = line.split("\t", 2); name, object_id = parts[:2]
+        symbolic_target = parts[2] if len(parts) == 3 else ""
+        if not (name.startswith("refs/remotes/") and symbolic_target):
             actual.append({"name": name, "object": object_id})
     require(actual == expected["refs"], "candidate committed-history refs mismatch")
     commits = []
@@ -359,7 +361,8 @@ def validate_report(value: object, common: dict[str, object], common_digest: str
     observed = set()
     for row in checks:
         require(isinstance(row, dict) and set(row) == {"id", "command", "exit_code", "summary"}, "invalid reproduced check")
-        require(isinstance(row["exit_code"], int) and isinstance(row["summary"], str) and row["summary"].strip(), "invalid check result")
+        require(isinstance(row["exit_code"], int) and not isinstance(row["exit_code"], bool)
+                and isinstance(row["summary"], str) and row["summary"].strip(), "invalid check result")
         key = (row["id"], row["command"])
         require(key not in observed, "duplicate reproduced check")
         observed.add(key)
@@ -374,7 +377,7 @@ def parse_jsonl(raw: bytes) -> list[dict[str, object]]:
     rows = []
     for line in raw.splitlines():
         require(line.strip(), "blank JSONL record")
-        value = json.loads(line)
+        value = strict_json(line.decode())
         require(isinstance(value, dict), "JSONL record must be an object")
         rows.append(value)
     return rows
@@ -387,6 +390,11 @@ def assistant_text(message: object) -> str:
     texts = [row["text"] for row in blocks if isinstance(row, dict) and row.get("type") == "text" and isinstance(row.get("text"), str)]
     require(len(texts) == 1, "final report must be one text block")
     return texts[0].strip()
+
+
+def check_exit_marker(context: str, check_id: str) -> str:
+    value = hashlib.sha256((context + "\0" + check_id).encode()).hexdigest()[:24]
+    return "__RAZR_REVIEW_EXIT_" + value + "__"
 
 
 def audit_events(events_raw: bytes, common: dict[str, object], common_digest: str, role: str,
@@ -443,7 +451,16 @@ def audit_events(events_raw: bytes, common: dict[str, object], common_digest: st
             require(not (isinstance(details, dict) and details.get("truncation", {}).get("truncated")),
                     "truncated validation result refused")
             exit_code = reported[(declared["id"], declared["command"])]
-            require(bool(result.get("isError")) == (exit_code != 0), "reported validation exit contradicts tool result")
+            require(isinstance(result.get("isError"), bool), "validation tool result lacks error status")
+            content = result.get("result", {}).get("content", []) if isinstance(result.get("result"), dict) else []
+            text = "\n".join(row.get("text", "") for row in content
+                              if isinstance(row, dict) and row.get("type") == "text")
+            matches = re.findall(re.escape(check_exit_marker(context, declared["id"])) + r"=(\d+)(?:\n|$)", text)
+            require(len(matches) == 1, "validation tool result lacks exact exit marker")
+            observed_exit = int(matches[0])
+            require(0 <= observed_exit <= 255 and observed_exit == exit_code,
+                    "reported validation exit contradicts exact tool result")
+            require(result["isError"] == (exit_code != 0), "reported validation exit contradicts tool status")
     return report, {"context": context, "accesses": accesses, "event_count": len(rows),
                     "original_report": original_report}
 
@@ -553,11 +570,15 @@ def launch(common_path: str, common_digest: str, role: str, run_path: str, provi
     require(git_text(candidate_view, "rev-parse", "HEAD") == common["candidate"]["commit"]
             and not git(candidate_view, "status", "--porcelain", "-z"), "isolated candidate mismatch")
     verify_history(candidate_view, common["committed_history"])
-    check_invocations = [{"id": row["id"], "command": row["command"],
-                          "bash": ("cd -- " + shlex.quote(str(candidate_view)) + " && "
-                                   + "RAZR_REVIEW_CHECK_ID=" + shlex.quote(row["id"]) + " /bin/sh -c "
-                                   + shlex.quote(row["command"]))}
-                         for row in common["declared_validations"]]
+    check_invocations = []
+    for row in common["declared_validations"]:
+        marker = check_exit_marker(context, row["id"])
+        command = ("cd -- " + shlex.quote(str(candidate_view)) + " && "
+                   + "RAZR_REVIEW_CHECK_ID=" + shlex.quote(row["id"]) + " /bin/sh -c "
+                   + shlex.quote(row["command"]) + "; razr_review_code=$?; printf '\\n"
+                   + marker + "=%s\\n' \"$razr_review_code\"; exit \"$razr_review_code\"")
+        check_invocations.append({"id": row["id"], "command": row["command"],
+                                  "exit_marker": marker, "bash": command})
     driver = run / "driver"
     (driver / ".pi").mkdir(parents=True)
     settings = {"transport": "sse", "retry": {"enabled": False, "maxRetries": 0,
