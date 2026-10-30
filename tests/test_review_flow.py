@@ -91,6 +91,7 @@ class ReviewFlowTests(FixtureTest):
         self.invoke([self.tools["git"], "-C", root, "update-ref", "refs/remotes/upstream/base", base_commit], root)
         self.invoke([self.tools["git"], "-C", root, "symbolic-ref", "refs/remotes/upstream/HEAD",
                      "refs/remotes/upstream/base"], root)
+        self.invoke([self.tools["git"], "-C", root, "update-ref", "refs/custom/important", base_commit], root)
         state = json.loads((item / "state.yaml").read_text())
         self.core(root, "candidate", work_id, "--repository", repository,
                   "--branch", branch, "--commit", commit, "--expect-generation", str(state["generation"]))
@@ -127,10 +128,16 @@ common = json.loads(pathlib.Path(common_path).read_text())
 launch = json.loads((pathlib.Path.cwd().parent / 'launch.json').read_text())
 role = launch['role']; events = [{'type': 'session', 'version': 3, 'id': context, 'cwd': str(pathlib.Path.cwd())}]
 read_content = [{'type': 'text', 'text': 'read frozen common input'}]
+candidate_path = str(pathlib.Path(launch['candidate_view']) / common['source_inventory'][0]['path'])
+candidate_content = [{'type': 'text', 'text': 'read candidate source'}]
 events.extend([{'type': 'tool_execution_start', 'toolCallId': 'common-read', 'toolName': 'read',
                 'args': {'path': common_path}},
                {'type': 'tool_execution_end', 'toolCallId': 'common-read', 'toolName': 'read',
-                'result': {'content': read_content}, 'isError': False}])
+                'result': {'content': read_content}, 'isError': False},
+               {'type': 'tool_execution_start', 'toolCallId': 'candidate-read', 'toolName': 'read',
+                'args': {'path': candidate_path}},
+               {'type': 'tool_execution_end', 'toolCallId': 'candidate-read', 'toolName': 'read',
+                'result': {'content': candidate_content}, 'isError': False}])
 checks = []; tool_contents = []
 for index, invocation in enumerate(launch['check_invocations']):
  call = 'call-' + str(index)
@@ -160,7 +167,11 @@ saved = [{'type': 'session', 'version': 3, 'id': context, 'cwd': str(pathlib.Pat
  {'type': 'message', 'message': {'role': 'assistant', 'content': [
   {'type': 'toolCall', 'id': 'common-read', 'name': 'read', 'arguments': {'path': common_path}}]}},
  {'type': 'message', 'message': {'role': 'toolResult', 'toolCallId': 'common-read', 'toolName': 'read',
-  'content': read_content, 'isError': False}}]
+  'content': read_content, 'isError': False}},
+ {'type': 'message', 'message': {'role': 'assistant', 'content': [
+  {'type': 'toolCall', 'id': 'candidate-read', 'name': 'read', 'arguments': {'path': candidate_path}}]}},
+ {'type': 'message', 'message': {'role': 'toolResult', 'toolCallId': 'candidate-read', 'toolName': 'read',
+  'content': candidate_content, 'isError': False}}]
 for index, invocation in enumerate(launch['check_invocations']):
  call = 'call-' + str(index)
  saved.append({'type': 'message', 'message': {'role': 'assistant', 'content': [
@@ -360,6 +371,8 @@ sys.exit(2)
             review.strict_json(duplicate_field)
         with self.assertRaisesRegex(review.Refusal, "non-finite JSON number"):
             review.strict_json('{"value":NaN}')
+        with self.assertRaisesRegex(review.Refusal, "non-finite JSON number"):
+            review.strict_json('{"value":1e999}')
         boolean_schema = json.loads(json.dumps(report)); boolean_schema["schema_version"] = True
         with self.assertRaisesRegex(review.Refusal, "unknown report protocol"):
             review.validate_report(boolean_schema, common, common_digest, "technical", context)
@@ -475,8 +488,8 @@ sys.exit(2)
         common_path, common_digest = review.freeze(str(root), "public-probe", str(output))
         history_names = {row["name"] for row in review.validate_common(common_path, common_digest)["committed_history"]["refs"]}
         self.assertTrue({"refs/tags/fixture-history-base", "refs/tags/release/HEAD",
-                         "refs/remotes/upstream/base", "refs/remotes/origin/main"} <= history_names)
-        self.assertNotIn("refs/remotes/upstream/HEAD", history_names)
+                         "refs/remotes/upstream/base", "refs/custom/important"} <= history_names)
+        self.assertIn("refs/remotes/upstream/HEAD", history_names)
         fake = self.fake_pi()
         run = self.lab / "technical-live-shape"
         result = review.launch(str(common_path), common_digest, "technical", str(run), "fixture", "fixture",
@@ -493,6 +506,14 @@ sys.exit(2)
         shallow.unlink()
         events = run / "events.jsonl"; original_events = events.read_bytes()
         rows = [json.loads(line) for line in original_events.splitlines()]
+        common_end = next(row for row in rows if row.get("type") == "tool_execution_end"
+                          and row.get("toolCallId") == "common-read")
+        common_end["isError"] = True
+        events.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        with self.assertRaisesRegex(review.Refusal, "successfully read required evidence"):
+            review.audit_run(str(common_path), common_digest, str(run), "technical")
+        events.write_bytes(original_events)
+        rows = [json.loads(line) for line in original_events.splitlines()]
         next(row for row in rows if row.get("type") == "tool_execution_end" and row.get("toolName") == "bash")["isError"] = True
         events.write_text("".join(json.dumps(row) + "\n" for row in rows))
         with self.assertRaisesRegex(review.Refusal, "exit contradicts"):
@@ -505,9 +526,18 @@ sys.exit(2)
         with self.assertRaisesRegex(review.Refusal, "exact tool result"):
             review.audit_run(str(common_path), common_digest, str(run), "technical")
         events.write_bytes(original_events)
+        execution_path = run / "execution.json"; original_execution = execution_path.read_bytes()
+        execution = json.loads(original_execution); execution["exit_code"] = False
+        execution_path.write_text(json.dumps(execution))
+        with self.assertRaisesRegex(review.Refusal, "execution incomplete"):
+            review.audit_run(str(common_path), common_digest, str(run), "technical")
+        execution_path.write_bytes(original_execution)
         session = next((run / "sessions").rglob("*.jsonl")); original_session = session.read_bytes()
         session.write_bytes(original_session.replace(b'"cwd":', b'"cwD":', 1))
         with self.assertRaisesRegex(review.Refusal, "evidence drift"):
+            review.audit_run(str(common_path), common_digest, str(run), "technical")
+        session.write_bytes(original_session + json.dumps({"type": "session", "id": str(uuid.uuid4())}).encode() + b"\n")
+        with self.assertRaisesRegex(review.Refusal, "saved session header"):
             review.audit_run(str(common_path), common_digest, str(run), "technical")
         session.write_bytes(original_session)
         with self.assertRaisesRegex(review.Refusal, "consumed"):
@@ -529,6 +559,10 @@ sys.exit(2)
         observed, audit = review.audit_events(raw, common, common_digest, "technical", context)
         self.assertEqual(observed["verdict"], "PASS")
         self.assertEqual(audit["context"], context)
+        duplicate_header_rows = rows[:1] + [{"type": "session", "id": str(uuid.uuid4())}] + rows[1:]
+        with self.assertRaisesRegex(review.Refusal, "exactly one leading"):
+            review.audit_events("".join(json.dumps(row) + "\n" for row in duplicate_header_rows).encode(),
+                                common, common_digest, "technical", context)
         rows[0]["parentSession"] = "/builder/session.jsonl"
         with self.assertRaisesRegex(review.Refusal, "forked"):
             review.audit_events("".join(json.dumps(row) + "\n" for row in rows).encode(),

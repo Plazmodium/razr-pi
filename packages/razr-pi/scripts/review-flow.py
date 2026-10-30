@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -63,8 +64,15 @@ def invalid_json_constant(value: str) -> object:
     raise Refusal("non-finite JSON number refused: " + value)
 
 
+def finite_float(value: str) -> float:
+    parsed = float(value)
+    require(math.isfinite(parsed), "non-finite JSON number refused: " + value)
+    return parsed
+
+
 def strict_json(raw: str) -> object:
-    return json.loads(raw, object_pairs_hook=unique_object, parse_constant=invalid_json_constant)
+    return json.loads(raw, object_pairs_hook=unique_object, parse_constant=invalid_json_constant,
+                      parse_float=finite_float)
 
 
 def digest(raw: bytes) -> str:
@@ -119,22 +127,20 @@ def safe_git_environment() -> None:
         require(name not in os.environ, "Git environment override refused: " + name)
 
 
-def history_identity(root: Path) -> dict[str, object]:
-    raw_refs = git_text(root, "for-each-ref", "--format=%(refname)%09%(objectname)%09%(symref)",
-                        "refs/heads", "refs/tags", "refs/remotes")
-    by_name = {}
-    for line in raw_refs.splitlines():
+def ref_inventory(root: Path) -> list[dict[str, str]]:
+    raw = git_text(root, "for-each-ref", "--format=%(refname)%09%(objectname)%09%(symref)", "refs")
+    rows = []
+    for line in raw.splitlines():
         parts = line.split("\t", 2); name, object_id = parts[:2]
         symbolic_target = parts[2] if len(parts) == 3 else ""
-        if name.startswith("refs/remotes/") and symbolic_target:
-            continue
-        require(name.startswith(("refs/heads/", "refs/tags/", "refs/remotes/"))
-                and re.fullmatch(r"[0-9a-f]{40}", object_id), "invalid committed-history reference")
-        by_name[name] = object_id
-    for name, object_id in list(by_name.items()):
-        if name.startswith("refs/heads/"):
-            by_name.setdefault("refs/remotes/origin/" + name.removeprefix("refs/heads/"), object_id)
-    refs = [{"name": name, "object": by_name[name]} for name in sorted(by_name)]
+        require(name.startswith("refs/") and re.fullmatch(r"[0-9a-f]{40}", object_id),
+                "invalid committed-history reference")
+        rows.append({"name": name, "object": object_id, "symbolic_target": symbolic_target})
+    return rows
+
+
+def history_identity(root: Path) -> dict[str, object]:
+    refs = ref_inventory(root)
     require(refs, "candidate committed history has no refs")
     commits = []
     for row in refs:
@@ -148,25 +154,23 @@ def history_identity(root: Path) -> dict[str, object]:
 
 
 def materialize_history_refs(root: Path, expected: dict[str, object]) -> None:
-    existing = git_text(root, "for-each-ref", "--format=%(refname)", "refs/heads", "refs/tags", "refs/remotes")
-    for name in existing.splitlines():
-        git(root, "update-ref", "-d", name)
+    for row in reversed(ref_inventory(root)):
+        if row["symbolic_target"]:
+            git(root, "symbolic-ref", "--delete", row["name"])
+        else:
+            git(root, "update-ref", "-d", row["name"])
     for row in expected["refs"]:
-        git(root, "update-ref", row["name"], row["object"])
+        if not row["symbolic_target"]:
+            git(root, "update-ref", row["name"], row["object"])
+    for row in expected["refs"]:
+        if row["symbolic_target"]:
+            git(root, "symbolic-ref", row["name"], row["symbolic_target"])
 
 
 def verify_history(root: Path, expected: dict[str, object]) -> None:
     require(git_text(root, "rev-parse", "--is-shallow-repository") == "false",
             "shallow candidate history refused")
-    actual = []
-    raw_actual = git_text(root, "for-each-ref", "--format=%(refname)%09%(objectname)%09%(symref)",
-                          "refs/heads", "refs/tags", "refs/remotes")
-    for line in raw_actual.splitlines():
-        parts = line.split("\t", 2); name, object_id = parts[:2]
-        symbolic_target = parts[2] if len(parts) == 3 else ""
-        if not (name.startswith("refs/remotes/") and symbolic_target):
-            actual.append({"name": name, "object": object_id})
-    require(actual == expected["refs"], "candidate committed-history refs mismatch")
+    require(ref_inventory(root) == expected["refs"], "candidate committed-history refs mismatch")
     commits = []
     for row in expected["refs"]:
         present = subprocess.run(["git", "cat-file", "-e", row["object"]], cwd=root,
@@ -234,7 +238,8 @@ def freeze_data(target: str | Path, work_id: str) -> dict[str, object]:
     agents_raw = regular(root / "AGENTS.md")
     executable = observation["executable"]
     require(state["spec"]["digest"] == digest(spec_raw), "approved spec identity drift")
-    require(state["executable"]["digest"] == core.executable_digest(json.loads(executable_raw)), "approved executable identity drift")
+    require(state["executable"]["digest"] == core.executable_digest(strict_json(executable_raw.decode())),
+            "approved executable identity drift")
     require(core.source_tree_digest(root, commit, work_relative) == candidate["source_digest"], "source digest drift")
     for name, raw in (
         ("AGENTS.md", agents_raw), ("razr.yaml", config_raw),
@@ -319,7 +324,7 @@ def freeze(target: str, work_id: str, output: str) -> tuple[Path, str]:
 def validate_common(path: str | Path, expected_digest: str) -> dict[str, object]:
     raw = regular(path)
     require(digest(raw) == expected_digest, "common input digest mismatch")
-    data = json.loads(raw)
+    data = strict_json(raw.decode())
     require(isinstance(data, dict) and isinstance(data.get("schema_version"), int)
             and not isinstance(data.get("schema_version"), bool) and data.get("schema_version") == 1
             and data.get("protocol") == COMMON_PROTOCOL, "unknown common input protocol")
@@ -408,11 +413,12 @@ def check_exit_marker(context: str, check_id: str) -> str:
 
 def audit_events(events_raw: bytes, common: dict[str, object], common_digest: str, role: str,
                  expected_context: str | None = None, required_commands: list[str] | None = None,
-                 required_read_path: str | None = None, forbidden_root: str | None = None, provider: str | None = None,
+                 required_read_paths: list[str] | None = None, forbidden_root: str | None = None, provider: str | None = None,
                  model: str | None = None) -> tuple[dict[str, object], dict[str, object]]:
     rows = parse_jsonl(events_raw)
-    require(rows and rows[0].get("type") == "session", "Pi session header missing")
-    header = rows[0]
+    headers = [row for row in rows if row.get("type") == "session"]
+    require(len(headers) == 1 and rows and rows[0] is headers[0], "exactly one leading Pi session header required")
+    header = headers[0]
     context = header.get("id")
     require(isinstance(context, str) and (expected_context is None or context == expected_context),
             "session header context mismatch")
@@ -457,9 +463,12 @@ def audit_events(events_raw: bytes, common: dict[str, object], common_digest: st
                          "is_error": ends[key].get("isError"),
                          "result_content": result.get("content") if isinstance(result, dict) else None})
     if required_commands is not None:
-        if required_read_path is not None:
-            require(any(row["tool"] == "read" and required_read_path in json.dumps(row["args"], sort_keys=True)
-                        for row in accesses), "reviewer did not read the frozen common input")
+        for required_path in required_read_paths or []:
+            require(any(row["tool"] == "read" and row["is_error"] is False
+                        and required_path in json.dumps(row["args"], sort_keys=True)
+                        and any(isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"]
+                                for item in (row["result_content"] or []))
+                        for row in accesses), "reviewer did not successfully read required evidence: " + required_path)
         require(all(observed_commands.count(command) == 1 for command in required_commands),
                 "declared validations were not each observed exactly once")
         reported = {(row["id"], row["command"]): row["exit_code"] for row in report["reproduced_checks"]}
@@ -582,8 +591,7 @@ def launch(common_path: str, common_digest: str, role: str, run_path: str, provi
                                common["candidate"]["commit"]], capture_output=True, text=True, timeout=60)
     require(checkout.returncode == 0, "cannot checkout isolated candidate: " + checkout.stderr.strip())
     fetch = subprocess.run(["git", "-C", str(candidate_view), "fetch", "--quiet", "--force", "--no-tags", str(root),
-                            "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*",
-                            "+refs/remotes/*:refs/remotes/*"], capture_output=True, text=True, timeout=120)
+                            "+refs/*:refs/*"], capture_output=True, text=True, timeout=120)
     require(fetch.returncode == 0, "cannot fetch complete committed history: " + fetch.stderr.strip())
     subprocess.run(["git", "-C", str(candidate_view), "remote", "remove", "origin"], capture_output=True, timeout=30)
     materialize_history_refs(candidate_view, common["committed_history"])
@@ -637,17 +645,22 @@ def launch(common_path: str, common_digest: str, role: str, run_path: str, provi
     (run / "events.jsonl").write_bytes(stdout)
     (run / "stderr.log").write_bytes(stderr)
     save_new(run / "execution.json", execution)
-    require(execution["reason"] is None and execution["exit_code"] == 0, "review process did not complete")
+    require(execution["reason"] is None and isinstance(execution["exit_code"], int)
+            and not isinstance(execution["exit_code"], bool) and execution["exit_code"] == 0,
+            "review process did not complete")
     session_files = list((run / "sessions").rglob("*.jsonl")) if (run / "sessions").is_dir() else []
     require(len(session_files) == 1, "exactly one saved fresh session required")
     session_rows = parse_jsonl(regular(session_files[0]))
-    require(session_rows and session_rows[0].get("type") == "session"
-            and session_rows[0].get("id") == context and "parentSession" not in session_rows[0],
+    session_headers = [row for row in session_rows if row.get("type") == "session"]
+    require(len(session_headers) == 1 and session_rows and session_rows[0] is session_headers[0]
+            and session_headers[0].get("id") == context and "parentSession" not in session_headers[0],
             "saved session freshness mismatch")
     total = execution["captured_output_bytes"] + session_files[0].stat().st_size
     require(total <= max_output_bytes, "retained review output exceeds bound")
+    required_reads = [str(reviewer_common_path),
+                      str(candidate_view / common["source_inventory"][0]["path"])]
     report, audit = audit_events(stdout, common, common_digest, role, context,
-                                 [row["bash"] for row in check_invocations], str(reviewer_common_path),
+                                 [row["bash"] for row in check_invocations], required_reads,
                                  str(root), provider, model)
     (run / "report-original.txt").write_text(audit.pop("original_report"))
     save_new(run / "report.json", report)
@@ -674,18 +687,22 @@ def audit_run(common_path: str, common_digest: str, run_path: str, role: str) ->
     require(load(claim) == {"role": role, "context": context, "common_digest": common_digest,
                             "status": "consumed-before-launch"}, "missing or changed role claim")
     execution = load(run / "execution.json")
-    require(execution.get("reason") is None and execution.get("exit_code") == 0, "review execution incomplete")
+    require(execution.get("reason") is None and isinstance(execution.get("exit_code"), int)
+            and not isinstance(execution.get("exit_code"), bool) and execution.get("exit_code") == 0,
+            "review execution incomplete")
+    required_reads = [str(run / "reviewer-common.json"),
+                      str(Path(launch_data["candidate_view"]) / common["source_inventory"][0]["path"])]
     report, audit = audit_events(regular(run / "events.jsonl"), common, common_digest, role, context,
-                                 [row["bash"] for row in launch_data["check_invocations"]],
-                                 str(run / "reviewer-common.json"), common["target"],
-                                 launch_data["provider"], launch_data["model"])
+                                 [row["bash"] for row in launch_data["check_invocations"]], required_reads,
+                                 common["target"], launch_data["provider"], launch_data["model"])
     require(audit.pop("original_report") == regular(run / "report-original.txt").decode(), "original report drift")
     require(report == load(run / "report.json"), "parsed report drift")
     sessions = list((run / "sessions").rglob("*.jsonl"))
     require(len(sessions) == 1, "saved session count changed")
     session_rows = parse_jsonl(regular(sessions[0]))
-    require(session_rows and session_rows[0].get("type") == "session"
-            and session_rows[0].get("id") == context and "parentSession" not in session_rows[0],
+    session_headers = [row for row in session_rows if row.get("type") == "session"]
+    require(len(session_headers) == 1 and session_rows and session_rows[0] is session_headers[0]
+            and session_headers[0].get("id") == context and "parentSession" not in session_headers[0],
             "saved session header changed")
     messages = [row.get("message") for row in session_rows if row.get("type") == "message"
                 and isinstance(row.get("message"), dict)]
@@ -762,8 +779,7 @@ def reproduce(common_path: str, common_digest: str, output_path: str, primary_co
                               cwd=candidate, capture_output=True, text=True, timeout=120)
     require(checkout.returncode == 0, "cannot checkout primary candidate: " + checkout.stderr.strip())
     fetch = subprocess.run(["git", "fetch", "--quiet", "--force", "--no-tags", str(root),
-                            "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*",
-                            "+refs/remotes/*:refs/remotes/*"], cwd=candidate,
+                            "+refs/*:refs/*"], cwd=candidate,
                            capture_output=True, text=True, timeout=120)
     require(fetch.returncode == 0, "cannot fetch complete primary history: " + fetch.stderr.strip())
     git(candidate, "remote", "remove", "origin")
