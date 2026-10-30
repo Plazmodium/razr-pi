@@ -140,6 +140,9 @@ def ref_inventory(root: Path) -> list[dict[str, str]]:
 
 
 def history_identity(root: Path) -> dict[str, object]:
+    fsck = subprocess.run(["git", "fsck", "--full", "--no-dangling"], cwd=root,
+                          capture_output=True, text=True, timeout=120)
+    require(fsck.returncode == 0, "unsupported or corrupt committed-history refs")
     refs = ref_inventory(root)
     require(refs, "candidate committed history has no refs")
     commits = []
@@ -254,6 +257,8 @@ def freeze_data(target: str | Path, work_id: str) -> dict[str, object]:
     untracked = set(git(root, "ls-files", "--others", "--exclude-standard", "-z").decode().split("\0")) - {""}
     allowed_locks = {f"{work_relative}/.state.lock", f"{work_relative}/{work_id}/.state.lock"}
     require(untracked <= allowed_locks, "untracked files require resolution")
+    ignored = set(git(root, "ls-files", "--others", "--ignored", "--exclude-standard", "-z").decode().split("\0")) - {""}
+    require(ignored <= allowed_locks, "ignored files require resolution before review")
     validations = []
     for node in executable["nodes"]:
         for index, command in enumerate(node["validation"]):
@@ -297,7 +302,7 @@ def freeze_data(target: str | Path, work_id: str) -> dict[str, object]:
             "Hashes establish identity, not execution, independence, semantic support or human approval.",
             "Reviewer tools execute with the current operating-system identity and are not a sandbox.",
             "Reviewers receive a detached candidate clone with committed Git history and no live-target path, but same-UID indirect discovery is not prevented.",
-            "Tracked source symlinks and Git submodules are unsupported and refused; valid linked Git worktrees are supported.",
+            "Tracked source symlinks, Git submodules, and ignored live files other than core lock tokens are unsupported and refused; valid linked Git worktrees are supported.",
             "GitHub observations and model/provider transport are external and non-atomic.",
         ],
     }
@@ -465,7 +470,7 @@ def audit_events(events_raw: bytes, common: dict[str, object], common_digest: st
     if required_commands is not None:
         for required_path in required_read_paths or []:
             require(any(row["tool"] == "read" and row["is_error"] is False
-                        and required_path in json.dumps(row["args"], sort_keys=True)
+                        and isinstance(row["args"], dict) and row["args"].get("path") == required_path
                         and any(isinstance(item, dict) and isinstance(item.get("text"), str) and item["text"]
                                 for item in (row["result_content"] or []))
                         for row in accesses), "reviewer did not successfully read required evidence: " + required_path)
@@ -484,7 +489,7 @@ def audit_events(events_raw: bytes, common: dict[str, object], common_digest: st
             content = result.get("result", {}).get("content", []) if isinstance(result.get("result"), dict) else []
             text = "\n".join(row.get("text", "") for row in content
                               if isinstance(row, dict) and row.get("type") == "text")
-            matches = re.findall(re.escape(check_exit_marker(context, declared["id"])) + r"=(\d+)(?:\n|$)", text)
+            matches = re.findall(r"(?m)^" + re.escape(check_exit_marker(context, declared["id"])) + r"=(\d+)$", text)
             require(len(matches) == 1, "validation tool result lacks exact exit marker")
             observed_exit = int(matches[0])
             require(0 <= observed_exit <= 255 and observed_exit == exit_code,

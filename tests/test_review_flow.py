@@ -30,7 +30,8 @@ class ReviewFlowTests(FixtureTest):
         if branch != "main":
             self.invoke([self.tools["git"], "-C", root, "branch", "-m", branch], root)
         (root / "history-base.txt").write_text("committed history base\n")
-        self.invoke([self.tools["git"], "-C", root, "add", "history-base.txt"], root)
+        (root / ".gitignore").write_text(".ignored-review\n")
+        self.invoke([self.tools["git"], "-C", root, "add", "history-base.txt", ".gitignore"], root)
         self.invoke([self.tools["git"], "-C", root, "commit", "-qm", "history base"], root)
         self.adopt(root, work_root)
         self.core(root, "idea", work_id, "--title", "Synthetic review probe", "--depth", "tiny")
@@ -461,6 +462,15 @@ sys.exit(2)
         with self.assertRaisesRegex(review.Refusal, "unsupported source entry"):
             review.source_inventory(submodule_root, gitlink_commit, ".razr/work")
 
+        broken_root = self.repo("broken-symbolic-ref")
+        (broken_root / "base.txt").write_text("base\n")
+        self.invoke([self.tools["git"], "-C", broken_root, "add", "base.txt"], broken_root)
+        self.invoke([self.tools["git"], "-C", broken_root, "commit", "-qm", "base"], broken_root)
+        self.invoke([self.tools["git"], "-C", broken_root, "symbolic-ref", "refs/custom/broken",
+                     "refs/custom/missing"], broken_root)
+        with self.assertRaisesRegex(review.Refusal, "unsupported or corrupt committed-history refs"):
+            review.history_identity(broken_root)
+
     def test_reports_refuse_incomplete_reuse_drift_and_peer_context(self):
         root, _ = self.candidate("refusals", ".workflow/items", shell_validation=True)
         output = self.lab / "refusal-review"
@@ -478,6 +488,10 @@ sys.exit(2)
         incomplete = self.report(common, common_digest, "contract", status="incomplete")
         checked = review.validate_report(incomplete, common, common_digest, "contract")
         self.assertIsNone(checked["verdict"])
+        ignored = root / ".ignored-review"; ignored.write_text("hidden input\n")
+        with self.assertRaisesRegex(review.Refusal, "ignored files require resolution"):
+            review.validate_common(common_path, common_digest)
+        ignored.unlink()
         (root / "untracked.txt").write_text("drift\n")
         with self.assertRaisesRegex(review.Refusal, "untracked"):
             review.validate_common(common_path, common_digest)
@@ -514,6 +528,12 @@ sys.exit(2)
             review.audit_run(str(common_path), common_digest, str(run), "technical")
         events.write_bytes(original_events)
         rows = [json.loads(line) for line in original_events.splitlines()]
+        next(row for row in rows if row.get("toolCallId") == "common-read" and row.get("type") == "tool_execution_start")["args"]["path"] += ".not-the-file"
+        events.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        with self.assertRaisesRegex(review.Refusal, "successfully read required evidence"):
+            review.audit_run(str(common_path), common_digest, str(run), "technical")
+        events.write_bytes(original_events)
+        rows = [json.loads(line) for line in original_events.splitlines()]
         next(row for row in rows if row.get("type") == "tool_execution_end" and row.get("toolName") == "bash")["isError"] = True
         events.write_text("".join(json.dumps(row) + "\n" for row in rows))
         with self.assertRaisesRegex(review.Refusal, "exit contradicts"):
@@ -524,6 +544,14 @@ sys.exit(2)
         ended["result"]["content"][0]["text"] = ended["result"]["content"][0]["text"].replace("=0\n", "=1\n")
         events.write_text("".join(json.dumps(row) + "\n" for row in rows))
         with self.assertRaisesRegex(review.Refusal, "exact tool result"):
+            review.audit_run(str(common_path), common_digest, str(run), "technical")
+        events.write_bytes(original_events)
+        rows = [json.loads(line) for line in original_events.splitlines()]
+        ended = next(row for row in rows if row.get("type") == "tool_execution_end" and row.get("toolName") == "bash")
+        ended["result"]["content"][0]["text"] = ended["result"]["content"][0]["text"].replace(
+            "__RAZR_REVIEW_EXIT_", "bogus-prefix__RAZR_REVIEW_EXIT_", 1)
+        events.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        with self.assertRaisesRegex(review.Refusal, "exact exit marker"):
             review.audit_run(str(common_path), common_digest, str(run), "technical")
         events.write_bytes(original_events)
         execution_path = run / "execution.json"; original_execution = execution_path.read_bytes()
