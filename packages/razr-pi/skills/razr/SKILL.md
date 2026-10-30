@@ -15,7 +15,6 @@ Read the project's instructions and actual decisions first. Follow only the row 
 | --- | --- |
 | New idea or project; no exact approved pair | [Greenfield preparation](references/greenfield.md). Keep discovery separate from implementation. |
 | Existing project needs explicit adoption | [Safe adoption](references/adoption.md). Never adopt or initialize automatically. |
-| Project was adopted by an earlier incompatible release | [Safe de-adoption](references/de-adoption.md), then restart from the beginning in a clean repository. No in-place upgrade. |
 | Human wants to stop using Razr routing in this project | [Safe de-adoption](references/de-adoption.md). Retain workflow data by default. |
 | Exact pair approved; task execution or candidate work authorized | [Primary execution](references/primary-execution.md). This is the single runbook from approval through the first human checkpoint and separately permitted candidate work. |
 | Candidate is in Verify; formal review or delivery requested | [Independent review through human PR handoff](references/review-delivery.md). Preserve fresh sessions, separate human gates and exact remote identity. |

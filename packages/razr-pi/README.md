@@ -423,7 +423,7 @@ Present to the human:
 
 ## Safe removal and refusal behavior
 
-- [Safe de-adoption](skills/razr/references/de-adoption.md) and `scripts/de-adopt.py` prepare exact original/proposed `AGENTS.md` files when a developer wants to remove Razr routing. They never change the project or delete retained data automatically.
+- [Safe de-adoption](skills/razr/references/de-adoption.md) and `scripts/de-adopt.py` create exact snapshot/proposal files when a developer wants to remove Razr routing. They never overwrite `AGENTS.md` or delete retained data automatically.
 - `scripts/primary.py` is read-only; it does not execute tasks or mutate workflow state.
 - `scripts/review-flow.py` has no automatic retry, fallback, repair, or outcome recording after launch.
 - `scripts/github-delivery.py` never pushes, mutates Razr state, merges, deploys, changes credentials, or compensates automatically.

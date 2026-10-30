@@ -2,7 +2,7 @@
   "name": "razr-pi",
   "version": "0.2.0",
   "private": true,
-  "description": "Breaking local Pi Razr package with explicit adoption, status and bounded workflow guidance",
+  "description": "Local Pi Razr package with explicit adoption and bounded end-to-end delivery guidance",
   "keywords": ["pi-package"],
   "pi": { "extensions": ["./extensions/razr.ts"], "skills": ["./skills"] },
   "peerDependencies": {

@@ -9,7 +9,7 @@ The helper never changes `AGENTS.md`. It reads one exact recognized `<!-- RAZR:S
 
 This avoids silently overwriting editor or concurrent-process changes. The human must compare the current file, original snapshot and proposal, then apply the proposal manually. Existing conflicting preparation files are refused rather than overwritten.
 
-This release does not migrate previous routing or workflow state. After manually applying the proposal, start again from the beginning in a clean repository. Reusing the same repository requires a separate explicit decision to archive or remove retained `razr.yaml` and `.razr/` data; this helper never does that automatically.
+Applying the proposal only removes the current managed routing block. Existing `razr.yaml`, `.razr/`, specifications, state, evidence and Memory remain untouched. Re-adopting the same repository while those paths remain requires a separate explicit decision to keep, archive or remove them; this helper never makes that decision automatically.
 
 Inspect the exact Git root and command first:
 

@@ -78,7 +78,7 @@ def preflight(target: Path, requested_root: str) -> Path:
     requested = work_root(root, requested_root)
     if not managed and (config.exists() or requested.exists() or (root / ".razr").exists()):
         raise PreflightError(
-            "refusing retained Razr data without current managed routing; this breaking release requires a clean repository"
+            "refusing existing Razr data without current managed routing; use a clean target or resolve the retained data explicitly"
         )
     return root
 

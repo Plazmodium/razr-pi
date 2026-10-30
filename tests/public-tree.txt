@@ -28,11 +28,6 @@ packages/razr-pi/extensions/razr.ts
 packages/razr-pi/package.json
 packages/razr-pi/runtime/AGENTS.project-razr.md
 packages/razr-pi/runtime/provenance.json
-packages/razr-pi/runtime/routing/adoption-discovery-v1.md
-packages/razr-pi/runtime/routing/candidate-v3.md
-packages/razr-pi/runtime/routing/dual-v5.md
-packages/razr-pi/runtime/routing/first-task-v2.md
-packages/razr-pi/runtime/routing/technical-v4.md
 packages/razr-pi/runtime/scripts/razr.py
 packages/razr-pi/runtime/templates/evidence.md
 packages/razr-pi/runtime/templates/executable.yaml
@@ -75,5 +70,5 @@ tests/test_pi_surface.py
 tests/test_primary_execution.py
 tests/test_provenance.py
 tests/test_public_boundary.py
-tests/test_recovery_release.py
+tests/test_project_removal.py
 tests/test_review_flow.py

@@ -1,6 +1,6 @@
 # Current Razr-Pi release
 
-Razr-Pi `0.2.0` is a breaking local Pi package release. It does not migrate routing or workflow state created by previous releases.
+Razr-Pi `0.2.0` is a local Pi package for explicit repository adoption and primary-led delivery through an open pull request for final human review.
 
 ## Start here
 
@@ -15,18 +15,17 @@ Razr-Pi `0.2.0` is a breaking local Pi package release. It does not migrate rout
 
 - Explicit repository adoption and validated discovery.
 - Core-backed status that reports workflow state separately from adapter authority.
-- Clear detection of incompatible previous-release routing.
-- Safe de-adoption preparation that creates exact original/proposed files and retains project data.
+- Safe routing-removal preparation that creates exact original/proposed files and retains project data.
 - Exact-approved first-task execution and the required human checkpoint.
 - Experimental candidate-bound fresh Technical and Contract review with explicit model bounds and primary audit.
 - Acceptance-pending human-gated Verify-to-Review transition, exact GitHub PR create/read-back and final human PR handoff.
 - Deterministic bounded context, repository-scoped Memory, and the documented read-oriented Pi commands.
 
-## Breaking restart policy
+## Clean installation and safe removal
 
-Projects adopted by previous releases must start again from the beginning in a clean repository. There is no in-place routing or workflow-state upgrade.
+Adoption requires an explicitly selected Git root without conflicting Razr routing or retained control data. The adapter refuses ambiguous markers, modified routing, linked control paths and unexplained existing Razr data rather than guessing how to reconcile them.
 
-Use `scripts/de-adopt.py` to create exact original/proposed `AGENTS.md` files, then compare the current file and apply the proposal manually. The helper never changes `AGENTS.md`; it retains `razr.yaml`, `.razr/`, specifications, state, evidence and Memory. Applying the proposal, or archiving/deleting retained data, is a separate explicit decision.
+When a developer wants to stop using Razr routing, `scripts/de-adopt.py` creates exact original/proposed `AGENTS.md` files for comparison and manual application. The helper never changes `AGENTS.md` or deletes `razr.yaml`, `.razr/`, specifications, state, evidence or Memory. Applying the proposal, uninstalling the package, or archiving/deleting retained data remains a separate explicit decision.
 
 ## Deliberately not automated
 

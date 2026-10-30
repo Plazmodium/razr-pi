@@ -1,4 +1,4 @@
-"""Recovery-release coverage for the discovery dead end and safe exit."""
+"""Current-routing status, clean adoption and safe routing-removal coverage."""
 import json
 from pathlib import Path
 import stat
@@ -9,7 +9,7 @@ from test_adoption import FixtureTest, surface
 from run_public import ROOT, PACKAGE
 
 
-class RecoveryReleaseTests(FixtureTest):
+class ProjectRemovalTests(FixtureTest):
     def status(self, root, work_id):
         env = dict(self.env)
         allowed_git = {"GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_OPTIONAL_LOCKS", "GIT_TERMINAL_PROMPT"}
@@ -24,28 +24,40 @@ class RecoveryReleaseTests(FixtureTest):
         self.assertEqual(result.stderr, "")
         return result
 
-    def test_discovery_status_explains_legacy_routing_and_is_read_only(self):
+    def test_discovery_status_refuses_unknown_routing_and_is_read_only(self):
         root = self.repo()
         self.adopt(root)
         agents = root / "AGENTS.md"
         current = (PACKAGE / "runtime/AGENTS.project-razr.md").read_text().strip()
-        legacy = (PACKAGE / "runtime/routing/adoption-discovery-v1.md").read_text().strip()
-        agents.write_text(agents.read_text().replace(current, legacy))
-        self.core(root, "idea", "recovery-probe", "--title", "Recovery probe", "--depth", "tiny")
+        unknown = "<!-- RAZR:START -->\nunknown managed routing\n<!-- RAZR:END -->"
+        agents.write_text(agents.read_text().replace(current, unknown))
+        self.core(root, "idea", "routing-probe", "--title", "Routing probe", "--depth", "tiny")
         self.invoke([self.tools["git"], "-C", root, "add", "AGENTS.md", "razr.yaml"], root)
         self.invoke([self.tools["git"], "-C", root, "-c", "user.name=fixture", "-c",
                      "user.email=fixture@example.invalid", "commit", "-qm", "fixture"], root)
         before = surface(root)
-        result = json.loads(self.status(root, "recovery-probe").stdout)
+        result = json.loads(self.status(root, "routing-probe").stdout)
         self.assertEqual(surface(root), before)
         self.assertEqual((result["stage"], result["status"], result["generation"]),
                          ("spec", "exploring", None))
         self.assertIsNone(result["raw_state"])
-        self.assertEqual(result["adapter"]["routing"], "incompatible_previous_release")
-        self.assertEqual(result["adapter"]["blocked_by"], "breaking_release")
-        self.assertIn("start again", result["adapter"]["reason"])
-        self.assertIn("de-adopt.py", result["adapter"]["next_action"])
-        self.assertIn("clean repository", result["adapter"]["next_action"])
+        self.assertEqual(result["adapter"]["routing"], "modified_or_unknown")
+        self.assertEqual(result["adapter"]["blocked_by"], "project_routing")
+        self.assertIn("still exploring", result["adapter"]["reason"])
+        self.assertIn("unknown or modified block", result["adapter"]["next_action"])
+        self.assertNotIn("routing_profile", result["adapter"])
+
+        agents.write_text(unknown + "\n" + unknown + "\n")
+        self.invoke([self.tools["git"], "-C", root, "add", "AGENTS.md"], root)
+        self.invoke([self.tools["git"], "-C", root, "-c", "user.name=fixture", "-c",
+                     "user.email=fixture@example.invalid", "commit", "-qm", "ambiguous routing"], root)
+        before = surface(root)
+        ambiguous = json.loads(self.status(root, "routing-probe").stdout)
+        self.assertEqual(surface(root), before)
+        self.assertEqual(ambiguous["adapter"]["routing"], "ambiguous")
+        self.assertEqual(ambiguous["adapter"]["blocked_by"], "project_routing")
+        self.assertIn("duplicated or out of order", ambiguous["adapter"]["next_action"])
+        self.assertNotIn("migration", ambiguous["adapter"]["next_action"].lower())
 
     def test_de_adopt_prepares_exact_files_and_retains_project_data(self):
         root = self.repo()
@@ -80,7 +92,7 @@ class RecoveryReleaseTests(FixtureTest):
         (root / "AGENTS.md").chmod(0o640)
         before_readopt = surface(root)
         refused = self.adopt(root, expected=2)
-        self.assertIn("breaking release requires a clean repository", refused.stderr)
+        self.assertIn("use a clean target or resolve the retained data explicitly", refused.stderr)
         self.assertEqual(surface(root), before_readopt)
         second = self.helper("de-adopt.py", "--target", str(root), cwd=root)
         self.assertIn("No managed Razr routing present", second.stdout)
@@ -142,20 +154,29 @@ class RecoveryReleaseTests(FixtureTest):
         self.assertEqual(surface(root), before)
         self.assertEqual(outside.read_text(), "protected\n")
 
-    def test_public_readmes_use_new_product_framing_and_keep_safe_exit(self):
-        root_readme = (ROOT / "README.md").read_text()
-        package_readme = (PACKAGE / "README.md").read_text()
-        capabilities = (ROOT / "docs/capabilities.md").read_text()
-        for text in (root_readme, package_readme, capabilities):
+    def test_public_product_surfaces_use_clean_install_framing_and_keep_safe_exit(self):
+        surfaces = {
+            "root_readme": (ROOT / "README.md").read_text(),
+            "package_readme": (PACKAGE / "README.md").read_text(),
+            "current": (ROOT / "docs/CURRENT.md").read_text(),
+            "capabilities": (ROOT / "docs/capabilities.md").read_text(),
+            "skill": (PACKAGE / "skills/razr/SKILL.md").read_text(),
+            "adoption": (PACKAGE / "skills/razr/references/adoption.md").read_text(),
+            "de_adoption": (PACKAGE / "skills/razr/references/de-adoption.md").read_text(),
+            "pi_surface": (PACKAGE / "scripts/pi-surface.py").read_text(),
+        }
+        for text in surfaces.values():
             self.assertNotIn("scripts/upgrade-routing.py", text)
-            self.assertIn("scripts/de-adopt.py", text)
-        for text in (root_readme, package_readme):
             lowered = text.lower()
             self.assertNotIn("breaking release", lowered)
             self.assertNotIn("previous release", lowered)
             self.assertNotIn("earlier release", lowered)
-            self.assertNotIn("in-place upgrade", lowered)
-        self.assertIn("experimental primary-led end-to-end path", root_readme)
-        self.assertIn("final human PR handoff", root_readme)
-        self.assertIn("safe de-adoption", package_readme.lower())
-        self.assertIn("remove Razr routing", package_readme)
+            self.assertNotIn("incompatible previous", lowered)
+            self.assertNotIn("migration", lowered)
+        self.assertIn("scripts/de-adopt.py", surfaces["root_readme"])
+        self.assertIn("scripts/de-adopt.py", surfaces["package_readme"])
+        self.assertIn("experimental primary-led end-to-end path", surfaces["root_readme"])
+        self.assertIn("final human PR handoff", surfaces["root_readme"])
+        self.assertIn("safe de-adoption", surfaces["package_readme"].lower())
+        self.assertIn("remove Razr routing", surfaces["package_readme"])
+        self.assertIn("never overwrite `AGENTS.md`", surfaces["package_readme"])

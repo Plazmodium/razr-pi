@@ -58,22 +58,14 @@ def _routing_status(root: Path) -> dict[str, str]:
     raw = path.read_bytes()
     if raw.count(start) != 1 or raw.count(end) != 1 or raw.find(end) < raw.find(start):
         return {"routing": "ambiguous", "blocked_by": "project_routing",
-                "next_action": "Stop and inspect the project instructions; no in-place migration is supported."}
+                "next_action": "Stop and inspect the project instructions; routing markers are missing, duplicated or out of order."}
     block = raw[raw.find(start):raw.find(end) + len(end)]
     current = (PACKAGE / "runtime/AGENTS.project-razr.md").read_bytes().strip()
     if block == current:
         return {"routing": "current", "blocked_by": "none",
                 "next_action": "Follow the loaded skill and exact project contract; human approval is never inferred."}
-    routing_dir = PACKAGE / "runtime/routing"
-    known = {} if not routing_dir.is_dir() else {
-        p.read_bytes().strip(): p.stem for p in routing_dir.glob("*.md")
-    }
-    if block in known:
-        return {"routing": "incompatible_previous_release", "routing_profile": known[block],
-                "blocked_by": "breaking_release",
-                "next_action": "Use scripts/de-adopt.py to prepare exact files, manually review and apply the proposal, then restart in a clean repository. Retained razr.yaml and .razr data require a separate explicit archive or removal decision."}
     return {"routing": "modified_or_unknown", "blocked_by": "project_routing",
-            "next_action": "Review the local routing; the adapter will not replace an unknown block."}
+            "next_action": "Review the local routing; the adapter will not replace an unknown or modified block."}
 
 
 def _adapter_status(root: Path, stage: str, status: str) -> dict[str, object]:
@@ -85,9 +77,7 @@ def _adapter_status(root: Path, stage: str, status: str) -> dict[str, object]:
         "review_and_delivery": "fresh dual review, human-gated Review entry and exact PR handoff are experimental and acceptance-pending; merge/deploy remain unavailable",
         **routing,
     }
-    if stage == "spec" and status == "exploring" and routing["routing"] == "incompatible_previous_release":
-        boundary["reason"] = "This project was adopted by an incompatible previous release. In-place upgrade is not supported; start again from the beginning."
-    elif stage == "spec" and status == "exploring":
+    if stage == "spec" and status == "exploring":
         boundary["reason"] = "This item is still exploring. Progress requires an exact approved spec/executable pair and the current project routing."
     else:
         boundary["reason"] = "Core workflow state and adapter authorization are separate; a valid state does not authorize the next action."

@@ -19,7 +19,7 @@ import stat
 import subprocess
 import sys
 
-ALLOWLIST_SHA256 = '6a6420c30687780ebc941a3bb029f18ffa1e5a0cb0b2e4880c0c3d2441b96e12'
+ALLOWLIST_SHA256 = '5f2a7168c2c4d9dc0e7d176502ce19b4fd51bca7deaa422850ff4ec557158104'
 LICENSE_SHA256 = '9d2fdecab2aa2dca006dbd67b07d3cc63a9d9f64a4f954aff2fe782251f9f8f4'
 OUTPUT_MARKER = 'clean-source-v1 owned private test output\n'
 PROVENANCE = {
@@ -32,7 +32,7 @@ PROVENANCE = {
 }
 
 SOURCE_PINS = {
-    'scripts/adopt.py': '8dd645e247cfa26f612463080bf365e6b8d35298a52bfc30879bc75a61b2b075',
+    'scripts/adopt.py': '88157336a553ca6c1667eba5b12bd4efc38e43875f887bb8738d5716fdc56ad1',
     'scripts/primary.py': '4ea38b5ef08dfb4944f50376d2475653d81671fb51239cac61549c49dfe895ed',
     'scripts/contract-preflight.py': '54d237feabd02cb250c51d677cc8df08de9fe9feaecc557583ef76579899a850',
     'scripts/named-regressions.py': '8885fa72a2ae3446e69577f26347c3ffacd8f499a322725d807bb8e947d01392',
@@ -169,7 +169,7 @@ def check(root):
     raw = regular(root / 'tests/public-tree.txt')
     require(sha(raw) == ALLOWLIST_SHA256, 'public allowlist drift')
     names = raw.decode('utf-8').splitlines()
-    require(len(names) == len(set(names)) == 79, 'invalid allowlist cardinality')
+    require(len(names) == len(set(names)) == 74, 'invalid allowlist cardinality')
     for name in names:
         p = PurePosixPath(name)
         require(not p.is_absolute() and '..' not in p.parts and str(p) == name, 'unsafe allowlist entry')

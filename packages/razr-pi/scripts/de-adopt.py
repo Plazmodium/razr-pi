@@ -40,11 +40,7 @@ END = b"<!-- RAZR:END -->"
 
 
 def recognized_blocks() -> set[bytes]:
-    blocks = {(PACKAGE / "runtime/AGENTS.project-razr.md").read_bytes().strip()}
-    routing = PACKAGE / "runtime/routing"
-    if routing.is_dir():
-        blocks.update(path.read_bytes().strip() for path in routing.glob("*.md"))
-    return blocks
+    return {(PACKAGE / "runtime/AGENTS.project-razr.md").read_bytes().strip()}
 
 
 def managed_block(path: Path, raw: bytes) -> tuple[bytes, int, int] | None:
