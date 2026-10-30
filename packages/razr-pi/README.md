@@ -4,8 +4,6 @@ Razr-Pi is a local Pi package for taking one explicitly adopted Git repository f
 
 The provenance-pinned Razr core owns lifecycle state. Pi is the primary engineering session. Package helpers provide safe adoption, read-only inspection, fresh bounded Technical and Contract review, and exact GitHub PR create/read-back. They do not authenticate approval, merge, deploy, retry failed reviews, or change credentials.
 
-> **Breaking release:** projects adopted by an earlier Razr-Pi release are not upgraded in place. Follow [Safe de-adoption](skills/razr/references/de-adoption.md), retain or separately archive existing `razr.yaml` and `.razr/` data, and restart from the beginning in a clean repository.
-
 ## Supported endpoint
 
 The supported operator path is:
@@ -423,9 +421,9 @@ Present to the human:
 
 **Stop at final human PR review.** Do not merge, deploy, publish, mark ready/merged, delete the branch, or infer acceptance.
 
-## Recovery and refusal behavior
+## Safe removal and refusal behavior
 
-- `scripts/de-adopt.py` prepares exact original/proposed `AGENTS.md` files but never changes the project or deletes retained data.
+- [Safe de-adoption](skills/razr/references/de-adoption.md) and `scripts/de-adopt.py` prepare exact original/proposed `AGENTS.md` files when a developer wants to remove Razr routing. They never change the project or delete retained data automatically.
 - `scripts/primary.py` is read-only; it does not execute tasks or mutate workflow state.
 - `scripts/review-flow.py` has no automatic retry, fallback, repair, or outcome recording after launch.
 - `scripts/github-delivery.py` never pushes, mutates Razr state, merges, deploys, changes credentials, or compensates automatically.

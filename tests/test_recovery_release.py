@@ -142,15 +142,20 @@ class RecoveryReleaseTests(FixtureTest):
         self.assertEqual(surface(root), before)
         self.assertEqual(outside.read_text(), "protected\n")
 
-    def test_public_docs_state_breaking_restart_and_safe_exit(self):
+    def test_public_readmes_use_new_product_framing_and_keep_safe_exit(self):
         root_readme = (ROOT / "README.md").read_text()
         package_readme = (PACKAGE / "README.md").read_text()
         capabilities = (ROOT / "docs/capabilities.md").read_text()
         for text in (root_readme, package_readme, capabilities):
             self.assertNotIn("scripts/upgrade-routing.py", text)
             self.assertIn("scripts/de-adopt.py", text)
-            self.assertIn("clean repository", text)
-        self.assertIn("Breaking release", root_readme)
+        for text in (root_readme, package_readme):
+            lowered = text.lower()
+            self.assertNotIn("breaking release", lowered)
+            self.assertNotIn("previous release", lowered)
+            self.assertNotIn("earlier release", lowered)
+            self.assertNotIn("in-place upgrade", lowered)
         self.assertIn("experimental primary-led end-to-end path", root_readme)
         self.assertIn("final human PR handoff", root_readme)
-        self.assertIn("retain", package_readme.lower())
+        self.assertIn("safe de-adoption", package_readme.lower())
+        self.assertIn("remove Razr routing", package_readme)

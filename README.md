@@ -2,8 +2,6 @@ Razr-Pi is a local [Pi](https://github.com/badlogic/pi-mono) package for reposit
 
 Already using Pi? Point your agent to [For Pi agents](#for-pi-agents) for guided setup.
 
-> **Breaking release:** Razr-Pi does not support in-place migration from previously generated project routing or workflow state. Existing users must start again from the beginning in a clean repository. The helper prepares original/proposed `AGENTS.md` files for human-applied de-adoption without deleting project data; archival or deletion of retained `razr.yaml` and `.razr/` data is a separate explicit decision.
->
 > Razr-Pi includes an experimental primary-led end-to-end path for bounded GitHub-backed projects: exact approval, execution, first-task checkpoint, candidate binding, fresh independent Technical and Contract review, human-gated Review entry, exact PR creation/read-back, and final human PR handoff. Release acceptance is still pending; it never merges or deploys automatically.
 
 ## Why Razr-Pi?
@@ -171,7 +169,7 @@ The experimental delivery workflow is intended to run from exploration through a
 
 The path is project/language/test-runner/model/branch independent within its explicit repository and safety constraints. Core commands, helper flags and hashes never bypass actual human gates.
 
-Use `/razr-context` for bounded context and the Memory commands for experiential context. Updating the package does not rewrite project routing, and this breaking release provides no in-place upgrade. Previous users should use `packages/razr-pi/scripts/de-adopt.py`, manually review and apply its proposal, retain or separately archive the old data, and begin again in a clean repository.
+Use `/razr-context` for bounded context and the Memory commands for experiential context. Package updates do not rewrite project routing or workflow state automatically. If a developer wants to remove Razr routing from a project, `packages/razr-pi/scripts/de-adopt.py` prepares an exact proposal for separate human review without deleting project data.
 
 ## Architecture and reference
 
