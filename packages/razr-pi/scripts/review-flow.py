@@ -59,8 +59,12 @@ def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return value
 
 
+def invalid_json_constant(value: str) -> object:
+    raise Refusal("non-finite JSON number refused: " + value)
+
+
 def strict_json(raw: str) -> object:
-    return json.loads(raw, object_pairs_hook=unique_object)
+    return json.loads(raw, object_pairs_hook=unique_object, parse_constant=invalid_json_constant)
 
 
 def digest(raw: bytes) -> str:
@@ -87,7 +91,7 @@ def regular(path: str | Path) -> bytes:
 
 
 def load(path: str | Path) -> object:
-    return json.loads(regular(path))
+    return strict_json(regular(path).decode())
 
 
 def save_new(path: Path, value: object) -> None:
@@ -288,6 +292,7 @@ def freeze_data(target: str | Path, work_id: str) -> dict[str, object]:
             "Hashes establish identity, not execution, independence, semantic support or human approval.",
             "Reviewer tools execute with the current operating-system identity and are not a sandbox.",
             "Reviewers receive a detached candidate clone with committed Git history and no live-target path, but same-UID indirect discovery is not prevented.",
+            "Tracked source symlinks and Git submodules are unsupported and refused; valid linked Git worktrees are supported.",
             "GitHub observations and model/provider transport are external and non-atomic.",
         ],
     }
@@ -315,7 +320,8 @@ def validate_common(path: str | Path, expected_digest: str) -> dict[str, object]
     raw = regular(path)
     require(digest(raw) == expected_digest, "common input digest mismatch")
     data = json.loads(raw)
-    require(isinstance(data, dict) and data.get("schema_version") == 1
+    require(isinstance(data, dict) and isinstance(data.get("schema_version"), int)
+            and not isinstance(data.get("schema_version"), bool) and data.get("schema_version") == 1
             and data.get("protocol") == COMMON_PROTOCOL, "unknown common input protocol")
     require(data == freeze_data(data["target"], data["work_id"]), "candidate/contract/common input drift")
     return data
@@ -339,7 +345,9 @@ def validate_report(value: object, common: dict[str, object], common_digest: str
     fields = {"schema_version", "protocol", "role", "context", "identity", "review_status", "verdict",
               "reproduced_checks", "findings", "limitations", "evidence_access"}
     require(set(value) == fields, "report has missing or extra fields")
-    require(value["schema_version"] == 1 and value["protocol"] == REPORT_PROTOCOL, "unknown report protocol")
+    require(isinstance(value["schema_version"], int) and not isinstance(value["schema_version"], bool)
+            and value["schema_version"] == 1 and value["protocol"] == REPORT_PROTOCOL,
+            "unknown report protocol")
     require(value["role"] == role, "report role mismatch")
     try:
         context = str(uuid.UUID(value["context"]))
@@ -367,6 +375,7 @@ def validate_report(value: object, common: dict[str, object], common_digest: str
         require(key not in observed, "duplicate reproduced check")
         observed.add(key)
     if value["review_status"] == "complete":
+        require(value["evidence_access"], "complete report requires accessed-evidence summary")
         require(observed == expected, "complete report must reproduce every declared validation")
         if value["verdict"] == "PASS":
             require(all(row["exit_code"] == 0 for row in checks), "PASS report contains a failed validation")
@@ -399,7 +408,7 @@ def check_exit_marker(context: str, check_id: str) -> str:
 
 def audit_events(events_raw: bytes, common: dict[str, object], common_digest: str, role: str,
                  expected_context: str | None = None, required_commands: list[str] | None = None,
-                 forbidden_root: str | None = None, provider: str | None = None,
+                 required_read_path: str | None = None, forbidden_root: str | None = None, provider: str | None = None,
                  model: str | None = None) -> tuple[dict[str, object], dict[str, object]]:
     rows = parse_jsonl(events_raw)
     require(rows and rows[0].get("type") == "session", "Pi session header missing")
@@ -422,8 +431,15 @@ def audit_events(events_raw: bytes, common: dict[str, object], common_digest: st
         require(final.get("model") == model, "review model mismatch")
     original_report = assistant_text(final)
     report = validate_report(strict_json(original_report), common, common_digest, role, context)
-    starts = {row.get("toolCallId"): row for row in rows if row.get("type") == "tool_execution_start"}
-    ends = {row.get("toolCallId"): row for row in rows if row.get("type") == "tool_execution_end"}
+    start_rows = [row for row in rows if row.get("type") == "tool_execution_start"]
+    end_rows = [row for row in rows if row.get("type") == "tool_execution_end"]
+    require(all(isinstance(row.get("toolCallId"), str) and row.get("toolCallId") for row in start_rows + end_rows),
+            "tool execution id missing")
+    require(len({row["toolCallId"] for row in start_rows}) == len(start_rows)
+            and len({row["toolCallId"] for row in end_rows}) == len(end_rows),
+            "duplicate tool execution record")
+    starts = {row["toolCallId"]: row for row in start_rows}
+    ends = {row["toolCallId"]: row for row in end_rows}
     require(starts.keys() == ends.keys(), "unpaired tool execution records")
     accesses = []
     observed_commands = []
@@ -435,11 +451,15 @@ def audit_events(events_raw: bytes, common: dict[str, object], common_digest: st
             require(forbidden_root not in serialized, "reviewer accessed live builder target")
         if start.get("toolName") == "bash" and isinstance(arguments, dict) and isinstance(arguments.get("command"), str):
             observed_commands.append(arguments["command"])
+        require(isinstance(ends[key].get("isError"), bool), "tool execution error status must be boolean")
         result = ends[key].get("result")
         accesses.append({"tool_call_id": key, "tool": start.get("toolName"), "args": arguments,
                          "is_error": ends[key].get("isError"),
                          "result_content": result.get("content") if isinstance(result, dict) else None})
     if required_commands is not None:
+        if required_read_path is not None:
+            require(any(row["tool"] == "read" and required_read_path in json.dumps(row["args"], sort_keys=True)
+                        for row in accesses), "reviewer did not read the frozen common input")
         require(all(observed_commands.count(command) == 1 for command in required_commands),
                 "declared validations were not each observed exactly once")
         reported = {(row["id"], row["command"]): row["exit_code"] for row in report["reproduced_checks"]}
@@ -532,7 +552,7 @@ Return ONLY one JSON object with exactly these fields:
 schema_version=1; protocol={REPORT_PROTOCOL}; role={role}; context={context};
 identity exactly as specified by the common candidate; review_status complete|incomplete;
 verdict PASS|FAIL only when complete, otherwise null; reproduced_checks as objects with id, command, exit_code, summary;
-findings, limitations, evidence_access as nonempty-string arrays (arrays may be empty).
+findings and limitations as nonempty-string arrays (arrays may be empty); evidence_access as a nonempty array faithfully summarizing accessed evidence.
 PASS requires all declared validations to exit 0 and no blocking finding. Missing evidence or interrupted work is incomplete, not FAIL.
 """
 
@@ -627,7 +647,8 @@ def launch(common_path: str, common_digest: str, role: str, run_path: str, provi
     total = execution["captured_output_bytes"] + session_files[0].stat().st_size
     require(total <= max_output_bytes, "retained review output exceeds bound")
     report, audit = audit_events(stdout, common, common_digest, role, context,
-                                 [row["bash"] for row in check_invocations], str(root), provider, model)
+                                 [row["bash"] for row in check_invocations], str(reviewer_common_path),
+                                 str(root), provider, model)
     (run / "report-original.txt").write_text(audit.pop("original_report"))
     save_new(run / "report.json", report)
     save_new(run / "structural-audit.json", {**audit, "events_digest": digest(stdout),
@@ -656,7 +677,8 @@ def audit_run(common_path: str, common_digest: str, run_path: str, role: str) ->
     require(execution.get("reason") is None and execution.get("exit_code") == 0, "review execution incomplete")
     report, audit = audit_events(regular(run / "events.jsonl"), common, common_digest, role, context,
                                  [row["bash"] for row in launch_data["check_invocations"]],
-                                 common["target"], launch_data["provider"], launch_data["model"])
+                                 str(run / "reviewer-common.json"), common["target"],
+                                 launch_data["provider"], launch_data["model"])
     require(audit.pop("original_report") == regular(run / "report-original.txt").decode(), "original report drift")
     require(report == load(run / "report.json"), "parsed report drift")
     sessions = list((run / "sessions").rglob("*.jsonl"))
@@ -683,10 +705,16 @@ def audit_run(common_path: str, common_digest: str, run_path: str, role: str) ->
             assistant_texts.extend(text for text in text_blocks if isinstance(text, str))
             for row in content:
                 if isinstance(row, dict) and row.get("type") == "toolCall":
-                    session_calls[row.get("id")] = {"tool": row.get("name"), "args": row.get("arguments")}
+                    require(isinstance(row.get("id"), str) and row["id"] not in session_calls,
+                            "duplicate saved-session tool call")
+                    session_calls[row["id"]] = {"tool": row.get("name"), "args": row.get("arguments")}
         if message.get("role") == "toolResult":
-            session_results[message.get("toolCallId")] = {"is_error": bool(message.get("isError")),
-                                                            "content": message.get("content")}
+            call_id = message.get("toolCallId")
+            require(isinstance(call_id, str) and call_id not in session_results,
+                    "duplicate saved-session tool result")
+            require(isinstance(message.get("isError"), bool), "saved-session tool status must be boolean")
+            session_results[call_id] = {"is_error": message["isError"],
+                                        "content": message.get("content")}
     require(regular(run / "prompt.md").decode() in user_texts, "saved session prompt mismatch")
     require(regular(run / "report-original.txt").decode() in assistant_texts, "saved session report mismatch")
     event_accesses = {row["tool_call_id"]: row for row in audit["accesses"]}
@@ -773,7 +801,10 @@ def validate_primary_reproduction(reproduction: dict[str, object], common: dict[
                 "invalid primary reproduction check")
         require(digest(regular(row["stdout"])) == row["stdout_digest"]
                 and digest(regular(row["stderr"])) == row["stderr_digest"], "primary reproduction output drift")
-        require(row["execution"].get("reason") is None
+        require(isinstance(row["exit_code"], int) and not isinstance(row["exit_code"], bool)
+                and isinstance(row["execution"].get("exit_code"), int)
+                and not isinstance(row["execution"].get("exit_code"), bool)
+                and row["execution"].get("reason") is None
                 and row["execution"].get("exit_code") == row["exit_code"],
                 "primary reproduction result mismatch")
         key = (row["id"], row["command"])
@@ -799,6 +830,7 @@ def support_run(common_path: str, common_digest: str, run_path: str, role: str,
     require(isinstance(decision_ref, str) and decision_ref.strip(), "primary decision reference required")
     reproduction = load(reproduction_path)
     require(isinstance(reproduction, dict) and set(reproduction) == {"schema_version", "primary_context", "common_digest", "candidate", "environment", "checks", "limitations"}
+            and isinstance(reproduction["schema_version"], int) and not isinstance(reproduction["schema_version"], bool)
             and reproduction["schema_version"] == 1 and reproduction["primary_context"] == primary_context,
             "invalid primary reproduction record")
     common = validate_common(common_path, common_digest)

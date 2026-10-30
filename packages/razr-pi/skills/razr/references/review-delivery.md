@@ -19,7 +19,7 @@ Review output must be a new retained directory outside both the target and packa
 
 Run the read-only primary inspector and core validation. Confirm Verify/active, all tasks complete, candidate bound, both critics `not_due`, PR absent, clean exact candidate HEAD/branch, configured Git author, approved contract identities, and inspected digest-excluded `AGENTS.md`, `razr.yaml` and work-root inputs.
 
-Stop on dirty/untracked source other than core lock tokens, linked/non-regular control paths, candidate/branch/source drift, unexpected prior outcomes, credentials, spending, destructive action or scope uncertainty.
+Stop on dirty/untracked source other than core lock tokens, linked/non-regular control paths, candidate/branch/source drift, unexpected prior outcomes, credentials, spending, destructive action or scope uncertainty. Valid registered linked Git worktrees are supported when the supplied target is their exact root. Tracked source symlinks and Git submodules are currently unsupported and are explicit refusals, not silently omitted inputs.
 
 ## 2. Freeze neutral common inputs
 

@@ -3,6 +3,7 @@ import importlib.util
 import json
 from pathlib import Path
 import os
+import shutil
 import subprocess
 import sys
 import uuid
@@ -125,6 +126,11 @@ common_path, common_digest = match.group(1), match.group(3)
 common = json.loads(pathlib.Path(common_path).read_text())
 launch = json.loads((pathlib.Path.cwd().parent / 'launch.json').read_text())
 role = launch['role']; events = [{'type': 'session', 'version': 3, 'id': context, 'cwd': str(pathlib.Path.cwd())}]
+read_content = [{'type': 'text', 'text': 'read frozen common input'}]
+events.extend([{'type': 'tool_execution_start', 'toolCallId': 'common-read', 'toolName': 'read',
+                'args': {'path': common_path}},
+               {'type': 'tool_execution_end', 'toolCallId': 'common-read', 'toolName': 'read',
+                'result': {'content': read_content}, 'isError': False}])
 checks = []; tool_contents = []
 for index, invocation in enumerate(launch['check_invocations']):
  call = 'call-' + str(index)
@@ -150,7 +156,11 @@ events.extend([{'type': 'message_end', 'message': message}, {'type': 'agent_sett
 for row in events: print(json.dumps(row), flush=True)
 session_dir.mkdir(parents=True, exist_ok=True)
 saved = [{'type': 'session', 'version': 3, 'id': context, 'cwd': str(pathlib.Path.cwd())},
- {'type': 'message', 'message': {'role': 'user', 'content': prompt}}]
+ {'type': 'message', 'message': {'role': 'user', 'content': prompt}},
+ {'type': 'message', 'message': {'role': 'assistant', 'content': [
+  {'type': 'toolCall', 'id': 'common-read', 'name': 'read', 'arguments': {'path': common_path}}]}},
+ {'type': 'message', 'message': {'role': 'toolResult', 'toolCallId': 'common-read', 'toolName': 'read',
+  'content': read_content, 'isError': False}}]
 for index, invocation in enumerate(launch['check_invocations']):
  call = 'call-' + str(index)
  saved.append({'type': 'message', 'message': {'role': 'assistant', 'content': [
@@ -336,6 +346,9 @@ sys.exit(2)
                   "declared_validations": [{"id": "one:1", "command": "true"},
                                            {"id": "two:1", "command": "true"}]}
         report = self.report(common, common_digest, "technical", context)
+        no_evidence = json.loads(json.dumps(report)); no_evidence["evidence_access"] = []
+        with self.assertRaisesRegex(review.Refusal, "accessed-evidence summary"):
+            review.validate_report(no_evidence, common, common_digest, "technical", context)
         contradictory = json.loads(json.dumps(report))
         contradictory["reproduced_checks"].append({"id": "one:1", "command": "true", "exit_code": 1,
                                                      "summary": "contradictory duplicate"})
@@ -345,9 +358,18 @@ sys.exit(2)
                                                        '"verdict": "FAIL", "verdict": "PASS"')
         with self.assertRaisesRegex(review.Refusal, "duplicate JSON object field"):
             review.strict_json(duplicate_field)
+        with self.assertRaisesRegex(review.Refusal, "non-finite JSON number"):
+            review.strict_json('{"value":NaN}')
+        boolean_schema = json.loads(json.dumps(report)); boolean_schema["schema_version"] = True
+        with self.assertRaisesRegex(review.Refusal, "unknown report protocol"):
+            review.validate_report(boolean_schema, common, common_digest, "technical", context)
         duplicate_event = b'{"type":"session","type":"message_end"}\n'
         with self.assertRaisesRegex(review.Refusal, "duplicate JSON object field"):
             review.parse_jsonl(duplicate_event)
+        duplicate_record = self.lab / "duplicate-record.json"
+        duplicate_record.write_text('{"schema_version":1,"schema_version":2}')
+        with self.assertRaisesRegex(review.Refusal, "duplicate JSON object field"):
+            review.load(duplicate_record)
         bool_exit = json.loads(json.dumps(report)); bool_exit["reproduced_checks"][0]["exit_code"] = False
         with self.assertRaisesRegex(review.Refusal, "invalid check result"):
             review.validate_report(bool_exit, common, common_digest, "technical", context)
@@ -364,6 +386,10 @@ sys.exit(2)
                  {"type": "agent_settled", "aborted": False}]
         raw = ("\n".join(json.dumps(row) for row in rows) + "\n").encode()
         review.audit_events(raw, common, common_digest, "technical", context, shells)
+        duplicate_rows = rows[:2] + [json.loads(json.dumps(rows[1]))] + rows[2:]
+        with self.assertRaisesRegex(review.Refusal, "duplicate tool execution record"):
+            review.audit_events(("\n".join(json.dumps(row) for row in duplicate_rows) + "\n").encode(),
+                                common, common_digest, "technical", context, shells)
         one_only = ("\n".join(json.dumps(row) for row in rows if row.get("toolCallId") != "1") + "\n").encode()
         with self.assertRaisesRegex(review.Refusal, "each observed exactly once"):
             review.audit_events(one_only, common, common_digest, "technical", context, shells)
@@ -378,9 +404,49 @@ sys.exit(2)
                                       "stderr": str(stderr), "stderr_digest": review.digest(stderr.read_bytes()),
                                       "execution": {"reason": None, "exit_code": 1}}]}
         review.validate_primary_reproduction(reproduction, common, fail_report)
+        boolean_reproduction = json.loads(json.dumps(reproduction))
+        boolean_reproduction["checks"][0]["exit_code"] = True
+        boolean_reproduction["checks"][0]["execution"]["exit_code"] = True
+        with self.assertRaisesRegex(review.Refusal, "reproduction result mismatch"):
+            review.validate_primary_reproduction(boolean_reproduction, common, fail_report)
         fail_report["verdict"] = "PASS"
         with self.assertRaisesRegex(review.Refusal, "contradicts PASS"):
             review.validate_primary_reproduction(reproduction, common, fail_report)
+
+    def test_linked_worktree_supported_and_unsupported_entries_refuse(self):
+        root, item = self.candidate("linked-source")
+        linked = self.lab / "linked-source-worktree"
+        self.invoke([self.tools["git"], "-C", root, "worktree", "add", "-q", "--detach", str(linked), "HEAD"], root)
+        linked_item = linked / ".razr/work/public-probe"
+        shutil.copy2(item / "state.yaml", linked_item / "state.yaml")
+        shutil.copy2(item / "evidence.md", linked_item / "evidence.md")
+        common_path, common_digest = review.freeze(str(linked), "public-probe", str(self.lab / "linked-review"))
+        self.assertEqual(review.validate_common(common_path, common_digest)["candidate"]["commit"],
+                         self.invoke([self.tools["git"], "-C", root, "rev-parse", "HEAD"], root).stdout.strip())
+
+        symlink_root = self.repo("tracked-symlink")
+        (symlink_root / "target.txt").write_text("target\n")
+        (symlink_root / "linked.txt").symlink_to("target.txt")
+        self.invoke([self.tools["git"], "-C", symlink_root, "add", "."], symlink_root)
+        self.invoke([self.tools["git"], "-C", symlink_root, "commit", "-qm", "symlink"], symlink_root)
+        symlink_commit = self.invoke([self.tools["git"], "-C", symlink_root, "rev-parse", "HEAD"],
+                                     symlink_root).stdout.strip()
+        with self.assertRaisesRegex(review.Refusal, "unsupported source entry"):
+            review.source_inventory(symlink_root, symlink_commit, ".razr/work")
+
+        submodule_root = self.repo("gitlink-source")
+        (submodule_root / "base.txt").write_text("base\n")
+        self.invoke([self.tools["git"], "-C", submodule_root, "add", "base.txt"], submodule_root)
+        self.invoke([self.tools["git"], "-C", submodule_root, "commit", "-qm", "base"], submodule_root)
+        object_id = self.invoke([self.tools["git"], "-C", submodule_root, "rev-parse", "HEAD"],
+                                submodule_root).stdout.strip()
+        self.invoke([self.tools["git"], "-C", submodule_root, "update-index", "--add", "--cacheinfo",
+                     f"160000,{object_id},vendor"], submodule_root)
+        self.invoke([self.tools["git"], "-C", submodule_root, "commit", "-qm", "gitlink"], submodule_root)
+        gitlink_commit = self.invoke([self.tools["git"], "-C", submodule_root, "rev-parse", "HEAD"],
+                                     submodule_root).stdout.strip()
+        with self.assertRaisesRegex(review.Refusal, "unsupported source entry"):
+            review.source_inventory(submodule_root, gitlink_commit, ".razr/work")
 
     def test_reports_refuse_incomplete_reuse_drift_and_peer_context(self):
         root, _ = self.candidate("refusals", ".workflow/items", shell_validation=True)
@@ -427,13 +493,13 @@ sys.exit(2)
         shallow.unlink()
         events = run / "events.jsonl"; original_events = events.read_bytes()
         rows = [json.loads(line) for line in original_events.splitlines()]
-        next(row for row in rows if row.get("type") == "tool_execution_end")["isError"] = True
+        next(row for row in rows if row.get("type") == "tool_execution_end" and row.get("toolName") == "bash")["isError"] = True
         events.write_text("".join(json.dumps(row) + "\n" for row in rows))
         with self.assertRaisesRegex(review.Refusal, "exit contradicts"):
             review.audit_run(str(common_path), common_digest, str(run), "technical")
         events.write_bytes(original_events)
         rows = [json.loads(line) for line in original_events.splitlines()]
-        ended = next(row for row in rows if row.get("type") == "tool_execution_end")
+        ended = next(row for row in rows if row.get("type") == "tool_execution_end" and row.get("toolName") == "bash")
         ended["result"]["content"][0]["text"] = ended["result"]["content"][0]["text"].replace("=0\n", "=1\n")
         events.write_text("".join(json.dumps(row) + "\n" for row in rows))
         with self.assertRaisesRegex(review.Refusal, "exact tool result"):
