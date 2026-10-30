@@ -79,7 +79,9 @@ class ReviewFlowTests(FixtureTest):
                                               "candidate_preparation_authorized": True})
         self.assertTrue(json.loads(checkpoint_decision.read_text())["candidate_preparation_authorized"])
         (root / "product.txt").write_text("portable review fixture\n")
+        (root / work_root / "shared-review-input.md").write_text("committed excluded work-root input\n")
         self.invoke([self.tools["git"], "-C", root, "add", "AGENTS.md", "razr.yaml", "product.txt",
+                     str(Path(work_root) / "shared-review-input.md"),
                      str(Path(work_root) / work_id / "spec.md"),
                      str(Path(work_root) / work_id / "executable.yaml"),
                      str(Path(work_root) / work_id / "state.yaml"),
@@ -213,6 +215,14 @@ saved.append({'type': 'message', 'message': message})
         common = review.validate_common(common_path, common_digest)
         self.assertEqual(common["candidate"]["repository"], "fixture/review-project")
         self.assertIn("origin", common["remotes"])
+        excluded = {row["path"]: row for row in common["excluded_inputs"]["work_root"]}
+        shared = ".razr/work/shared-review-input.md"
+        self.assertIn(shared, excluded)
+        self.assertTrue(excluded[shared]["live_matches_candidate"])
+        self.assertEqual(excluded[shared]["candidate_sha256"], excluded[shared]["live_sha256"])
+        state_path = ".razr/work/public-probe/state.yaml"
+        self.assertIn(state_path, excluded)
+        self.assertFalse(excluded[state_path]["live_matches_candidate"])
         fake = self.fake_pi()
         runs = {}
         primary_context = str(uuid.uuid4())
@@ -447,6 +457,20 @@ sys.exit(2)
                                      symlink_root).stdout.strip()
         with self.assertRaisesRegex(review.Refusal, "unsupported source entry"):
             review.source_inventory(symlink_root, symlink_commit, ".razr/work")
+
+        excluded_symlink_root = self.repo("excluded-tracked-symlink")
+        (excluded_symlink_root / ".razr/work").mkdir(parents=True)
+        (excluded_symlink_root / "target.txt").write_text("target\n")
+        (excluded_symlink_root / ".razr/work/linked.txt").symlink_to("../../target.txt")
+        self.invoke([self.tools["git"], "-C", excluded_symlink_root, "add", "."], excluded_symlink_root)
+        self.invoke([self.tools["git"], "-C", excluded_symlink_root, "commit", "-qm", "excluded symlink"],
+                    excluded_symlink_root)
+        excluded_symlink_commit = self.invoke(
+            [self.tools["git"], "-C", excluded_symlink_root, "rev-parse", "HEAD"],
+            excluded_symlink_root).stdout.strip()
+        with self.assertRaisesRegex(review.Refusal, "unsupported excluded work-root entry"):
+            review.excluded_work_root_inventory(excluded_symlink_root, excluded_symlink_commit,
+                                                ".razr/work", set())
 
         submodule_root = self.repo("gitlink-source")
         (submodule_root / "base.txt").write_text("base\n")

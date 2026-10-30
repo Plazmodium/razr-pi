@@ -30,7 +30,7 @@ python3 -B "$REVIEW" freeze \
   --output <new-reviewed-retained-directory>
 ```
 
-Read `common.json`, its printed digest, source inventory, excluded inputs, declared validations, limitations and remotes. This is identity preparation, not launch authorization or human approval.
+Read `common.json`, its printed digest, source inventory, excluded inputs, declared validations, limitations and remotes. The excluded-input record must enumerate every committed entry under the configured work root with candidate/live hashes and an explicit match flag, in addition to root `AGENTS.md` and `razr.yaml`; stop on a missing entry, unsupported file kind or unexplained live drift. This is identity preparation, not launch authorization or human approval.
 
 ## 3. Launch fresh independent critics
 

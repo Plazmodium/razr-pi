@@ -191,6 +191,37 @@ def verify_history(root: Path, expected: dict[str, object]) -> None:
     require(fsck.returncode == 0, "candidate committed history integrity failure")
 
 
+def excluded_work_root_inventory(root: Path, commit: str, work_relative: str,
+                                 allowed_live_drift: set[str]) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    prefix = work_relative + "/"
+    for record in git(root, "ls-tree", "-r", "-z", "--full-tree", commit, "--", work_relative).split(b"\0"):
+        if not record:
+            continue
+        metadata, raw_name = record.split(b"\t", 1)
+        mode, kind, object_id = metadata.decode("ascii").split()
+        name = raw_name.decode("utf-8")
+        path = PurePosixPath(name)
+        require(not path.is_absolute() and ".." not in path.parts and str(path) == name
+                and (name == work_relative or name.startswith(prefix)), "unsafe excluded work-root path")
+        require(kind == "blob" and mode in ("100644", "100755"),
+                "unsupported excluded work-root entry: " + name)
+        candidate_content = git(root, "cat-file", "blob", object_id)
+        live_content = regular(root / name)
+        require(bool((root / name).stat().st_mode & 0o111) == (mode == "100755"),
+                "excluded work-root mode drift: " + name)
+        matches = candidate_content == live_content
+        require(matches or name in allowed_live_drift,
+                "excluded work-root input differs from candidate: " + name)
+        rows.append({"path": name, "mode": mode, "object": object_id,
+                     "candidate_sha256": digest(candidate_content),
+                     "candidate_size_bytes": len(candidate_content),
+                     "live_sha256": digest(live_content), "live_size_bytes": len(live_content),
+                     "live_matches_candidate": matches})
+    require(rows, "excluded work-root inventory is empty")
+    return rows
+
+
 def source_inventory(root: Path, commit: str, work_relative: str) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for record in git(root, "ls-tree", "-r", "-z", "--full-tree", commit).split(b"\0"):
@@ -265,6 +296,7 @@ def freeze_data(target: str | Path, work_id: str) -> dict[str, object]:
             validations.append({"id": f"{node['id']}:{index + 1}", "node": node["id"], "command": command})
     require(validations, "declared validations required")
     inventory = source_inventory(root, commit, work_relative)
+    excluded_work_root = excluded_work_root_inventory(root, commit, work_relative, allowed)
     history = history_identity(root)
     remotes = sorted(git_text(root, "remote").splitlines()) if git_text(root, "remote") else []
     data: dict[str, object] = {
@@ -283,6 +315,7 @@ def freeze_data(target: str | Path, work_id: str) -> dict[str, object]:
         "excluded_inputs": {
             "AGENTS.md": {"sha256": digest(agents_raw), "content": agents_raw.decode()},
             "razr.yaml": {"sha256": digest(config_raw), "content": config_raw.decode()},
+            "work_root": excluded_work_root,
         },
         "canonical": {"state": state, "evidence_sha256": digest(evidence_raw)},
         "declared_validations": validations,
@@ -308,6 +341,8 @@ def freeze_data(target: str | Path, work_id: str) -> dict[str, object]:
     }
     require(primary.inspect(root, work_id) == observation, "canonical state changed during freeze")
     require(source_inventory(root, commit, work_relative) == inventory, "candidate source changed during freeze")
+    require(excluded_work_root_inventory(root, commit, work_relative, allowed) == excluded_work_root,
+            "excluded work-root inputs changed during freeze")
     require(history_identity(root) == history, "candidate committed history changed during freeze")
     return data
 
