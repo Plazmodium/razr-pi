@@ -46,6 +46,12 @@ class IdentityMismatch(DeliveryError):
     pass
 
 
+class CreatedButUnverified(DeliveryError):
+    def __init__(self, message: str, **details: Any):
+        super().__init__(message)
+        self.details = details
+
+
 def _env() -> dict[str, str]:
     names = ("PATH", "HOME", "TMPDIR", "GH_HOST", "LANG", "LC_ALL", "LC_CTYPE",
              "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GIT_OPTIONAL_LOCKS",
@@ -859,17 +865,32 @@ def create_pr(root: Path, *, base: str, head: str, title: str, body: str,
                        expected_base_sha=base_sha, expected_head=head, expected_head_sha=head_sha,
                        expected_source_digest=digest)
     except DeliveryError as exc:
-        try:
-            outcome = _close_created(root, repository, url, base=base, head=head,
-                                     base_sha=base_sha, head_sha=head_sha)
-        except DeliveryError as close_error:
-            message = f"post-create verification failed: {exc}; compensation uncertain: {close_error}"
-            raise type(exc)(message) from exc
-        message = f"post-create verification failed: {exc}; compensation {outcome}"
-        raise type(exc)(message) from exc
+        raise CreatedButUnverified(
+            f"created-but-unverified; separate exact close authorization required: {exc}",
+            url=url, repository=repository, base=base, branch=head,
+            base_sha=base_sha, head_sha=head_sha, source_digest=digest,
+        ) from exc
 
 
-def snapshot(root: Path, *, branch: str, base: str = "campaign/razr-pi-next") -> dict[str, Any]:
+def close_pr(root: Path, *, url: str, repository: str, base: str, head: str,
+             base_sha: str, head_sha: str, source_digest: str) -> dict[str, Any]:
+    validate_repository(repository)
+    if not SHA_RE.fullmatch(base_sha) or not SHA_RE.fullmatch(head_sha) \
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", source_digest):
+        raise InvalidRequest("close requires exact base/head/source identities")
+    if remote_identity(root).lower() != repository.lower():
+        raise IdentityMismatch("close repository expectation mismatch")
+    if pushed_head(root, base) != base_sha or pushed_head(root, head) != head_sha:
+        raise CandidateChanged("close branch identity moved")
+    if source_identity(root, head_sha) != source_digest:
+        raise CandidateChanged("close source identity moved")
+    outcome = _close_created(root, repository, url, base=base, head=head, base_sha=base_sha, head_sha=head_sha)
+    return {"url": url, "repository": repository, "state": "CLOSED", "compensation": outcome,
+            "base": base, "branch": head, "base_commit": base_sha, "commit": head_sha,
+            "source_digest": source_digest}
+
+
+def snapshot(root: Path, *, branch: str, base: str) -> dict[str, Any]:
     repository = remote_identity(root)
     commit = pushed_head(root, branch)
     return {"repository": repository, "branch": branch, "commit": commit,

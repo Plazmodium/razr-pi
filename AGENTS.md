@@ -1,11 +1,14 @@
-# Razr-Pi public bootstrap guidance
+# Razr–Pi learning workspace
 
-Read README.md, SOURCE_BASELINE.md and docs/capabilities.md before acting. This candidate is not a general delivery adapter. Explain the relevant Pi concept briefly; distinguish instructions, actual execution and verified results.
+This is a beginner-friendly porting workshop, not a production-ready adapter.
+Read README.md and WORKSHOP.md; load `.pi/skills/razr-pi-learning/SKILL.md` for learning or port design.
 
-Plan thin vertical slices using docs/05-vertical-slices.md. Make the first verified task an end-to-end tracer and stop for the actual human checkpoint. Parallelize only satisfied dependencies with compatible shared interfaces.
+Explain the relevant Pi concept briefly before using it. Work in small observable labs; distinguish instructions, actual execution, and verified results. Ask only material product decisions; look up environmental facts yourself. Persist decisions and open questions, not transcripts.
 
-Exact human specification approval, deterministic generation-fenced transitions, source-digest identity and excluded-input scrutiny, fresh independent Technical and Contract critics, and final human PR review remain mandatory. Switching models or forking builder history is not independent critique. CLI attestations do not prove tests ran or humans approved.
+Plan features as thin vertical slices with observable end-to-end proof, not frontend/backend/database delivery tracks. Read `docs/05-vertical-slices.md` when decomposing work. Make the first verified task a tracer bullet; parallelize only slices with satisfied blockers and compatible shared interfaces. These are planning/review rules, not claims of new CLI enforcement.
 
-Do not hand-edit lifecycle state, infer future approval, import historical evidence, or use unsupported review/recovery paths. Preserve original contracts and private artifacts outside this public tree. Do not install packages, inspect credentials, configure globals, invoke models, stage, commit, publish, merge or deploy without separate explicit authority.
+Keep changes here unless the human explicitly widens scope. Do not change `../razr/`, global agent configuration, credentials, MCP, or install packages implicitly. Do not claim this folder is a Git repository without checking.
 
-The first-task bootstrap run uses only owned temporary repositories and no-model resource loading. Stop after its actual read-back. Full-suite scaffolding is not completed proof, and the PR factory remains deferred.
+Preserve exact human spec approval, deterministic generation-fenced transitions, first verified task checkpoint, source-digest identity, fresh independent Technical and Contract critics, and human final PR review. A model switch or a fork carrying builder history is not fresh independent critique. CLI attestations are not proof checks ran.
+
+Do not run an installer intended for another harness to configure Pi. Do not invent native subagents, cron, approval sandboxes, or MCP parity. No automatic merge or deploy. Stop for credential, spending, destructive, production, and material scope decisions.

@@ -79,7 +79,7 @@ class GithubDeliveryTests(unittest.TestCase):
         with patch.object(delivery, "remote_identity", return_value="o/r"), \
              patch.object(delivery, "pushed_head", side_effect=[SHA, "b" * 40]), \
              patch.object(delivery, "source_identity", return_value=DIGEST):
-            result = delivery.snapshot(Path("."), branch="feature")
+            result = delivery.snapshot(Path("."), branch="feature", base="dev")
             self.assertEqual(result["commit"], SHA)
             self.assertEqual(result["base_commit"], "b" * 40)
 
@@ -277,32 +277,38 @@ class GithubDeliveryTests(unittest.TestCase):
                                    expected_head_sha=SHA, expected_source_digest=DIGEST)
             mutate.assert_not_called()
 
-    def test_new_candidate_identity_mismatch_is_compensated(self):
-        with patch.object(delivery, "remote_identity", return_value="o/r"), \
-             patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA, "b" * 40, SHA]), \
-             patch.object(delivery, "source_identity", side_effect=[DIGEST, DIGEST]), \
-             patch.object(delivery, "_json", return_value=[]), patch.object(delivery, "_run", return_value=URL), \
-             patch.object(delivery, "read_pr", side_effect=delivery.IdentityMismatch("PR head commit mismatch")), \
-             patch.object(delivery, "_close_created", side_effect=delivery.DeliveryError("close failed")) as close:
-            with self.assertRaises(delivery.IdentityMismatch) as raised:
-                delivery.create_pr(Path("."), base="base", head="feature", title="t", body="b",
-                                   expected_repository="o/r", expected_base_sha="b" * 40,
-                                   expected_head_sha=SHA, expected_source_digest=DIGEST)
-            self.assertIn("uncertain", str(raised.exception))
-            close.assert_called_once()
-
-    def test_general_post_create_failure_is_compensated(self):
+    def test_post_create_failure_does_not_compensate_without_explicit_authorization(self):
         with patch.object(delivery, "remote_identity", return_value="o/r"), \
              patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA, "b" * 40, SHA]), \
              patch.object(delivery, "source_identity", side_effect=[DIGEST, DIGEST]), \
              patch.object(delivery, "_json", return_value=[]), patch.object(delivery, "_run", return_value=URL), \
              patch.object(delivery, "read_pr", side_effect=delivery.DeliveryError("checks unavailable")), \
-             patch.object(delivery, "_close_created", return_value="confirmed") as close:
-            with self.assertRaisesRegex(delivery.DeliveryError, "compensation confirmed"):
+             patch.object(delivery, "_close_created") as close:
+            with self.assertRaises(delivery.CreatedButUnverified) as raised:
                 delivery.create_pr(Path("."), base="base", head="feature", title="t", body="b",
                                    expected_repository="o/r", expected_base_sha="b" * 40,
                                    expected_head_sha=SHA, expected_source_digest=DIGEST)
+            self.assertIn("separate exact close authorization", str(raised.exception))
+            self.assertEqual(raised.exception.details["url"], URL)
+            self.assertEqual(raised.exception.details["head_sha"], SHA)
+            close.assert_not_called()
+
+    def test_separately_authorized_close_rebinds_exact_identity(self):
+        with patch.object(delivery, "remote_identity", return_value="o/r"), \
+             patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA]), \
+             patch.object(delivery, "source_identity", return_value=DIGEST), \
+             patch.object(delivery, "_close_created", return_value="confirmed") as close:
+            result = delivery.close_pr(Path("."), url=URL, repository="o/r", base="base", head="feature",
+                                       base_sha="b" * 40, head_sha=SHA, source_digest=DIGEST)
+            self.assertEqual((result["state"], result["compensation"]), ("CLOSED", "confirmed"))
             close.assert_called_once()
+        with patch.object(delivery, "remote_identity", return_value="o/r"), \
+             patch.object(delivery, "pushed_head", side_effect=["c" * 40, SHA]), \
+             patch.object(delivery, "_close_created") as close:
+            with self.assertRaises(delivery.CandidateChanged):
+                delivery.close_pr(Path("."), url=URL, repository="o/r", base="base", head="feature",
+                                  base_sha="b" * 40, head_sha=SHA, source_digest=DIGEST)
+            close.assert_not_called()
 
     def test_malformed_create_output_is_explicitly_unverified(self):
         with patch.object(delivery, "remote_identity", return_value="o/r"), \
@@ -344,23 +350,6 @@ class GithubDeliveryTests(unittest.TestCase):
             self.assertIs(delivery.create_pr(Path("."), base="base", head="feature", title="t", body="b",
                                              expected_repository="o/r", expected_base_sha="b" * 40,
                                              expected_head_sha=SHA, expected_source_digest=DIGEST), recovered)
-
-    def test_new_mismatched_pr_is_closed_but_race_recovery_is_not(self):
-        with patch.object(delivery, "remote_identity", return_value="o/r"), \
-             patch.object(delivery, "pushed_head", side_effect=["b" * 40, SHA, "b" * 40, SHA]), \
-             patch.object(delivery, "source_identity", side_effect=[DIGEST, DIGEST]), \
-             patch.object(delivery, "_json", side_effect=[[],
-                 {"number": 1, "url": URL, "state": "OPEN", "baseRefName": "base", "headRefName": "feature",
-                  "baseRefOid": "b" * 40, "headRefOid": SHA},
-                 {"number": 1, "url": URL, "state": "CLOSED"}]), \
-             patch.object(delivery, "_run", side_effect=[URL, ""]) as run, \
-             patch.object(delivery, "read_pr", side_effect=delivery.CandidateChanged("moved")):
-            with self.assertRaises(delivery.CandidateChanged):
-                delivery.create_pr(Path("."), base="base", head="feature", title="t", body="b",
-                                   expected_repository="o/r", expected_base_sha="b" * 40,
-                                   expected_head_sha=SHA, expected_source_digest=DIGEST)
-            self.assertIn("close", run.call_args_list[-1].args[1])
-            self.assertNotIn("--delete-branch", run.call_args_list[-1].args[1])
 
     def test_create_refuses_ambiguous_existing_prs(self):
         with patch.object(delivery, "remote_identity", return_value="o/r"), \
@@ -514,7 +503,7 @@ class GithubDeliveryTests(unittest.TestCase):
         self.assertIn('"ok": false', output.getvalue())
         output = io.StringIO()
         with patch.object(cli.delivery, "auth_preflight"), patch.object(cli.delivery, "snapshot", return_value={"commit": SHA}), \
-             patch.object(sys, "stdin", io.StringIO('{"schema_version":1,"operation":"snapshot","branch":"feature"}')), \
+             patch.object(sys, "stdin", io.StringIO('{"schema_version":1,"operation":"snapshot","branch":"feature","base":"dev"}')), \
              patch.object(sys, "stdout", output):
             self.assertEqual(cli.main(), 0)
         self.assertIn('"commit": "' + SHA, output.getvalue())

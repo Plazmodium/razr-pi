@@ -35,7 +35,12 @@ class PiSurfaceTests(FixtureTest):
         self.assertEqual(surface(root), before)
         self.assertEqual(set(result), {"schema_version", "work_id", "stage", "status", "generation",
                                        "node_id", "node_status", "node_attempt", "node_result_ref",
-                                       "candidate", "status_row", "raw_state", "fanout"})
+                                       "candidate", "status_row", "raw_state", "adapter", "fanout"})
+        self.assertEqual(result["schema_version"], 2)
+        self.assertEqual(result["adapter"]["routing"], "current")
+        self.assertEqual(result["adapter"]["supported_through"], "candidate_binding")
+        self.assertEqual(result["adapter"]["experimental_through"], "open_pr_handoff")
+        self.assertEqual(result["adapter"]["delivery_status"], "acceptance_pending")
         self.assertEqual((result["work_id"], result["stage"], result["status"], result["generation"]),
                          ("public-probe", "build", "active", 1))
         self.assertEqual(result["node_id"], "assert-arithmetic")
@@ -62,7 +67,7 @@ class PiSurfaceTests(FixtureTest):
     def test_status_requires_materialized_work_and_refuses_unknown_or_malformed(self):
         root = self.repo("unadopted")
         before = surface(root)
-        self.assertIn("status requires", self.surface(root, "status", expected=2).stderr)
+        self.assertIn("status requires a work_id", self.surface(root, "status", expected=2).stderr)
         self.adopt(root)
         self.commit_adopted_root(root)
         before = surface(root)
@@ -73,7 +78,7 @@ class PiSurfaceTests(FixtureTest):
     def test_herdr_identity_refusal_comes_from_m04_provider(self):
         root = self.repo("herdr-identity")
         result = self.surface(root, "status", expected=2, env={"HERDR_ENV": "1"})
-        self.assertIn("status requires", result.stderr)
+        self.assertIn("status requires a work_id", result.stderr)
         # The provider's public probe remains the direct identity assertion; no CLI is launched.
         sys.path.insert(0, str(PACKAGE))
         from adapter.herdr_provider import HerdrProvider

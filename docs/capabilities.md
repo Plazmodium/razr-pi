@@ -1,10 +1,14 @@
 # Capabilities and limitations
 
+## Product boundary
+
+Razr-Pi includes an experimental, acceptance-pending primary-led end-to-end delivery path for bounded GitHub-backed projects. It covers explicit adoption, discovery, exact-approved execution, the first-task checkpoint, candidate binding, fresh independent Technical and Contract review, human-approved Review entry, exact PR creation/read-back and final human PR handoff. It does not merge or deploy automatically.
+
 ## Supported capabilities
 
 ### Repository adoption and workflow inspection
 
-Razr-Pi safely adopts an explicitly selected repository, creates managed routing, and delegates workflow initialization and validation to the Python core. Status reads are core-backed and do not mutate lifecycle state.
+Razr-Pi safely adopts an explicitly selected repository, creates one current managed routing block, and delegates workflow initialization and validation to the Python core. Status reads are core-backed and do not mutate lifecycle state. The Pi status surface reports core state separately from the adapter boundary and refuses missing, ambiguous, unknown or locally modified routing without inferring approval.
 
 ### Pi package surface
 
@@ -41,6 +45,12 @@ The optional Herdr provider supports capability probing, launch, inspect, collec
 
 Attempts use fresh context, separate caller/target identity, permanent resource identities, append-only STARTED/SETTLED evidence, bounded time/output, process-group cleanup, and truthful `UNKNOWN` outcomes. Herdr telemetry is never Razr state.
 
+### Independent review
+
+`scripts/review-flow.py` creates immutable candidate-bound neutral inputs, launches separately authorized fresh Technical and Contract Pi sessions with explicit model/time/output bounds, retains structured events and reports, validates report identity/completeness, and supports primary-owned generation-fenced outcome recording through the core.
+
+The launcher has no billable model default, retry, fallback or repair path. Structural validation and flags do not prove semantic support, independence or human approval. The primary must inspect actual accesses/results, reproduce relevant checks, preserve consumed claims and stop on incomplete or failed review.
+
 ### GitHub delivery
 
 The separate GitHub helper supports:
@@ -49,7 +59,11 @@ The separate GitHub helper supports:
 - bounded PR `read`; and
 - separately authorized PR `create`.
 
-Operations bind repository, base/head branches, full commits, and source digest. Read results disclose bounded/non-atomic and collection-completeness limits. Candidate movement or malformed provider data is refused.
+Operations require explicit repository/base/head/full commits/source digest; there is no default base. Read results disclose bounded/non-atomic and collection-completeness limits. Candidate movement or malformed provider data is refused. Post-create compensation is disabled unless separately authorized for the exact safely rebound PR.
+
+### Clean adoption and safe routing removal
+
+Adoption supports one current managed routing block and refuses unknown or modified blocks rather than replacing them. `scripts/de-adopt.py` never changes `AGENTS.md`; for the exact current managed block it creates original/proposed files for human review and manual application. It retains `razr.yaml`, `.razr/`, specifications, evidence and Memory by default. Applying the proposal, package uninstallation, archival or deletion of retained data requires a separate explicit decision.
 
 ## Deliberately unsupported
 
@@ -57,9 +71,9 @@ Razr-Pi does not provide:
 
 - automatic project adoption;
 - a Pi worker command;
-- automatic critic selection or dispatch;
+- automatic model selection, critic retry, fallback or repair;
 - implicit retry after uncertain execution;
-- a general PR factory;
+- an autonomous PR factory or automatic compensation;
 - automatic merge, deployment, or publication;
 - credential installation or global configuration; or
 - inference of approval from a hash, model report, process state, or CLI message.
@@ -76,4 +90,4 @@ Razr-Pi does not provide:
 
 ## Mandatory human and review gates
 
-For delivery, Razr-Pi requires exact candidate identity, excluded-input scrutiny, fresh independent Technical and Contract review of that exact commit, and final human PR review. These gates remain outside package loading and automated test results.
+For delivery, Razr-Pi requires exact candidate identity, excluded-input scrutiny, fresh independent Technical and Contract review of that exact commit, explicit human approval before Review entry, separate authorization for remote mutation, and final human review of the actual PR. These gates remain outside package loading, helper flags and automated test results.

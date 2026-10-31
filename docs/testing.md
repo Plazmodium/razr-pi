@@ -35,7 +35,7 @@ dogfood_root="$(mktemp -d "$physical_root/.test-output/dogfood.XXXXXX")"
 mkdir "$dogfood_root/fixtures"
 (cd "$physical_root/tests" && PUBLIC_TEST_ROOT="$dogfood_root/fixtures" \
   python3 -B -m unittest -v \
-  test_pi_surface test_primary_execution test_github_delivery)
+  test_project_removal test_pi_surface test_github_delivery)
 ```
 
 Run focused commands only in an owned checkout. The Herdr suite tests provider mechanics with real subprocess/Git fixtures and simulated host responses; it does not launch a live worker or model.
@@ -52,15 +52,19 @@ When `.git` is present, read-only Git checks require a valid exact repository ro
 
 | Module | Main scope |
 |---|---|
+| `test_adapter_foundation` | Core subprocess protocol, provenance, source identity, read-back and environment bounds |
 | `test_adoption` | Exact-root adoption safety, preservation, idempotence, work-root handling, relocation |
-| `test_clean_package` | Actual no-model Pi loading, resource closure, no implicit adoption |
-| `test_contract_preflight` | Structural contract identities and evidence-authority conflicts |
-| `test_primary_execution` | Core-backed inspection, generation fences, candidate and delivery identity |
+| `test_contract_preflight` | Contract/core executable preflight and conflict diagnostics |
+| `test_primary_execution` | Candidate identity, approval, staging and delivery-inspector gates |
+| `test_clean_package` / `clean_package_preflight.mjs` | Clean-copy package loading and no implicit adoption |
+| `public_package_preflight.mjs` | Public-export no-model Pi loading, resource closure and no implicit adoption in the tracer |
+| `test_project_removal` | Current-routing status, clean-adoption refusal, safe routing removal and retained-data protection |
+| `test_review_flow` | Generic candidate freeze, bounded fresh-session transport, dual report recording, Review gate and drift/refusal behavior |
 | `test_provenance` | Core/template/helper pins, relocation, missing or changed files |
 | `test_public_boundary` | Exact tree, links, paths, output ownership, fixtures, repository identity |
 | `test_context` | Immutable-candidate context selection, bounds, dirty-source refusal, stale Memory |
 | `test_memory` | Record protocol, repository scoping, bounds, locking, corruption and concurrency |
-| `test_pi_surface` | Typed Pi command status/context behavior and standalone fanout refusal |
+| `test_pi_surface` | Typed Pi command status/context behavior, adapter boundary and standalone fanout refusal |
 | `test_herdr_provider` | Capability, authority fences, attempts, recovery, subprocess and cleanup mechanics |
 | `test_github_delivery` | Repository/PR identity, bounded reads, create recovery, compensation and cleanup |
 | `test_named_regressions` | Named callback outcomes, subcases, fixture errors and category mappings |
