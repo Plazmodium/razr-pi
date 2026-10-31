@@ -1,13 +1,27 @@
 <!-- RAZR:START -->
 ## Razr in Pi
 
-This project explicitly adopts Razr. Load the `razr` Pi skill before workflow actions. If unavailable, stop and ask the human to load the reviewed local package; do not install anything automatically or guess a CLI from PATH.
+This project explicitly adopts Razr. Load the reviewed `razr` Pi skill before workflow actions. If unavailable, stop and ask the human to load the reviewed local package; do not install automatically or guess a CLI from PATH.
 
-The primary Pi agent owns conversation and workflow mutations. The existing Razr Python CLI remains the validator; never hand-edit lifecycle state. Before acting on an existing project, read its rules and run actual `status --json` and `validate --all` through the skill's bundled core.
+One primary Pi session owns the conversation and supported workflow mutations. The provenance-pinned Razr Python core is the sole lifecycle authority; never hand-edit canonical state. Read project rules and actual human decisions, then inspect core status and validation before acting.
 
-Authority: `spec.md` owns intent; `executable.yaml` owns the approved immutable DAG; `state.yaml` owns generation-fenced progress; `evidence.md` records reproduced proof. Git owns source history; the live PR is the human review surface. Before approval, discovery contains only `spec.md`.
+Authority: `spec.md` owns exact approved intent; `executable.yaml` owns the immutable approved DAG; `state.yaml` owns generation-fenced progress; `evidence.md` records observed proof. Git owns candidate history. The live PR is the final human review surface.
 
-This adapter currently supports adoption and discovery only. Stop before approval, compilation, build, candidate recording, or PR actions. Do not mistake this support boundary for removal of the eventual gates: exact human specification approval, first verified-task human checkpoint, source-digest identity, fresh independent Technical and Contract critics, and final human PR review remain mandatory.
+Follow the shipped skill procedures in order:
 
-CLI attestations do not authenticate approval, execute tests, or prove critic independence. A model switch or fork with builder history is not fresh critique. The source digest excludes the entire root AGENTS.md, razr.yaml, and configured work root; these paths still require explicit scrutiny. Stop on partial or inconsistent state, preserve artifacts, and never invent recovery evidence. No automatic install, global configuration, merge, or deployment.
+1. discovery and exact spec/executable approval;
+2. declared task execution with actual evidence and fresh generations;
+3. mandatory human inspection after the first verified task;
+4. explicit candidate staging/commit, source identity and digest-excluded input scrutiny;
+5. fresh independent Technical and Contract Pi sessions against the same frozen candidate inputs;
+6. primary audit and supported original-outcome recording through the core;
+7. explicit human approval before Verify-to-Review transition;
+8. separately authorized non-force push and exact GitHub PR create/read-back;
+9. core PR recording and final human PR handoff.
+
+Package loading, hashes, flags, CLI attestations, model identity and Herdr telemetry do not prove execution, independence or human approval. A model switch, resumed/forked builder session or context carrying builder history is not fresh critique. Incomplete, unsupported, contaminated, drifted or failed review stops; there is no automatic retry, repair or fallback. A repair requires legal return to Build, a new candidate and two new reviews.
+
+The source digest excludes root `AGENTS.md`, `razr.yaml` and the configured work root; inspect them explicitly. Use freshly read generations for every core mutation. Preserve failures and consumed review claims. Stop for credentials, spending, destructive operations, production actions and material scope decisions.
+
+No automatic install, global configuration, force-push, compensation, merge, deployment, release or publication is permitted. Review entry, remote mutation and final PR acceptance remain distinct human-owned decisions.
 <!-- RAZR:END -->

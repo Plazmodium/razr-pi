@@ -92,8 +92,10 @@ def isolate(run, tools):
     }
 
 
-TEST_MODULES = ('test_adapter_foundation', 'test_memory', 'test_context', 'test_herdr_provider', 'test_adoption', 'test_clean_package', 'test_pi_surface', 'test_contract_preflight',
-                'test_primary_execution', 'test_provenance', 'test_public_boundary', 'test_named_regressions', 'test_github_delivery')
+TEST_MODULES = ('test_adapter_foundation', 'test_memory', 'test_context', 'test_herdr_provider', 'test_adoption', 'test_pi_surface',
+                'test_contract_preflight', 'test_primary_execution', 'test_clean_package',
+                'test_provenance', 'test_public_boundary', 'test_project_removal', 'test_review_flow',
+                'test_named_regressions', 'test_github_delivery')
 
 
 def regression_worker(source_before):
@@ -199,7 +201,7 @@ def main():
         command('git-init', [tools['git'], 'init', '-q', '-b', 'main', str(project)], run, env)
         initial_project = snapshot(project)
         loader_before = {k: snapshot(run / k) for k in ('home', 'agent', 'xdg')}
-        loader = json.loads(command('package-resolver', [tools['node'], ROOT / 'tests/clean_package_preflight.mjs',
+        loader = json.loads(command('package-resolver', [tools['node'], ROOT / 'tests/public_package_preflight.mjs',
                                                         pi_root, run], project, env))
         require(loader['status'] == 'PASS' and loader['adopted'] is False and loader['unchanged'] is True,
                 'loader did not prove read-only package resolution')

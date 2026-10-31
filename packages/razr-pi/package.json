@@ -1,8 +1,8 @@
 {
   "name": "razr-pi",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "Local Pi package for repository context, Razr Memory, workflow inspection, and bounded host/delivery adapters",
+  "description": "Local Pi Razr package with explicit adoption and bounded end-to-end delivery guidance",
   "keywords": ["pi-package"],
   "pi": { "extensions": ["./extensions/razr.ts"], "skills": ["./skills"] },
   "peerDependencies": {

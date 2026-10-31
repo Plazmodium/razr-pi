@@ -14,6 +14,8 @@ docs/audits/task-attempt-lifecycle.md
 docs/campaigns/razr-pi-next.md
 docs/capabilities.md
 docs/design/execution-provider.md
+docs/general-end-to-end-delivery-approval.md
+docs/general-end-to-end-delivery-contract.md
 docs/testing.md
 packages/razr-pi/README.md
 packages/razr-pi/adapter/context.py
@@ -34,15 +36,22 @@ packages/razr-pi/runtime/templates/spec.md
 packages/razr-pi/runtime/templates/state.yaml
 packages/razr-pi/scripts/adopt.py
 packages/razr-pi/scripts/contract-preflight.py
+packages/razr-pi/scripts/de-adopt.py
 packages/razr-pi/scripts/github-delivery.py
 packages/razr-pi/scripts/named-regressions.py
 packages/razr-pi/scripts/pi-surface.py
 packages/razr-pi/scripts/primary.py
+packages/razr-pi/scripts/review-flow.py
 packages/razr-pi/skills/razr/SKILL.md
 packages/razr-pi/skills/razr/references/adoption.md
+packages/razr-pi/skills/razr/references/de-adoption.md
+packages/razr-pi/skills/razr/references/greenfield.md
+packages/razr-pi/skills/razr/references/primary-execution.md
+packages/razr-pi/skills/razr/references/review-delivery.md
 templates/vertical-slice.md
 tests/check_public_tree.py
 tests/clean_package_preflight.mjs
+tests/public_package_preflight.mjs
 tests/fixtures/public-contract/README.md
 tests/fixtures/public-contract/executable.yaml
 tests/fixtures/public-contract/spec.md
@@ -61,3 +70,5 @@ tests/test_pi_surface.py
 tests/test_primary_execution.py
 tests/test_provenance.py
 tests/test_public_boundary.py
+tests/test_project_removal.py
+tests/test_review_flow.py
