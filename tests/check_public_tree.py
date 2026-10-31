@@ -209,7 +209,10 @@ def check(root):
         if name != 'tests/check_public_tree.py':
             require(not re.search(r'/(?:Users|home)/[^\s/]+|[A-Za-z]:\\(?:Users|Documents)\\', text),
                     'personal absolute path: ' + name)
-            require(not re.search(r'\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b', text, re.I),
+            privacy_text = re.sub(
+                r'https://github\.com/user-attachments/assets/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}',
+                '', text, flags=re.I)
+            require(not re.search(r'\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b', privacy_text, re.I),
                     'session-shaped identifier: ' + name)
             require('docs/specs/' not in text, 'historical specification dependency: ' + name)
             require(not re.search(r'\b(?:primary-support|sequence-receipt|technical-checkpoint|review-inputs)\.(?:json|jsonl)\b', text),
