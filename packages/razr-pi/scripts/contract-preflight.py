@@ -26,6 +26,9 @@ def inspect_pair(pair):
     before = {p: p.read_bytes() for p in paths}
     metadata, body = core.parse_spec(paths[0])
     executable, errors = core.validate_executable(folder, metadata.get('id'), metadata, body)
+    missing_sections = core.missing_spec_sections(body)
+    if missing_sections:
+        errors.append('missing required spec sections: ' + ', '.join(missing_sections))
     # Narrow regression diagnostic, not a semantic contract validator or state authority.
     # Review every contract manually; passing this pattern check is not contradiction proof.
     flat = re.sub(r'\s+', ' ', body.replace('`', '')).lower()

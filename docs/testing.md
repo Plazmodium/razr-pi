@@ -54,7 +54,7 @@ When `.git` is present, read-only Git checks require a valid exact repository ro
 |---|---|
 | `test_adapter_foundation` | Core subprocess protocol, provenance, source identity, read-back and environment bounds |
 | `test_adoption` | Exact-root adoption safety, preservation, idempotence, work-root handling, relocation |
-| `test_contract_preflight` | Contract/core executable preflight and conflict diagnostics |
+| `test_contract_preflight` | Core-required spec sections, draft-pair compatibility, executable/conflict diagnostics, identities and read-only refusal |
 | `test_primary_execution` | Candidate identity, approval, staging and delivery-inspector gates |
 | `test_clean_package` / `clean_package_preflight.mjs` | Clean-copy package loading and no implicit adoption |
 | `public_package_preflight.mjs` | Public-export no-model Pi loading, resource closure and no implicit adoption in the tracer |
@@ -70,6 +70,8 @@ When `.git` is present, read-only Git checks require a valid exact repository ro
 | `test_named_regressions` | Named callback outcomes, subcases, fixture errors and category mappings |
 
 The fixtures are synthetic. They do not represent real human approval, a genuine critic decision, or a live PR operation unless a separately identified integration explicitly performs one.
+
+The pair-preflight tests invoke the actual CLI on fresh copies of the public draft fixture. They remove each required heading, all seven, and the original three-heading combination while refreshing the executable's source-spec digest, so refusal proves the section check rather than a stale digest. They also cover heading case/level, core-accepted whitespace, optional context, combined diagnostics, unchanged fixture surfaces and absence of materialized state/evidence. The helper reuses the unchanged core's section recognizer; it does not implement a new Markdown policy, complete frontmatter validation or human-approval verification. Its updated source pin binds the reviewed helper bytes without changing runtime provenance or other pins.
 
 ## What passing tests prove
 

@@ -26,7 +26,7 @@ Run the package's read-only preflight:
 python3 "$PACKAGE/scripts/contract-preflight.py" --pair "$TARGET/approval/<item>"
 ```
 
-Inspect its exit, errors and identities. It uses the core executable validator plus a narrow known-conflict diagnostic; it does not certify all semantic consistency or enforce approval. Still inspect normative mapping, scope, product semantics and all checkpoints manually.
+Inspect its exit, errors and identities. It uses the unchanged core's required-section check and executable validator plus a narrow known-conflict diagnostic. Missing required sections produce `structural_preflight: FAIL`, exit 1 and the missing names in core order; existing executable and conflict diagnostics remain visible. Complete draft approval pairs are valid preflight inputs: the helper does not apply canonical lifecycle validation, approve the pair or create state/evidence. PASS does not certify all frontmatter, semantic consistency or human approval. Still inspect normative mapping, scope, product semantics and all checkpoints manually.
 
 ## Identity and decision record
 
