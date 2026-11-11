@@ -5,13 +5,51 @@ from pathlib import Path
 from test_adoption import FixtureTest, surface
 from run_public import ROOT, sha
 
+REQUIRED_SECTIONS = ('Intent', 'Requirements', 'Constraints', 'Non-goals',
+                     'Assumptions', 'Proof obligations', 'Approval')
+
 
 class ContractPreflightTests(FixtureTest):
+    def fixture_surface(self):
+        # Only the fixture harness's original command records may be added.
+        return {name: value for name, value in surface(self.lab).items()
+                if name != 'commands' and not name.startswith('commands/')}
+
     def inspect_pair(self, pair, expected=0):
-        before = surface(pair)
+        before = self.fixture_surface()
         result = self.helper('contract-preflight.py', '--pair', str(pair), expected=expected)
-        self.assertEqual(surface(pair), before)
-        return json.loads(result.stdout) if result.stdout else result.stderr
+        self.assertEqual(self.fixture_surface(), before)
+        self.assertFalse((pair / 'state.yaml').exists())
+        self.assertFalse((pair / 'evidence.md').exists())
+        if not result.stdout:
+            return result.stderr
+        self.assertEqual(result.stderr, '')
+        report = json.loads(result.stdout)
+        self.assertEqual(report['schema_version'], 1)
+        self.assertEqual(report['structural_preflight'], 'PASS' if expected == 0 else 'FAIL')
+        self.assertIn('Not approval', report['authority'])
+        executable = json.loads((pair / 'executable.yaml').read_bytes())
+        # Independently reproduce the unchanged core's canonical JSON identity.
+        canonical = json.dumps(executable, sort_keys=True, separators=(',', ':')).encode('utf-8')
+        self.assertEqual(report['identities'], {
+            'spec_file_sha256': 'sha256:' + sha((pair / 'spec.md').read_bytes()),
+            'executable_file_sha256': 'sha256:' + sha((pair / 'executable.yaml').read_bytes()),
+            'executable_core_digest': 'sha256:' + sha(canonical),
+        })
+        return report
+
+    def rewrite_headings(self, pair, replacements):
+        spec = pair / 'spec.md'
+        text = spec.read_text()
+        for section, heading in replacements.items():
+            original = '## ' + section + '\n'
+            self.assertEqual(text.count(original), 1)
+            text = text.replace(original, heading)
+        spec.write_text(text)
+        path = pair / 'executable.yaml'
+        executable = json.loads(path.read_bytes())
+        executable['source_spec']['digest'] = 'sha256:' + sha(spec.read_bytes())
+        path.write_text(json.dumps(executable, indent=2) + '\n')
 
     def rewrite_constraint(self, pair, statement):
         exe = json.loads((pair / 'executable.yaml').read_bytes())
@@ -32,6 +70,55 @@ class ContractPreflightTests(FixtureTest):
         self.assertIn('Not approval', result['authority'])
         self.assertIn('condition: draft', (pair / 'spec.md').read_text())
         self.assertFalse((pair / 'state.yaml').exists())
+
+    def test_missing_original_three_sections_refuse(self):
+        pair = self.pair()
+        self.rewrite_headings(pair, {section: '' for section in ('Intent', 'Assumptions', 'Approval')})
+        result = self.inspect_pair(pair, expected=1)
+        self.assertEqual(result['structural_preflight'], 'FAIL')
+        self.assertEqual(result['errors'], ['missing required spec sections: Intent, Assumptions, Approval'])
+
+    def test_each_required_section_and_all_sections_refuse_in_core_order(self):
+        cases = [(section,) for section in REQUIRED_SECTIONS] + [REQUIRED_SECTIONS]
+        for index, sections in enumerate(cases):
+            with self.subTest(missing=sections):
+                pair = self.pair('missing-' + str(index))
+                self.rewrite_headings(pair, {section: '' for section in sections})
+                result = self.inspect_pair(pair, expected=1)
+                self.assertEqual(result['errors'], ['missing required spec sections: ' + ', '.join(sections)])
+
+    def test_wrong_heading_case_or_level_is_not_a_required_section(self):
+        for name, heading in (('case', '## intent\n'), ('level-one', '# Intent\n'),
+                              ('level-three', '### Intent\n')):
+            with self.subTest(format=name):
+                pair = self.pair(name)
+                self.rewrite_headings(pair, {'Intent': heading})
+                self.assertEqual(self.inspect_pair(pair, expected=1)['errors'],
+                                 ['missing required spec sections: Intent'])
+
+    def test_core_heading_whitespace_and_optional_context_remain_valid(self):
+        cases = {'whitespace': {section: '##\t' + section + ' \t\n' for section in REQUIRED_SECTIONS},
+                 'optional-context': {'Context and Evidence': ''}}
+        for name, replacements in cases.items():
+            with self.subTest(format=name):
+                pair = self.pair(name)
+                self.rewrite_headings(pair, replacements)
+                self.assertEqual(self.inspect_pair(pair)['errors'], [])
+                self.assertIn('condition: draft\n', (pair / 'spec.md').read_text())
+
+    def test_section_diagnostic_preserves_executable_and_authority_errors(self):
+        pair = self.pair()
+        self.rewrite_headings(pair, {'Intent': ''})
+        self.rewrite_constraint(pair, 'Never hand-edit state and evidence.')
+        path = pair / 'executable.yaml'
+        executable = json.loads(path.read_bytes())
+        executable['critique']['contract'] = 'optional'
+        path.write_text(json.dumps(executable, indent=2) + '\n')
+        errors = self.inspect_pair(pair, expected=1)['errors']
+        self.assertIn('missing required spec sections: Intent', errors)
+        self.assertTrue(any('separate technical and contract' in error for error in errors))
+        self.assertTrue(any('Evidence authority conflict' in error for error in errors))
+        self.assertEqual(len(errors), 3)
 
     def test_raw_and_canonical_identities_are_distinct(self):
         pair = self.pair()

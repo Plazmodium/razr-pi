@@ -34,7 +34,7 @@ PROVENANCE = {
 SOURCE_PINS = {
     'scripts/adopt.py': '88157336a553ca6c1667eba5b12bd4efc38e43875f887bb8738d5716fdc56ad1',
     'scripts/primary.py': '4ea38b5ef08dfb4944f50376d2475653d81671fb51239cac61549c49dfe895ed',
-    'scripts/contract-preflight.py': '54d237feabd02cb250c51d677cc8df08de9fe9feaecc557583ef76579899a850',
+    'scripts/contract-preflight.py': 'cdd4023356f14fa69e4cf77bdf12c95c5c452bc86c04d90a922b5d4b556a0a85',
     'scripts/named-regressions.py': '8885fa72a2ae3446e69577f26347c3ffacd8f499a322725d807bb8e947d01392',
     'runtime/provenance.json': '071d73081db98d2f397a58925ffade5844d4b873a82074acb7c8661583f3fc89',
 }
